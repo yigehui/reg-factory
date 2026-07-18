@@ -44,6 +44,11 @@ body{margin:0;background:var(--bg);color:var(--text);
 .field input[type=text],.field input[type=number],.field input[type=password],.field select{
   width:100%;max-width:520px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);
   border-radius:6px;color:var(--text);font-size:14px}
+.two-col-form{display:grid;grid-template-columns:repeat(2,minmax(260px,1fr));column-gap:18px;row-gap:0}
+.two-col-form .form-head,.two-col-form .form-actions,.two-col-form .cmd-line{grid-column:1 / -1}
+.two-col-form .field input[type=text],.two-col-form .field input[type=number],
+.two-col-form .field input[type=password],.two-col-form .field select{max-width:none}
+@media (max-width:900px){.two-col-form{grid-template-columns:1fr}}
 .field.checkbox{display:flex;align-items:center;gap:8px}
 .field.checkbox input{width:17px;height:17px}
 .field.checkbox label{margin:0}
@@ -53,6 +58,9 @@ body{margin:0;background:var(--bg);color:var(--text);
   cursor:pointer;font-size:14px;font-weight:600;margin-top:8px}
 .btn-run:hover{filter:brightness(1.1)}
 .btn-run:disabled{opacity:.5;cursor:not-allowed}
+.form-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px}
+.form-actions button{margin-right:10px}
+.form-actions .btn-run{margin-top:0}
 .btn-stop{background:var(--red);color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer}
 .btn-stop:disabled{opacity:.4;cursor:not-allowed}
 

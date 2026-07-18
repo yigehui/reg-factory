@@ -1,5 +1,6 @@
 # 密钥
 .env
+webui_script_configs.json
 
 # Python
 __pycache__/
@@ -27,6 +28,14 @@ screenshots/*
 !screenshots/.gitkeep
 screenshots_outlook/*
 !screenshots_outlook/.gitkeep
+screenshots_ruoyi/*
+!screenshots_ruoyi/.gitkeep
+screenshots_camonfox/*
+!screenshots_camonfox/.gitkeep
+screenshots_px_debug/
+har_ruoyi/
+.px_debug_profiles/
+*.har
 screenshots_github/*
 !screenshots_github/.gitkeep
 # GitHub 验证求解的临时调试脚本（不进库）
@@ -42,7 +51,9 @@ claude_node_usage.txt
 # 本地调试/运行期门控脚本与代理清单（不进库）
 codex_gated_launch.sh
 proxies_clash.txt
+proxies_outlook*.txt
 oauth_authorize_dump.html
+.patch/
 
 # Gmail Android release/offline binary payloads
 gmail_android/offline/bluestacks/*

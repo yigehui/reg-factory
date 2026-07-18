@@ -56,6 +56,13 @@ def log(msg, level="INFO"):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
 
 
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
 # ---------------------------------------------------------------- emails.txt
 def read_fresh_emails():
     """返回 emails.txt 里全部 (email, password, token, client_id) 条目（含已 reserve 的，纯快照用于 diff）。
@@ -103,11 +110,16 @@ def stage_email(args, env):
 
     cmd = [
         sys.executable, "outlook_reg_loop.py",
+        "--engine", args.outlook_engine,
         "--count", str(args.email_attempts),
         "--timeout", str(args.email_timeout),
         "--max-press", str(args.max_press),
         "--sleep", "3",
     ]
+    if args.outlook_proxy_file:
+        cmd += ["--proxy-file", args.outlook_proxy_file]
+    if args.outlook_headless:
+        cmd.append("--headless")
     if args.email_confirm_before_register:
         cmd.append("--confirm-before-register")
     log(f"Stage A cmd: {' '.join(cmd)}", "A")
@@ -230,6 +242,13 @@ def main():
     ap.add_argument("--email-attempts", type=int, default=30, help="邮箱注册最多尝试次数")
     ap.add_argument("--email-timeout", type=int, default=180, help="单次邮箱注册硬超时(s)")
     ap.add_argument("--email-total-timeout", type=int, default=1800, help="Stage A 总超时(s)")
+    ap.add_argument("--outlook-engine", choices=["ruoyi", "camonfox", "standalone"],
+                    default=os.environ.get("OUTLOOK_REG_ENGINE", "ruoyi"),
+                    help="Outlook 自注册后端；默认 ruoyi")
+    ap.add_argument("--outlook-proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+                    help="ruoyi 后端代理池文件")
+    ap.add_argument("--outlook-headless", action="store_true",
+                    help="仅 ruoyi 后端：Outlook 注册阶段使用无头模式")
     ap.add_argument("--max-press", default="3", help="人机验证按住次数上限")
     ap.add_argument("--email-confirm-before-register", action="store_true",
                     help="邮箱注册页打开后自动点确认，再开始填写")
@@ -270,7 +289,10 @@ def main():
     t_all = time.time()
     print("=" * 64)
     mode = "无限" if args.rounds == 0 else f"{args.rounds} 轮"
-    log(f"全流程开始（循环 {mode}）  proxy={args.proxy or 'OFF'}  clash={args.clash_api}")
+    log(
+        f"全流程开始（循环 {mode}）  outlook={args.outlook_engine}  "
+        f"proxy={args.proxy or 'OFF'}  clash={args.clash_api}"
+    )
     print("=" * 64)
 
     ok = fail = 0

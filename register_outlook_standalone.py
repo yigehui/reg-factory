@@ -15,12 +15,15 @@ import asyncio
 import json
 import math
 import os
+import queue
 import random
 import re
 import string
 import sys
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -86,6 +89,11 @@ def _fingerprint_provider():
 CAPSOLVER_API_KEY = os.environ.get("CAPSOLVER_API_KEY", "")
 EZCAPTCHA_API_KEY = os.environ.get("EZCAPTCHA_API_KEY", "")
 EZCAPTCHA_API_BASE = os.environ.get("EZCAPTCHA_API_BASE", "https://api.ez-captcha.com")
+CAPTCHARUN_API_BASE = os.environ.get("CAPTCHARUN_API_BASE", "https://api.captcha-run.com").rstrip("/")
+CAPTCHARUN_API_KEY = os.environ.get("CAPTCHARUN_API_KEY") or os.environ.get("CAPTCHARUN_TOKEN", "")
+
+MS_RISK_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad"
+MS_RISK_BASE = f"https://login.microsoftonline.com/{MS_RISK_TENANT}/api/v1.0/risk"
 
 # Arkose Labs public key for Microsoft signup
 MS_SIGNUP_ARKOSE_KEY = "B7D8911C-5CC8-A9A3-35B0-554ACEE604DA"
@@ -97,6 +105,8 @@ SCREENSHOT_DIR = "screenshots_outlook"
 # Registration timeout per account (seconds)
 REGISTER_TIMEOUT = 300
 VERIFY_AFTER_REGISTER = True
+ACCOUNT_QUEUE = None
+_ACCOUNT_CONTEXT = threading.local()
 
 
 def verify_registered_outlook(email, password, tag=""):
@@ -302,14 +312,204 @@ def generate_name():
     return random.choice(first_names), random.choice(last_names)
 
 
-def generate_email_password():
-    """Generate random Outlook email and password"""
-    prefix = random.choice(string.ascii_lowercase) + "".join(
-        random.choices(string.ascii_lowercase + string.digits, k=11)
+def _slug_name(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _current_account_names(create=False):
+    first = getattr(_ACCOUNT_CONTEXT, "first_name", "")
+    last = getattr(_ACCOUNT_CONTEXT, "last_name", "")
+    if create and (not first or not last):
+        first, last = generate_name()
+        _ACCOUNT_CONTEXT.first_name = first
+        _ACCOUNT_CONTEXT.last_name = last
+    return first, last
+
+
+def _consume_account_names():
+    first, last = _current_account_names(create=True)
+    _ACCOUNT_CONTEXT.first_name = ""
+    _ACCOUNT_CONTEXT.last_name = ""
+    return first, last
+
+
+def _random_chars(chars, length):
+    return "".join(random.choices(chars, k=max(0, int(length))))
+
+
+def _expand_random_template(template, default_generator):
+    """Expand lightweight random placeholders used by account/password formats."""
+    if not template:
+        return default_generator()
+
+    def repl(match):
+        kind = (match.group(1) or "rand").lower()
+        length = int(match.group(2) or "8")
+        if kind in {"digit", "digits", "num", "number"}:
+            chars = string.digits
+        elif kind in {"letter", "letters", "lower"}:
+            chars = string.ascii_lowercase
+        elif kind == "upper":
+            chars = string.ascii_uppercase
+        else:
+            chars = string.ascii_letters + string.digits
+        return _random_chars(chars, length)
+
+    # Supported: {rand:12}, {letters:8}, {digits:4}, {upper:2}
+    value = re.sub(r"\{(rand|random|letters?|lower|upper|digits?|num|number):(\d+)\}", repl, template)
+    first, last = _current_account_names(create=bool(re.search(r"\{(?:first|last|name)", value, re.I)))
+    first_slug = _slug_name(first)
+    last_slug = _slug_name(last)
+    name_values = {
+        "{first}": first_slug,
+        "{firstname}": first_slug,
+        "{last}": last_slug,
+        "{lastname}": last_slug,
+        "{first_initial}": first_slug[:1],
+        "{last_initial}": last_slug[:1],
+        "{fi}": first_slug[:1],
+        "{li}": last_slug[:1],
+        "{name}": f"{first_slug}{last_slug}",
+        "{first.raw}": first,
+        "{last.raw}": last,
+    }
+    for key, replacement in name_values.items():
+        value = value.replace(key, replacement)
+    # Convenience aliases without length.
+    value = value.replace("{rand}", _random_chars(string.ascii_letters + string.digits, 8))
+    value = value.replace("{lower}", _random_chars(string.ascii_lowercase, 8))
+    value = value.replace("{digits}", _random_chars(string.digits, 4))
+    return value
+
+
+def _email_suffixes():
+    raw = (
+        os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES")
+        or os.environ.get("OUTLOOK_EMAIL_SUFFIXES")
+        or "outlook.com"
     )
-    email = f"{prefix}@outlook.com"
-    password = "Aa1!" + "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    suffixes = [s.strip().lstrip("@") for s in re.split(r"[,;\s]+", raw) if s.strip()]
+    return suffixes or ["outlook.com"]
+
+
+def _generate_prefix():
+    fmt = os.environ.get("OUTLOOK_ACCOUNT_FORMAT", "").strip()
+    if fmt:
+        return _expand_random_template(fmt, lambda: "")
+    return random.choice(string.ascii_lowercase) + _random_chars(string.ascii_lowercase + string.digits, 11)
+
+
+def _generate_password():
+    fmt = os.environ.get("OUTLOOK_PASSWORD_FORMAT", "").strip()
+    if fmt:
+        return _expand_random_template(fmt, lambda: "")
+    return "Aa1!" + _random_chars(string.ascii_letters + string.digits, 12)
+
+
+def _normalize_account_spec(line):
+    """Parse exe-like account formats: account / account@suffix / account----password."""
+    raw = (line or "").strip()
+    if not raw or raw.startswith("#"):
+        return None
+    if raw.count("----") > 1:
+        raise ValueError("account line can contain at most one ---- separator")
+    account, password = (raw.split("----", 1) + [""])[:2] if "----" in raw else (raw, "")
+    account = account.strip()
+    password = password.strip()
+    if not account:
+        return None
+    if "@" in account:
+        email = account
+        prefix = account.split("@", 1)[0]
+    else:
+        prefix = account
+        email = f"{account}@{random.choice(_email_suffixes())}"
+    return email, password or _generate_password(), prefix
+
+
+def _next_account_spec():
+    global ACCOUNT_QUEUE
+    if ACCOUNT_QUEUE is None:
+        return None
+    try:
+        return ACCOUNT_QUEUE.get_nowait()
+    except queue.Empty:
+        return None
+
+
+def generate_email_password():
+    """Generate or pop an Outlook email/password pair."""
+    queued = _next_account_spec()
+    if queued:
+        return queued
+    prefix = _generate_prefix()
+    email = f"{prefix}@{random.choice(_email_suffixes())}"
+    password = _generate_password()
     return email, password, prefix
+
+
+def _random_digits(count):
+    return "".join(random.choice(string.digits) for _ in range(max(1, int(count or 1))))
+
+
+def _email_domain(email):
+    if not email or "@" not in str(email):
+        return random.choice(_email_suffixes())
+    return str(email).rsplit("@", 1)[-1].strip().lstrip("@") or random.choice(_email_suffixes())
+
+
+def _append_random_digits_email(email, prefix=None, digits=1, domain=None):
+    domain = (domain or _email_domain(email)).strip().lstrip("@") or random.choice(_email_suffixes())
+    base_prefix = str(prefix or "").strip()
+    if not base_prefix and email and "@" in str(email):
+        base_prefix = str(email).split("@", 1)[0].strip()
+    if not base_prefix:
+        base_prefix = _generate_prefix()
+    new_prefix = f"{base_prefix}{_random_digits(digits)}"
+    return f"{new_prefix}@{domain}", new_prefix
+
+
+def load_account_queue(path):
+    q = queue.Queue()
+    if not path:
+        return q
+    loaded = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                item = _normalize_account_spec(line)
+            except ValueError as exc:
+                print(f"  account file line {lineno} skipped: {exc}")
+                continue
+            if item:
+                q.put(item)
+                loaded += 1
+    print(f"  loaded account specs: {loaded} from {path}")
+    return q
+
+
+ACCOUNT_FORMAT_PRESETS = {
+    "random": "",
+    "name": "{first}_{last}",
+    "name_digits": "{first}_{last}{digits:3}",
+}
+
+
+def apply_account_format_mode(mode, custom_format=""):
+    mode = (mode or "").strip().lower()
+    if mode == "custom":
+        if custom_format:
+            os.environ["OUTLOOK_ACCOUNT_FORMAT"] = custom_format
+        return
+    if mode in ACCOUNT_FORMAT_PRESETS:
+        value = ACCOUNT_FORMAT_PRESETS[mode]
+        if value:
+            os.environ["OUTLOOK_ACCOUNT_FORMAT"] = value
+        else:
+            os.environ.pop("OUTLOOK_ACCOUNT_FORMAT", None)
 
 
 # ======================== CAPTCHA Solvers ========================
@@ -794,6 +994,8 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
 
         # Step 1: Enter email
         email_ok = False
+        taken_retry_count = 0
+        current_domain = _email_domain(email)
         for retry in range(5):
             email_input = page.locator(
                 'input[type="email"], input[name="MemberName"], input[id="MemberName"], '
@@ -815,6 +1017,8 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 await email_input.fill(prefix)
                 try:
                     await domain_dropdown.select_option("outlook.com")
+                    current_domain = "outlook.com"
+                    email = f"{prefix}@{current_domain}"
                 except Exception:
                     pass
                 print(f"  {tag} filled prefix: {prefix} (dropdown)")
@@ -834,11 +1038,13 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             page_lower = page_text.lower()
 
             if ("already" in page_lower and "email" in page_lower) or "taken" in page_lower:
-                prefix = random.choice(string.ascii_lowercase) + "".join(
-                    random.choices(string.ascii_lowercase + string.digits, k=11)
+                taken_retry_count += 1
+                extra_digits = 3 if taken_retry_count == 1 else 1
+                email, prefix = _append_random_digits_email(
+                    email, prefix, extra_digits, current_domain
                 )
-                email = f"{prefix}@outlook.com"
-                print(f"  {tag} email taken, retry: {email}")
+                current_domain = _email_domain(email)
+                print(f"  {tag} email taken, append {extra_digits} digit(s), retry: {email}")
                 continue
 
             if "needs to start" in page_lower or "in the format" in page_lower or "enter a valid" in page_lower or "use letters" in page_lower:
@@ -1126,7 +1332,7 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 await asyncio.sleep(3)
 
         # Step 5: First/Last Name + checkbox (Chinese: 姓/名)
-        first_name, last_name = generate_name()
+        first_name, last_name = _consume_account_names()
         await asyncio.sleep(2)
 
         for _ in range(10):
@@ -1597,20 +1803,453 @@ def _proxy_for_playwright(proxy_str):
     return result
 
 
+def _extract_signup_server_data(html):
+    """Extract the SPA bootstrap ServerData JSON from signup.live.com."""
+    marker = "var ServerData="
+    start = html.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html[start:])
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _signup_query_url(api_url, signup_url):
+    """Match the SPA request helper: API URL + current signup query string."""
+    query = urlsplit(signup_url).query
+    if not query:
+        return api_url
+    sep = "&" if "?" in api_url else "?"
+    return f"{api_url}{sep}{query}"
+
+
+def _query_param(url, name, default=""):
+    try:
+        values = parse_qs(urlsplit(url).query).get(name)
+        return values[0] if values else default
+    except Exception:
+        return default
+
+
+def _protocol_common_payload(server_data):
+    """Fields added by the current signup SPA request wrapper (Qh())."""
+    return {
+        "uiflvr": server_data.get("iUiFlavor"),
+        "scid": server_data.get("iScenarioId"),
+        "uaid": server_data.get("sUnauthSessionID", ""),
+        "hpgid": server_data.get("hpgid"),
+    }
+
+
+def _protocol_api_headers(server_data, canary, signup_url):
+    uaid = server_data.get("sUnauthSessionID", "")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
+        "canary": canary or "",
+        "hpgid": str(server_data.get("hpgid") or 0),
+        "hpgact": str(server_data.get("hpgact") or 0),
+        "uiflvr": str(server_data.get("iUiFlavor") or ""),
+        "scid": str(server_data.get("iScenarioId") or ""),
+        "uaid": uaid,
+        "Origin": "https://signup.live.com",
+        "Referer": signup_url,
+    }
+    if uaid:
+        headers["correlationId"] = uaid
+        headers["client-request-id"] = uaid
+    session_id = server_data.get("sSessionId") or server_data.get("sessionId")
+    if session_id:
+        headers["sessionId"] = str(session_id)
+    return headers
+
+
+def _update_api_canary(resp_json, fallback):
+    if isinstance(resp_json, dict) and resp_json.get("apiCanary"):
+        return resp_json["apiCanary"]
+    return fallback
+
+
+def _json_or_none(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _protocol_captcharun_enabled():
+    return _env_truthy("OUTLOOK_PROTOCOL_CAPTCHARUN_PX", "0")
+
+
+def _protocol_captcharun_key():
+    return (
+        os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TOKEN")
+        or CAPTCHARUN_API_KEY
+        or ""
+    ).strip()
+
+
+def _protocol_proxy_parts(proxy_str):
+    parsed = BitBrowserClient._parse_proxy(proxy_str or "")
+    if not parsed:
+        return None
+    host = parsed.get("host") or ""
+    port = parsed.get("port") or ""
+    login = parsed.get("username") or ""
+    password = parsed.get("password") or ""
+    if not host or not port:
+        return None
+    return {
+        "host": host,
+        "port": int(port) if str(port).isdigit() else port,
+        "login": login,
+        "password": password,
+    }
+
+
+def _protocol_proxy_geo(proxies, tag):
+    try:
+        resp = requests.get(
+            "http://ip-api.com/json",
+            proxies=proxies,
+            timeout=12,
+        )
+        data = resp.json()
+    except Exception as exc:
+        print(f"  {tag} proxy geo lookup failed: {type(exc).__name__}: {exc}")
+        return {}
+    if not isinstance(data, dict) or data.get("status") == "fail":
+        print(f"  {tag} proxy geo lookup returned: {str(data)[:120]}")
+        return {}
+    info = {
+        "country": data.get("countryCode") or "",
+        "timezone": data.get("timezone") or "",
+        "query": data.get("query") or "",
+    }
+    print(
+        f"  {tag} proxy geo: ip={info['query'] or '-'} "
+        f"country={info['country'] or '-'} timezone={info['timezone'] or '-'}"
+    )
+    return info
+
+
+def _protocol_captcharun_payload(server_data, proxy_str, signup_url, user_agent, proxy_geo=None):
+    proxy_parts = _protocol_proxy_parts(proxy_str)
+    if not proxy_parts:
+        return None
+    uaid = (
+        server_data.get("sUnauthSessionID")
+        or server_data.get("uaid")
+        or _query_param(signup_url, "uaid")
+        or ""
+    )
+    if not uaid:
+        return None
+    payload = {
+        "captchaType": "PxCaptcha2",
+        "uaid": uaid,
+        "userAgent": user_agent,
+        **proxy_parts,
+    }
+    proxy_geo = proxy_geo or {}
+    country = (os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_COUNTRY") or "").strip()
+    if country.upper() == "AUTO":
+        country = ""
+    if not country and os.environ.get("CAPTCHARUN_PX_COUNTRY", "").strip().upper() != "AUTO":
+        country = os.environ.get("CAPTCHARUN_PX_COUNTRY", "").strip()
+    if not country:
+        country = (proxy_geo.get("country") or "US").strip()
+
+    timezone_name = (os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEZONE") or "").strip()
+    if timezone_name.upper() == "AUTO":
+        timezone_name = ""
+    if not timezone_name and os.environ.get("CAPTCHARUN_PX_TIMEZONE", "").strip().upper() != "AUTO":
+        timezone_name = os.environ.get("CAPTCHARUN_PX_TIMEZONE", "").strip()
+    if not timezone_name:
+        timezone_name = (proxy_geo.get("timezone") or "America/New_York").strip()
+    if country:
+        payload["country"] = country
+    if timezone_name:
+        payload["timezone"] = timezone_name
+    return payload
+
+
+def _protocol_captcharun_headers(api_key):
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _protocol_captcharun_create(payload, tag):
+    api_key = _protocol_captcharun_key()
+    if not api_key:
+        print(f"  {tag} CaptchaRun disabled: missing CAPTCHARUN_API_KEY")
+        return None, None
+    try:
+        resp = requests.post(
+            f"{CAPTCHARUN_API_BASE}/v2/tasks",
+            headers=_protocol_captcharun_headers(api_key),
+            json=payload,
+            timeout=45,
+        )
+        data = resp.json()
+    except Exception as exc:
+        print(f"  {tag} CaptchaRun create error: {type(exc).__name__}: {exc}")
+        return None, None
+    if resp.status_code >= 400:
+        print(f"  {tag} CaptchaRun create HTTP {resp.status_code}: {str(data)[:180]}")
+        return None, data
+    task_id = data.get("taskId") or data.get("id")
+    if not task_id and str(data.get("status") or "").lower() == "success":
+        return "sync", data
+    if not task_id:
+        print(f"  {tag} CaptchaRun create missing taskId: {str(data)[:180]}")
+        return None, data
+    return task_id, data
+
+
+def _protocol_captcharun_result(task_id, captcha_type, tag):
+    api_key = _protocol_captcharun_key()
+    timeout_sec = int(os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEOUT")
+                      or os.environ.get("CAPTCHARUN_PX_TIMEOUT")
+                      or "120")
+    deadline = time.time() + max(10, timeout_sec)
+    while time.time() < deadline:
+        try:
+            resp = requests.get(
+                f"{CAPTCHARUN_API_BASE}/v2/tasks/{task_id}",
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+                params={"captchaType": captcha_type},
+                timeout=30,
+            )
+            data = resp.json()
+        except Exception as exc:
+            print(f"  {tag} CaptchaRun poll {captcha_type} error: {type(exc).__name__}: {exc}")
+            return None
+        status = str(data.get("status") or "").lower()
+        if status == "success":
+            return data
+        if status == "fail":
+            print(f"  {tag} CaptchaRun {captcha_type} fail: {str(data)[:180]}")
+            return None
+        time.sleep(4)
+    print(f"  {tag} CaptchaRun {captcha_type} timeout")
+    return None
+
+
+def _protocol_token_value(captcha_data, token_name):
+    if not isinstance(captcha_data, dict):
+        return None
+    response = captcha_data.get("response") or {}
+    if isinstance(response, dict):
+        return response.get(token_name) or response.get("token") or response
+    return response
+
+
+def _protocol_risk_headers(server_data, canary, signup_url, user_agent):
+    headers = _protocol_api_headers(server_data, canary, signup_url)
+    headers.update({
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": user_agent,
+        "Origin": "https://signup.live.com",
+        "Referer": signup_url,
+    })
+    return headers
+
+
+def _protocol_risk_initialize(session, server_data, canary, signup_url, proxies, account_ctx, user_agent, tag):
+    cookies = session.cookies.get_dict()
+    payload = {
+        "riskProvider": "Human",
+        "riskProviderMetadata": {
+            "px3": cookies.get("_px3", ""),
+            "pxde": cookies.get("_pxde", ""),
+            "pxvid": cookies.get("_pxvid", ""),
+        },
+        "memberName": account_ctx["email"],
+        "siteId": server_data.get("sSiteId", ""),
+        "uiFlavor": server_data.get("iUiFlavor"),
+        "appId": "Web",
+        "birthdate": account_ctx["birthdate"],
+        "firstName": account_ctx["first_name"],
+        "lastName": account_ctx["last_name"],
+        "countryCode": account_ctx["country"],
+        "verificationCode": "",
+        "deviceDetails": {},
+        "isRdm": bool(server_data.get("fIsRDM")),
+    }
+    try:
+        resp = session.post(
+            f"{MS_RISK_BASE}/initialize",
+            headers=_protocol_risk_headers(server_data, canary, signup_url, user_agent),
+            json=payload,
+            proxies=proxies,
+            timeout=30,
+        )
+        data = resp.json()
+    except Exception as exc:
+        print(f"  {tag} risk/initialize error: {type(exc).__name__}: {exc}")
+        return None
+    if resp.status_code >= 400:
+        print(f"  {tag} risk/initialize HTTP {resp.status_code}: {str(data)[:180]}")
+        return None
+    return data
+
+
+def _protocol_risk_verify(session, server_data, canary, signup_url, proxies, state, token, user_agent, tag):
+    payload = {
+        "state": state or "",
+        "challengeType": "HumanCaptcha",
+        "challengeSolution": token,
+    }
+    try:
+        resp = session.post(
+            f"{MS_RISK_BASE}/verify",
+            headers=_protocol_risk_headers(server_data, canary, signup_url, user_agent),
+            json=payload,
+            proxies=proxies,
+            timeout=30,
+        )
+        data = resp.json()
+    except Exception as exc:
+        print(f"  {tag} risk/verify error: {type(exc).__name__}: {exc}")
+        return None
+    if resp.status_code >= 400:
+        print(f"  {tag} risk/verify HTTP {resp.status_code}: {str(data)[:180]}")
+        return None
+    return data
+
+
+def _protocol_risk_fields(verify_data):
+    if not isinstance(verify_data, dict):
+        return {}
+    candidates = [
+        verify_data,
+        verify_data.get("data") if isinstance(verify_data.get("data"), dict) else {},
+        verify_data.get("error_data") if isinstance(verify_data.get("error_data"), dict) else {},
+        verify_data.get("challengeDetails") if isinstance(verify_data.get("challengeDetails"), dict) else {},
+    ]
+    fields = {}
+    key_map = {
+        "arkoseBlob": ("arkoseBlob", "ArkoseBlob"),
+        "riskAssessmentDetails": ("riskAssessmentDetails", "RiskAssessmentDetails"),
+        "repMapRequestIdentifierDetails": (
+            "repMapRequestIdentifierDetails",
+            "RepMapRequestIdentifierDetails",
+        ),
+    }
+    for src in candidates:
+        if not isinstance(src, dict):
+            continue
+        for out_key, aliases in key_map.items():
+            for alias in aliases:
+                value = src.get(alias)
+                if value:
+                    fields[out_key] = value
+                    break
+    return fields
+
+
+def _protocol_solve_risk_with_captcharun(session, server_data, canary, signup_url, proxies,
+                                         proxy_str, account_ctx, user_agent, tag):
+    if not _protocol_captcharun_enabled():
+        return {}
+    proxy_geo = {}
+    if proxies and not (
+        os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_COUNTRY")
+        and os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEZONE")
+    ):
+        proxy_geo = _protocol_proxy_geo(proxies, tag)
+    payload = _protocol_captcharun_payload(
+        server_data, proxy_str, signup_url, user_agent, proxy_geo=proxy_geo
+    )
+    if not payload:
+        print(f"  {tag} CaptchaRun skipped: missing uaid or account proxy")
+        return {}
+    print(f"  {tag} CaptchaRun PxCaptcha2 create uaid={payload.get('uaid', '')[:8]}...")
+    task_id, create_data = _protocol_captcharun_create(payload, tag)
+    if not task_id:
+        return {}
+
+    init_data = _protocol_risk_initialize(
+        session, server_data, canary, signup_url, proxies, account_ctx, user_agent, tag
+    )
+    state = init_data.get("state") if isinstance(init_data, dict) else ""
+
+    silent_data = create_data if task_id == "sync" else _protocol_captcharun_result(task_id, "silent", tag)
+    silent_token = _protocol_token_value(silent_data, "silentToken")
+    if not silent_token:
+        print(f"  {tag} CaptchaRun no silentToken")
+        return {}
+
+    verify_data = _protocol_risk_verify(
+        session, server_data, canary, signup_url, proxies, state, silent_token, user_agent, tag
+    )
+    fields = _protocol_risk_fields(verify_data)
+    if fields:
+        print(f"  {tag} risk verified by silent token: {list(fields.keys())}")
+        return fields
+
+    # 样本逻辑：无感不够时再取 press token 继续 risk/verify。
+    press_data = create_data if task_id == "sync" else _protocol_captcharun_result(task_id, "press", tag)
+    press_token = _protocol_token_value(press_data, "pressToken")
+    if not press_token:
+        return {}
+    verify_data = _protocol_risk_verify(
+        session, server_data, canary, signup_url, proxies, state, press_token, user_agent, tag
+    )
+    fields = _protocol_risk_fields(verify_data)
+    if fields:
+        print(f"  {tag} risk verified by press token: {list(fields.keys())}")
+    return fields
+
+
+def _protocol_log_error_response(tag, response, body_json=None):
+    if isinstance(body_json, dict) and isinstance(body_json.get("error"), dict):
+        err = body_json["error"]
+        code = err.get("code") or ""
+        field = err.get("field") or ""
+        message = err.get("message") or err.get("description") or ""
+        suffix = f" field={field}" if field else ""
+        if message:
+            suffix += f" msg={str(message)[:120]}"
+        print(f"  {tag} CreateAccount error code={code}{suffix}")
+        return
+    location = response.headers.get("location") or response.url
+    errcode = ""
+    if location:
+        errcode = _query_param(location, "e") or _query_param(location, "errcode")
+    if not errcode:
+        match = re.search(r"errcode=([0-9A-Za-z._-]+)", response.text or "", re.I)
+        errcode = match.group(1) if match else ""
+    if errcode:
+        print(f"  {tag} CreateAccount redirected/error code={errcode}")
+    else:
+        print(f"  {tag} CreateAccount unexpected HTTP {response.status_code}")
+
+
 def register_outlook_protocol(proxy_str=None, idx=0):
     """
-    Register Outlook via pure HTTP requests — no browser, ~50KB per attempt.
+    Register Outlook via current signup.live.com SPA JSON APIs.
     Returns (email, password) on success, (None, None) on failure/captcha.
     """
     tag = f"[#{idx}][proto]"
     session = requests.Session()
     proxies = _proxy_for_requests(proxy_str)
+    user_agent = (
+        os.environ.get("OUTLOOK_PROTOCOL_USER_AGENT")
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/145.0.0.0 Safari/537.36"
+    )
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/130.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
@@ -1619,8 +2258,9 @@ def register_outlook_protocol(proxy_str=None, idx=0):
 
     try:
         print(f"  {tag} GET signup page...")
+        signup_url = "https://signup.live.com/signup?lic=1"
         resp = session.get(
-            "https://signup.live.com/signup?lic=1",
+            signup_url,
             proxies=proxies, timeout=30, allow_redirects=True,
         )
         if resp.status_code != 200:
@@ -1628,110 +2268,162 @@ def register_outlook_protocol(proxy_str=None, idx=0):
             return None, None
 
         html = resp.text
-
-        # Microsoft signup is a React SPA — form fields rendered via JS.
-        # Protocol mode only works if the server-side rendered form is present.
-        # Detect availability by checking for MemberName field.
-        if "MemberName" not in html and "iSignupAction" not in html:
-            print(f"  {tag} SPA form not in HTML (JS-rendered) — protocol N/A")
+        server_data = _extract_signup_server_data(html)
+        if not server_data:
+            print(f"  {tag} no ServerData in signup page")
             return None, None
 
-        # Detect immediate bot-block
-        if any(kw in html.lower() for kw in ["perimeterx", "px-block", "_px.init", "bot protection"]):
-            print(f"  {tag} PerimeterX blocked on load")
+        check_url = server_data.get("urlCheckAvailableSigninNames")
+        create_url = server_data.get("urlCreateAccount")
+        canary = server_data.get("apiCanary", "")
+        if not check_url or not create_url or not canary:
+            print(f"  {tag} missing SPA API bootstrap fields")
             return None, None
 
-        # Extract PPFT (CSRF token)
-        ppft = None
-        for pat in [
-            r'name="PPFT"[^>]*value="([^"]+)"',
-            r'"sFT"\s*:\s*"([^"]+)"',
-            r"sFT\s*:\s*'([^']+)'",
-        ]:
-            m = re.search(pat, html)
-            if m:
-                ppft = m.group(1)
+        signup_url = resp.url or signup_url
+        common_payload = _protocol_common_payload(server_data)
+        check_url = _signup_query_url(check_url, signup_url)
+        create_url = _signup_query_url(create_url, signup_url)
+
+        email = password = None
+        check_result = None
+        prefix = None
+        domain = None
+        for attempt in range(5):
+            if attempt == 0:
+                email, password, prefix = generate_email_password()
+                domain = _email_domain(email)
+            else:
+                extra_digits = 3 if attempt == 1 else 1
+                email, prefix = _append_random_digits_email(email, prefix, extra_digits, domain)
+            headers = _protocol_api_headers(server_data, canary, signup_url)
+            check_payload = {
+                "includeSuggestions": True,
+                "signInName": email,
+                **common_payload,
+            }
+            check_resp = session.post(
+                check_url,
+                headers=headers,
+                json=check_payload,
+                proxies=proxies,
+                timeout=30,
+                allow_redirects=True,
+            )
+            check_result = _json_or_none(check_resp)
+            canary = _update_api_canary(check_result, canary)
+            if not isinstance(check_result, dict):
+                print(f"  {tag} CheckAvailable non-json HTTP {check_resp.status_code}")
+                return None, None
+            if check_result.get("error"):
+                _protocol_log_error_response(tag, check_resp, check_result)
+                return None, None
+            if check_result.get("isAvailable") is True:
                 break
-        if not ppft:
-            print(f"  {tag} no PPFT token found")
+            if attempt < 4:
+                extra_digits = 3 if attempt == 0 else 1
+                print(
+                    f"  {tag} email unavailable: {email}, next retry appends "
+                    f"{extra_digits} digit(s) ({attempt + 1}/5)"
+                )
+            else:
+                print(f"  {tag} email unavailable: {email} ({attempt + 1}/5)")
+        else:
             return None, None
 
-        # Extract uaid and action URL
-        uaid_m = re.search(r'[?&]uaid=([A-Za-z0-9\-]+)', html)
-        uaid = uaid_m.group(1) if uaid_m else ""
-        action_m = re.search(r'action="(https://signup\.live\.com[^"]+)"', html)
-        action_url = action_m.group(1) if action_m else f"https://signup.live.com/signup?lic=1&uaid={uaid}"
-
-        # Extract canary token (CSRF #2, optional)
-        canary_name_m = re.search(r'"sCanaryTokenName"\s*:\s*"([^"]+)"', html)
-        canary_val_m = re.search(r'"sCanaryToken"\s*:\s*"([^"]+)"', html)
-        canary_name = canary_name_m.group(1) if canary_name_m else ""
-        canary_val = canary_val_m.group(1) if canary_val_m else ""
-
-        # Generate account details
-        email, password, prefix = generate_email_password()
-        first_name, last_name = generate_name()
+        first_name, last_name = _consume_account_names()
         year, month, day = generate_birthday()
         print(f"  {tag} trying: {email}")
 
-        form_data = {
-            "MemberName": f"{prefix}@outlook.com",
-            "Password": password,
+        is_possible_evicted = bool((check_result or {}).get("isPossibleEvicted"))
+        country = os.environ.get("OUTLOOK_PROTOCOL_COUNTRY", "US")
+        birthdate = f"{day:02d}:{month:02d}:{year}"
+        risk_fields = _protocol_solve_risk_with_captcharun(
+            session,
+            server_data,
+            canary,
+            signup_url,
+            proxies,
+            proxy_str,
+            {
+                "email": email,
+                "birthdate": birthdate,
+                "first_name": first_name,
+                "last_name": last_name,
+                "country": country,
+            },
+            user_agent,
+            tag,
+        )
+        create_payload = {
+            "BirthDate": birthdate,
+            "CheckAvailStateMap": [f"{email}:{str(is_possible_evicted).lower()}"],
+            "Country": country,
+            "EvictionWarningShown": [],
             "FirstName": first_name,
+            "IsRDM": bool(server_data.get("fIsRDM")),
+            "IsOptOutEmailDefault": not bool(server_data.get("fIsOptinEmailInitialValue")),
+            "IsOptOutEmailShown": bool(server_data.get("fShowOptinEmail")),
+            "IsOptOutEmail": True,
+            "IsUserConsentedToChinaPIPL": False,
             "LastName": last_name,
-            "BirthDate": str(day),
-            "BirthMonth": str(month),
-            "BirthYear": str(year),
-            "Country": "US",
-            "LiveDomainBoxList": "outlook.com",
-            "LcId": "1033",
-            "PPFT": ppft,
-            "lic": "1",
-            "sErrorCode": "",
-            "iSignupFlow": "2",
+            "LW": bool(server_data.get("fIsLightWeightSignUp")),
+            "MemberName": email,
+            "RequestTimeStamp": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
+            "ReturnUrl": _query_param(signup_url, "ru"),
+            "SignupReturnUrl": _query_param(signup_url, "sru"),
+            "SuggestedAccountType": server_data.get("sSuggestedAccountType", ""),
+            "SiteId": server_data.get("sSiteId", ""),
+            "VerificationCode": "",
+            "VerificationCodeSlt": "",
+            "PrivateAccessToken": server_data.get("sPrivateAccessToken", ""),
+            "WReply": _query_param(signup_url, "wreply"),
+            "MemberNameChangeCount": 1,
+            "MemberNameAvailableCount": 1,
+            "MemberNameUnavailableCount": 0,
+            "Password": password,
+            **common_payload,
         }
-        if canary_name and canary_val:
-            form_data[canary_name] = canary_val
+        if risk_fields:
+            create_payload.update(risk_fields)
 
         resp2 = session.post(
-            action_url,
-            data=form_data,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://signup.live.com/signup?lic=1",
-                "Origin": "https://signup.live.com",
-            },
+            create_url,
+            headers=_protocol_api_headers(server_data, canary, signup_url),
+            json=create_payload,
             proxies=proxies, timeout=30, allow_redirects=True,
         )
 
-        final_url = resp2.url.lower()
-        body = resp2.text.lower()
+        body_json = _json_or_none(resp2)
+        canary = _update_api_canary(body_json, canary)
+        if isinstance(body_json, dict) and body_json.get("error"):
+            _protocol_log_error_response(tag, resp2, body_json)
+            return None, None
 
-        # Success: left signup domain
-        if "signup" not in final_url and any(kw in final_url for kw in ["outlook", "live.com", "microsoft"]):
-            if not verify_registered_outlook(email, password, tag):
+        if isinstance(body_json, dict) and (
+            body_json.get("redirectUrl") or body_json.get("slt")
+            or body_json.get("signinName") or body_json.get("signInName")
+        ):
+            registered_email = (
+                body_json.get("signinName") or body_json.get("signInName")
+                or body_json.get("memberName") or email
+            )
+            if not verify_registered_outlook(registered_email, password, tag):
                 print(f"  {tag} verification failed, discarding proto account")
                 return None, None
-            print(f"  {tag} OK (proto): {email}")
-            return email, password
+            print(f"  {tag} OK (proto): {registered_email}")
+            return registered_email, password
 
-        # Captcha / bot detection → fall back
+        body = (resp2.text or "").lower()
         if any(kw in body for kw in ["captcha", "perimeterx", "challenge", "press and hold",
-                                      "verify you're human", "unusual activity", "_pxhd"]):
-            print(f"  {tag} captcha/bot detected — proto failed")
+                                      "verify you're human", "unusual activity", "_pxhd",
+                                      "arkose", "hip", "risk"]):
+            print(f"  {tag} challenge/risk page returned — proto failed")
             return None, None
 
-        # Email taken
-        if ("already" in body and "email" in body) or "taken" in body:
-            print(f"  {tag} email taken")
-            return None, None
-
-        # Blocked
-        if "blocked" in body or "suspended" in body:
-            print(f"  {tag} account blocked")
-            return None, None
-
-        print(f"  {tag} unknown result: {resp2.url[:80]}")
+        _protocol_log_error_response(tag, resp2, body_json)
         return None, None
 
     except Exception as e:
@@ -2095,6 +2787,19 @@ async def main():
     parser.add_argument("--count", "-n", type=int, default=10, help="Number of accounts to register")
     parser.add_argument("--concurrency", "-c", type=int, default=2, help="Parallel registrations")
     parser.add_argument("--proxy-file", "-p", type=str, help="Proxy file (one per line: user:pass@host:port)")
+    parser.add_argument("--account-file", type=str, default="",
+                        help="Optional account spec file: account / account@suffix / account----password / account@suffix----password")
+    parser.add_argument("--email-suffixes", type=str, default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES", ""),
+                        help="Email suffix pool, comma/space separated, e.g. outlook.com,hotmail.com")
+    parser.add_argument("--account-format-mode", type=str,
+                        default=(os.environ.get("OUTLOOK_ACCOUNT_FORMAT_MODE")
+                                 or ("custom" if os.environ.get("OUTLOOK_ACCOUNT_FORMAT") else "name")),
+                        choices=["random", "name", "name_digits", "custom"],
+                        help="Account format preset: random/name/name_digits/custom")
+    parser.add_argument("--account-format", type=str, default=os.environ.get("OUTLOOK_ACCOUNT_FORMAT", ""),
+                        help="Generated local-part template, e.g. {first}.{last}{digits:3}; empty uses default random")
+    parser.add_argument("--password-format", type=str, default=os.environ.get("OUTLOOK_PASSWORD_FORMAT", ""),
+                        help="Generated password template, e.g. Aa1!{rand:12}; empty uses default random")
     parser.add_argument("--no-proxy", action="store_true", default=False, help="No proxy")
     parser.add_argument("--timeout", "-t", type=int, default=300, help="Per-account timeout (seconds)")
     parser.add_argument("--mode", "-m", type=str, default="auto",
@@ -2104,13 +2809,42 @@ async def main():
                         help="Do not verify Outlook login before writing successful accounts")
     parser.add_argument("--confirm-before-register", action="store_true",
                         help="Auto-click confirmation on the signup page before filling")
+    parser.add_argument("--protocol-captcharun-px", action=argparse.BooleanOptionalAction,
+                        default=_env_truthy("OUTLOOK_PROTOCOL_CAPTCHARUN_PX", "0"),
+                        help="Protocol mode: use CaptchaRun PxCaptcha2 + Microsoft risk/verify before CreateAccount")
+    parser.add_argument("--protocol-captcharun-token", default=os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TOKEN", ""),
+                        help="Protocol mode: CaptchaRun token; falls back to CAPTCHARUN_API_KEY/CAPTCHARUN_TOKEN")
+    parser.add_argument("--protocol-captcharun-country", default=os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_COUNTRY", ""),
+                        help="Protocol mode: CaptchaRun country code, e.g. US; empty/AUTO = detect by proxy")
+    parser.add_argument("--protocol-captcharun-timezone", default=os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEZONE", ""),
+                        help="Protocol mode: CaptchaRun timezone, e.g. America/New_York; empty/AUTO = detect by proxy")
+    parser.add_argument("--protocol-captcharun-timeout", type=int,
+                        default=int(os.environ.get("OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEOUT")
+                                    or os.environ.get("CAPTCHARUN_PX_TIMEOUT")
+                                    or "120"),
+                        help="Protocol mode: CaptchaRun per-stage polling timeout seconds")
     args = parser.parse_args()
 
-    global REGISTER_TIMEOUT, VERIFY_AFTER_REGISTER
+    global REGISTER_TIMEOUT, VERIFY_AFTER_REGISTER, ACCOUNT_QUEUE
     REGISTER_TIMEOUT = args.timeout
     VERIFY_AFTER_REGISTER = not args.no_verify
+    if args.email_suffixes:
+        os.environ["OUTLOOK_ACCOUNT_SUFFIXES"] = args.email_suffixes
+    os.environ["OUTLOOK_ACCOUNT_FORMAT_MODE"] = args.account_format_mode
+    apply_account_format_mode(args.account_format_mode, args.account_format)
+    if args.password_format:
+        os.environ["OUTLOOK_PASSWORD_FORMAT"] = args.password_format
+    ACCOUNT_QUEUE = load_account_queue(args.account_file) if args.account_file else None
     if args.confirm_before_register:
         os.environ["OUTLOOK_CONFIRM_BEFORE_REGISTER"] = "1"
+    os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_PX"] = "1" if args.protocol_captcharun_px else "0"
+    if args.protocol_captcharun_token:
+        os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_TOKEN"] = args.protocol_captcharun_token
+    if args.protocol_captcharun_country:
+        os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_COUNTRY"] = args.protocol_captcharun_country
+    if args.protocol_captcharun_timezone:
+        os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEZONE"] = args.protocol_captcharun_timezone
+    os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEOUT"] = str(args.protocol_captcharun_timeout)
     proxy_env = ensure_clash_proxy_env()
     if proxy_env:
         print(f"  proxy env ready: {proxy_env}")

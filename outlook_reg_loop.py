@@ -14,8 +14,9 @@ Usage:
   python outlook_reg_loop.py --max-press 5         # OUTLOOK_REG_MAX_PRESS
   python outlook_reg_loop.py --sleep 5             # gap between attempts (s)
 
-Reads HTTP_PROXY env for Clash routing (host:port form). Set
-SELF_REG_SCRIPT_PATH to override standalone script location.
+Standalone mode uses a random proxy from --proxy-file / OUTLOOK_PROXIES and
+puts it directly into the BitBrowser profile. Set SELF_REG_SCRIPT_PATH to
+override standalone script location.
 """
 from __future__ import annotations
 
@@ -23,11 +24,15 @@ import argparse
 import asyncio
 import json
 import os
+import random
+import re
 import sys
 import time
 import importlib.util
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 
 if sys.platform == "win32":
     try:
@@ -39,46 +44,134 @@ ARTIFACT_DIR = os.path.dirname(os.path.abspath(__file__))
 POOL_DIR = os.path.join(ARTIFACT_DIR, "_outlook_pool")
 # 账号注册侧消费的池（common/emails.next_email 读取），格式 email----password----token----clientid
 EMAILS_POOL = os.path.join(ARTIFACT_DIR, "emails.txt")
-
 STANDALONE_PATH = os.environ.get(
     "SELF_REG_SCRIPT_PATH",
     os.path.join(ARTIFACT_DIR, "register_outlook_standalone.py"),
 )
+RUOYI_PATH = os.environ.get(
+    "SELF_REG_RUOYI_PATH",
+    os.path.join(ARTIFACT_DIR, "register_outlook_ruoyi.py"),
+)
+CAMONFOX_PATH = os.environ.get(
+    "SELF_REG_CAMONFOX_PATH",
+    os.path.join(ARTIFACT_DIR, "register_outlook_camonfox.py"),
+)
 
-# Optional Clash rotation between attempts. Without this, MS PerimeterX
-# learns the egress IP after 1-2 signups and ERR_CONNECTION_CLOSEDs us out.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    import _clash_verge  # type: ignore
-except ImportError:
-    _clash_verge = None
 
 
 def log(msg, level="INFO"):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
 
 
-def ensure_clash_proxy_env():
-    """Use .env CLASH_PROXY for direct loop runs, while keeping local APIs direct."""
-    existing = (
-        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        or ""
-    ).strip()
-    proxy = existing or os.environ.get("CLASH_PROXY", "").strip()
-    if not proxy:
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+_PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+def _looks_like_local_proxy(value):
+    v = (value or "").strip().lower()
+    if not v:
+        return False
+    return ("127.0.0.1" in v or "localhost" in v) and any(
+        port in v for port in (":7890", ":7897", ":7898")
+    )
+
+
+def clear_inherited_local_proxy_env():
+    """养号循环不用本机转发代理，避免覆盖账号专用代理。"""
+    removed = []
+    for key in _PROXY_ENV_KEYS:
+        value = os.environ.get(key)
+        if _looks_like_local_proxy(value):
+            os.environ.pop(key, None)
+            removed.append(key)
+    if removed:
+        log(f"ignored inherited local proxy env: {', '.join(sorted(set(removed)))}")
+
+
+def parse_proxy(proxy_str):
+    """Parse user:pass@host:port / host:port / socks5://... into BitBrowser fields."""
+    if not proxy_str:
+        return None
+    proxy_type = "http"
+    s = str(proxy_str).strip()
+    for prefix in ("socks5://", "socks4://", "http://", "https://"):
+        if s.lower().startswith(prefix):
+            proxy_type = prefix.split("://", 1)[0]
+            s = s[len(prefix):]
+            break
+    s = s.replace(",", "@", 1) if "@" not in s and "," in s else s
+    m = re.match(r"^(.+):(.+)@(.+):(\d+)$", s)
+    if m:
+        return {
+            "type": proxy_type,
+            "username": m.group(1),
+            "password": m.group(2),
+            "host": m.group(3),
+            "port": m.group(4),
+        }
+    m = re.match(r"^(.+):(\d+)$", s)
+    if m:
+        return {"type": proxy_type, "host": m.group(1), "port": m.group(2)}
+    return None
+
+
+def mask_proxy(proxy_str):
+    p = parse_proxy(proxy_str)
+    if not p:
+        return "***" if proxy_str else "noproxy"
+    user = p.get("username")
+    auth = f"{user[:8]}...@" if user else ""
+    return f"{p.get('type', 'http')}://{auth}{p['host']}:{p['port']}"
+
+
+def proxy_url_for_requests(proxy_str):
+    p = parse_proxy(proxy_str)
+    if not p:
         return ""
-    if not existing:
-        os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
-        os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
-    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-    required = ["127.0.0.1", "localhost", "::1"]
-    parts = [p.strip() for p in no_proxy.split(",") if p.strip()]
-    for item in required:
-        if item not in parts:
-            parts.append(item)
-    os.environ["NO_PROXY"] = os.environ["no_proxy"] = ",".join(parts)
-    return proxy
+    auth = f"{p['username']}:{p['password']}@" if p.get("username") else ""
+    return f"{p.get('type', 'http')}://{auth}{p['host']}:{p['port']}"
+
+
+@contextmanager
+def account_proxy_env(proxy_str):
+    """Temporarily route trust_env=True HTTP helpers through the account proxy."""
+    old = {k: os.environ.get(k) for k in _PROXY_ENV_KEYS}
+    try:
+        for key in _PROXY_ENV_KEYS:
+            os.environ.pop(key, None)
+        url = proxy_url_for_requests(proxy_str)
+        if url:
+            os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = url
+            os.environ["http_proxy"] = os.environ["https_proxy"] = url
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def load_proxy_pool(proxy_file="", mod=None):
+    pool = []
+    if proxy_file and os.path.isfile(proxy_file):
+        with open(proxy_file, "r", encoding="utf-8") as f:
+            pool.extend(
+                line.strip() for line in f
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+    elif proxy_file:
+        log(f"proxy file not found: {proxy_file}", "WARN")
+    if not pool and mod is not None:
+        pool.extend(list(getattr(mod, "DEFAULT_PROXIES", []) or []))
+    return pool
 
 
 def load_standalone():
@@ -92,104 +185,34 @@ def load_standalone():
     return m
 
 
-def init_clash():
-    """Connect to Clash controller. Returns (client, group_name) or (None, None)."""
-    if _clash_verge is None:
-        return None, None
-    api = os.environ.get("CLASH_API", "").strip() or None
-    secret = os.environ.get("CLASH_SECRET", "").strip()
-    if not api:
-        try:
-            api = _clash_verge.auto_detect_api(secret=secret)
-        except Exception as e:
-            log(f"clash auto-detect failed: {e}", "WARN")
-            return None, None
-    if not api:
-        return None, None
-    try:
-        client = _clash_verge.ClashClient(api=api, secret=secret)
-    except Exception as e:
-        log(f"clash client init failed: {e}", "WARN")
-        return None, None
-    group = (os.environ.get("CLASH_GROUP", "").strip() or "").strip()
-    if not group or group.lower() == "auto":
-        try:
-            group = _clash_verge.auto_pick_group(client) or ""
-        except Exception as e:
-            log(f"clash auto-pick group failed: {e}", "WARN")
-    if not group:
-        log("clash: no usable group", "WARN")
-        return None, None
-    log(f"clash ready: api={api} group={group!r}")
-    return client, group
+def load_ruoyi():
+    if not os.path.isfile(RUOYI_PATH):
+        log(f"ruoyi backend not found at {RUOYI_PATH}", "ERR")
+        sys.exit(1)
+    spec = importlib.util.spec_from_file_location("_self_reg_ruoyi", RUOYI_PATH)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    log(f"loaded ruoyi from {RUOYI_PATH}")
+    return m
 
 
-# Clash 节点轮换排除名单：国内直连/大陆节点从中国 IP 出口，Outlook(MS PerimeterX)
-# 对中国 IP 的按住验证基本必挂，且轮到它纯浪费一次 attempt，故从 GLOBAL 轮换里剔除。
-# 子串匹配（节点名含任一即排除）。可经 CLASH_EXCLUDE_NODES 环境变量追加（逗号分隔）。
-_CN_EXCLUDE_HINTS = ("国内直连", "直连", "DIRECT", "大陆", "国内", "China", "回国")
+def load_camonfox():
+    if not os.path.isfile(CAMONFOX_PATH):
+        log(f"camonfox backend not found at {CAMONFOX_PATH}", "ERR")
+        sys.exit(1)
+    spec = importlib.util.spec_from_file_location("_self_reg_camonfox", CAMONFOX_PATH)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    log(f"loaded camonfox from {CAMONFOX_PATH}")
+    return m
 
 
-def _rotate_excluded(client, group):
-    """把 CN/直连子串提示解析成 GLOBAL 组里真实节点名集合（pick_node 用精确匹配，
-    故必须先列出实际节点名再按子串挑出要排除的）。CLASH_EXCLUDE_NODES 追加精确名。"""
-    ex = set()
-    extra = (os.environ.get("CLASH_EXCLUDE_NODES") or "").strip()
-    if extra:
-        ex |= {x.strip() for x in extra.replace("，", ",").split(",") if x.strip()}
-    try:
-        for name in client.list_nodes(group):
-            if any(h in name for h in _CN_EXCLUDE_HINTS):
-                ex.add(name)
-    except Exception as e:
-        log(f"resolve excluded nodes err: {type(e).__name__}: {e}", "WARN")
-    return ex
-
-
-def maybe_rotate(client, group, strategy="round_robin", max_latency_ms=6000,
-                 mixed_port=7897):
-    """Rotate to a fresh Clash node and verify egress IP actually changed.
-    Uses rotate_with_verify which recurses into nested selector groups when
-    the outer switch hits another group (e.g. GLOBAL -> 📲 Telegram is just
-    another selector, not a real node).
-
-    排除国内直连/大陆节点（见 _CN_EXCLUDE_HINTS）：中国 IP 注册 Outlook 基本必挂。"""
-    if client is None or not group:
-        return None
-    try:
-        excluded = _rotate_excluded(client, group)
-        if excluded:
-            log(f"clash rotate excluding CN/direct nodes: {sorted(excluded)}")
-        info = _clash_verge.rotate_with_verify(
-            client, group, strategy=strategy,
-            max_latency_ms=max_latency_ms,
-            mixed_port=mixed_port,
-            settle_sec=1.5,
-            excluded=excluded,
-        )
-        if info.get("ip_changed"):
-            log(f"clash IP {info.get('ip_before')} -> {info.get('ip_after')} (group={info.get('group')})")
-        else:
-            log(f"clash rotate: IP unchanged ({info.get('ip_before')})", "WARN")
-        return info
-    except Exception as e:
-        log(f"clash rotate err: {type(e).__name__}: {e}", "WARN")
-        return None
-
-
-def clash_proxy_from_env():
-    raw = (
-        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        or ""
-    ).strip()
-    if not raw:
-        return None
-    for pfx in ("http://", "https://", "socks5://"):
-        if raw.lower().startswith(pfx):
-            raw = raw[len(pfx):]
-            break
-    return raw.rstrip("/") or None
+def load_engine(engine):
+    if engine == "ruoyi":
+        return load_ruoyi()
+    if engine == "camonfox":
+        return load_camonfox()
+    return load_standalone()
 
 
 BB_API = os.environ.get("BITBROWSER_API", "http://127.0.0.1:54345")
@@ -215,21 +238,33 @@ def _bb_call(path, body):
         return json.loads(r.read())
 
 
-def bb_create_for_outlook_reg(name):
+def apply_bitbrowser_proxy(data, proxy_str):
+    p = parse_proxy(proxy_str)
+    if not p:
+        data["proxyType"] = "noproxy"
+        return False
+    data["proxyType"] = p.get("type", "http")
+    data["host"] = p["host"]
+    data["port"] = p["port"]
+    if p.get("username"):
+        data["proxyUserName"] = p["username"]
+    if p.get("password"):
+        data["proxyPassword"] = p["password"]
+    return True
+
+
+def bb_create_for_outlook_reg(name, proxy_str=None):
     """Mirror bs_register_step1.bb_create_ephemeral so we share the working
-    fingerprint config (proxyType=noproxy + IP-derived locale; routes through
-    Clash via TUN). Standalone's hardcoded coreVersion=130 returns 502 on
-    BitBrowser builds that only have Chromium 146 installed."""
+    fingerprint config and the installed Chromium version, while putting the
+    selected account proxy directly into the BitBrowser profile."""
     if _fingerprint_provider() in {"adspower", "ads_power", "ads"}:
         from bitbrowser import BitBrowser
-        return BitBrowser().create_browser(
-            name=name,
-            remark="outlook reg loop auto-deleted after use",
-            platform="https://outlook.live.com",
-            platformIcon="outlook.live.com",
-            proxyMethod=2,
-            proxyType="noproxy",
-            browserFingerPrint={
+        kwargs = {
+            "remark": "outlook reg loop auto-deleted after use",
+            "platform": "https://outlook.live.com",
+            "platformIcon": "outlook.live.com",
+            "proxyMethod": 2,
+            "browserFingerPrint": {
                 "ostype": "PC",
                 "os": "Win32",
                 "coreVersion": BB_CORE_VERSION,
@@ -239,14 +274,15 @@ def bb_create_for_outlook_reg(name):
                 "isIpCreatePosition": True,
                 "isIpCountry": True,
             },
-        )
+        }
+        apply_bitbrowser_proxy(kwargs, proxy_str)
+        return BitBrowser().create_browser(name=name, **kwargs)
     body = {
         "name": name,
         "remark": "outlook reg loop — auto-deleted after use",
         "platform": "https://outlook.live.com",
         "platformIcon": "outlook.live.com",
         "proxyMethod": 2,
-        "proxyType": "noproxy",
         "browserFingerPrint": {
             "ostype": "PC",
             "os": "Win32",
@@ -258,6 +294,8 @@ def bb_create_for_outlook_reg(name):
             "isIpCountry": True,
         },
     }
+    apply_bitbrowser_proxy(body, proxy_str)
+    log(f"BitBrowser proxy: {mask_proxy(proxy_str)}")
     r = _bb_call("/browser/update", body)
     if not r.get("success"):
         raise RuntimeError(f"/browser/update failed: {r}")
@@ -277,12 +315,13 @@ def count_pool():
         return 0
 
 
-def extract_graph_for_account(email, password, attempts=3):
+def extract_graph_for_account(email, password, attempts=3, proxy_str=None):
     """Return Graph token data for a freshly registered Outlook account."""
     try:
         from extract_graph_tokens import get_graph_token
         for attempt in range(attempts):
-            res = get_graph_token(email, password)
+            with account_proxy_env(proxy_str):
+                res = get_graph_token(email, password)
             if res and res.get("refresh_token"):
                 graph = {
                     "refresh_token": res["refresh_token"],
@@ -291,16 +330,7 @@ def extract_graph_for_account(email, password, attempts=3):
                 log(f"graph token extracted for {email}", "OK")
                 return graph
             if attempt < attempts - 1:
-                log(f"graph token attempt {attempt + 1}/{attempts} failed, rotate and retry: {email}", "WARN")
-                try:
-                    from common import proxy_switch as _ps
-                    import random as _rnd
-                    cur = _ps.current_node()
-                    candidates = [n for n in _ps.concrete_nodes() if n != cur]
-                    if candidates:
-                        _ps.set_node(_rnd.choice(candidates))
-                except Exception as exc:
-                    log(f"graph retry node switch failed: {str(exc)[:50]}", "WARN")
+                log(f"graph token attempt {attempt + 1}/{attempts} failed, retry: {email}", "WARN")
                 time.sleep(3 * (attempt + 1))
         log(f"graph token missing after {attempts} attempts: {email}", "WARN")
     except Exception as exc:
@@ -353,17 +383,7 @@ def append_to_emails_pool(email, password):
             if res and res.get("refresh_token"):
                 break
             if _try < 2:
-                # 抽取经代理偶发 TLS 抖动：第 2 次起先切 Clash 节点换出口再试(绕开坏节点)。
-                log(f"graph token 抽取第{_try+1}次未成，切节点重试: {email}", "WARN")
-                try:
-                    from common import proxy_switch as _ps
-                    import random as _rnd
-                    _cur = _ps.current_node()
-                    _cands = [n for n in _ps.concrete_nodes() if n != _cur]
-                    if _cands:
-                        _ps.set_node(_rnd.choice(_cands))
-                except Exception as _e:
-                    log(f"切节点失败(忽略): {str(_e)[:50]}", "WARN")
+                log(f"graph token 抽取第{_try+1}次未成，重试: {email}", "WARN")
                 time.sleep(3 * (_try + 1))
         if res and res.get("refresh_token"):
             token = res["refresh_token"]
@@ -455,7 +475,7 @@ async def _run_outlook_on_ctx(mod, ctx, idx):
     return email, password, cookies
 
 
-async def one_attempt(mod, proxy_str, idx):
+async def one_attempt_standalone(mod, proxy_str, idx):
     """Mirrors bs_register_step1.fetch_email_from_self_register's inline
     flow, but doesn't carry the breaker state — we're a dedicated loop and
     want to keep trying."""
@@ -468,7 +488,7 @@ async def one_attempt(mod, proxy_str, idx):
                 # Use our own create that picks coreVersion=146 (matches the
                 # BitBrowser install on this machine). Standalone's hardcoded
                 # 130 makes BB return 502.
-                profile_id = bb_create_for_outlook_reg(f"outlook_loop_{ts}_{idx}")
+                profile_id = bb_create_for_outlook_reg(f"outlook_loop_{ts}_{idx}", proxy_str=proxy_str)
                 break
             except Exception as e:
                 m = str(e)
@@ -504,8 +524,71 @@ async def one_attempt(mod, proxy_str, idx):
                 pass
 
 
+def _one_attempt_ruoyi(
+    mod,
+    proxy_file,
+    idx,
+    timeout,
+    max_press,
+    confirm_before_register,
+    headless,
+    email_suffixes="",
+    account_format_mode="name",
+    account_format="",
+    password_format="",
+):
+    proxy_path = proxy_file or getattr(mod, "PROXY_FILE", "")
+    proxy_pool = mod.parse_proxy_pool(proxy_path) if proxy_path else []
+    selected_pool = []
+    if proxy_pool:
+        select_proxy = getattr(mod, "select_proxy_for_account", None)
+        if callable(select_proxy):
+            selected_pool = select_proxy(proxy_pool)
+        else:
+            selected_pool = [random.choice(proxy_pool)]
+        masked = selected_pool[0].split(":")
+        masked_proxy = f"{masked[0]}:{masked[1]}:{masked[2]}:***" if len(masked) == 4 else "***"
+        log(f"{getattr(mod, 'ENGINE_NAME', 'ruoyi')} attempt #{idx} proxy -> {masked_proxy}")
+    opts = SimpleNamespace(
+        headless=headless,
+        no_verify=False,
+        timeout=timeout,
+        max_press=max_press,
+        confirm_before_register=confirm_before_register,
+        proxy_file=proxy_path,
+        email_suffixes=email_suffixes,
+        account_format_mode=account_format_mode,
+        account_format=account_format,
+        password_format=password_format,
+    )
+    email, password = mod.register_outlook(opts, selected_pool, idx)
+    return email, password, []
+
+
+async def one_attempt(engine, mod, proxy_str, idx, args):
+    if engine in ("ruoyi", "camonfox"):
+        return await asyncio.to_thread(
+            _one_attempt_ruoyi,
+            mod,
+            args.proxy_file,
+            idx,
+            args.timeout,
+            args.max_press,
+            args.confirm_before_register,
+            args.headless,
+            getattr(args, "email_suffixes", "") or "",
+            getattr(args, "account_format_mode", "name") or "name",
+            getattr(args, "account_format", "") or "",
+            getattr(args, "password_format", "") or "",
+        )
+    return await one_attempt_standalone(mod, proxy_str, idx)
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--engine", choices=["standalone", "ruoyi", "camonfox"],
+                    default=os.environ.get("OUTLOOK_REG_ENGINE", "ruoyi"),
+                    help="Outlook 自注册后端；ruoyi=Firefox BiDi，camonfox=原生 Camoufox，standalone=BitBrowser/Playwright")
     ap.add_argument("--count", type=int, default=0,
                     help="run this many attempts then exit (0 = loop forever)")
     ap.add_argument("--target-pool", type=int, default=0,
@@ -515,8 +598,24 @@ def main():
                     help="OUTLOOK_REG_MAX_PRESS — captcha press-and-hold cap")
     ap.add_argument("--confirm-before-register", action="store_true",
                     help="auto-click confirmation on the signup page before filling")
+    ap.add_argument("--headless", action="store_true",
+                    help="仅 ruoyi 后端：以无头模式启动 Firefox")
     ap.add_argument("--timeout", type=int, default=180,
                     help="hard cap per attempt (seconds)")
+    ap.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+                    help="代理池文件(每行 user:pass@host:port)；standalone/BitBrowser 每次随机取一个")
+    ap.add_argument("--email-suffixes",
+                    default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES") or os.environ.get("OUTLOOK_EMAIL_SUFFIXES") or "outlook.com",
+                    help="邮箱后缀池，逗号/空格分隔，如 outlook.com,hotmail.com")
+    ap.add_argument("--account-format-mode",
+                    default=(os.environ.get("OUTLOOK_ACCOUNT_FORMAT_MODE")
+                             or ("custom" if os.environ.get("OUTLOOK_ACCOUNT_FORMAT") else "name")),
+                    choices=["random", "name", "name_digits", "custom"],
+                    help="账号格式预设：random/name/name_digits/custom")
+    ap.add_argument("--account-format", default=os.environ.get("OUTLOOK_ACCOUNT_FORMAT", ""),
+                    help="指定格式模板，如 {first}.{last}{digits:3}")
+    ap.add_argument("--password-format", default=os.environ.get("OUTLOOK_PASSWORD_FORMAT", ""),
+                    help="密码模板，如 Aa1!{rand:12}")
     ap.add_argument("--sleep", type=int, default=5,
                     help="seconds between attempts (after fail or success)")
     ap.add_argument("--sleep-when-full", type=int, default=60,
@@ -526,26 +625,32 @@ def main():
     os.environ.setdefault("OUTLOOK_REG_MAX_PRESS", args.max_press)
     if args.confirm_before_register:
         os.environ["OUTLOOK_CONFIRM_BEFORE_REGISTER"] = "1"
+    if args.proxy_file:
+        os.environ["OUTLOOK_PROXY_FILE"] = args.proxy_file
+    if args.email_suffixes:
+        os.environ["OUTLOOK_ACCOUNT_SUFFIXES"] = args.email_suffixes
+    os.environ["OUTLOOK_ACCOUNT_FORMAT_MODE"] = args.account_format_mode
+    if args.account_format:
+        os.environ["OUTLOOK_ACCOUNT_FORMAT"] = args.account_format
+    if args.password_format:
+        os.environ["OUTLOOK_PASSWORD_FORMAT"] = args.password_format
     if sys.platform == "win32":
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         except Exception:
             pass
 
-    mod = load_standalone()
-    injected_proxy = ensure_clash_proxy_env()
-    if injected_proxy:
-        log(f"proxy env ready: {injected_proxy}")
-    proxy = clash_proxy_from_env()
-    if not proxy:
-        log("HTTP_PROXY not set — running without proxy (signup will likely fail)", "WARN")
-    else:
-        log(f"using clash proxy: {proxy}")
-
-    # Initialize Clash controller for per-attempt node rotation. MS PerimeterX
-    # learns the egress IP fast — without rotation we get ERR_CONNECTION_CLOSED
-    # after 1-2 signups from the same node.
-    clash_client, clash_group = init_clash()
+    clear_inherited_local_proxy_env()
+    mod = load_engine(args.engine)
+    proxy_pool = []
+    if args.engine == "standalone":
+        proxy_pool = load_proxy_pool(args.proxy_file, mod=mod)
+        if proxy_pool:
+            log(f"standalone BitBrowser random proxy pool: {len(proxy_pool)} from {args.proxy_file}")
+        else:
+            log("standalone proxy pool empty — BitBrowser will run noproxy", "WARN")
+    elif args.proxy_file:
+        log(f"ruoyi proxy file: {args.proxy_file}")
 
     log(f"pool dir: {POOL_DIR}")
     os.makedirs(POOL_DIR, exist_ok=True)
@@ -564,21 +669,22 @@ def main():
             log(f"pool at target ({ps}/{args.target_pool}) — sleep {args.sleep_when_full}s")
             time.sleep(args.sleep_when_full)
             continue
-        # Rotate Clash node before each attempt so MS PX sees a fresh IP.
-        maybe_rotate(clash_client, clash_group)
+        selected_proxy = random.choice(proxy_pool) if args.engine == "standalone" and proxy_pool else None
+        if args.engine == "standalone":
+            log(f"attempt #{n} BitBrowser proxy -> {mask_proxy(selected_proxy)}")
         log(f"=== attempt #{n}  (pool={ps}, succ={succ}, fail={failed}) ===")
         t0 = time.time()
         email = password = None
         cookies = []
         try:
             email, password, cookies = asyncio.run(
-                asyncio.wait_for(one_attempt(mod, proxy, n), timeout=args.timeout)
+                asyncio.wait_for(one_attempt(args.engine, mod, selected_proxy, n, args), timeout=args.timeout)
             )
         except Exception as e:
             log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")
         elapsed = time.time() - t0
         if email and password:
-            graph = extract_graph_for_account(email, password)
+            graph = extract_graph_for_account(email, password, proxy_str=selected_proxy)
             if not graph or not graph.get("refresh_token"):
                 failed += 1
                 log(f"registered but graph RT missing; not saved: {email}", "WARN")

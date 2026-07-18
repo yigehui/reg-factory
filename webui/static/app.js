@@ -5,9 +5,36 @@ let curRun = null;     // 当前运行 run_id
 let curSrc = null;     // 当前选中脚本
 let evtSrc = null;     // EventSource
 let smsTimer = null;   // 接码助手倒计时刷新
+let curSavedArgs = {}; // 当前脚本已保存的参数
 
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+
+function escHtml(v){
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[ch]));
+}
+
+function escAttr(v){
+  return escHtml(v);
+}
+
+function choiceValue(c){
+  return (c && typeof c === 'object') ? c.value : c;
+}
+
+function choiceLabel(c){
+  return (c && typeof c === 'object') ? (c.label ?? c.value ?? '') : c;
+}
+
+function renderChoiceOptions(choices, selected){
+  return (choices || []).map(c=>{
+    const value = choiceValue(c);
+    const text = choiceLabel(c);
+    return `<option value="${escAttr(value)}" ${String(value)==String(selected)?'selected':''}>${escHtml(text)}</option>`;
+  }).join('');
+}
 
 // ---------------------------------------------------------------- 状态灯轮询
 async function pollStatus(){
@@ -83,52 +110,109 @@ async function loadScripts(){
   }catch(e){}
 }
 
-function selectScript(id){
+async function selectScript(id){
   curSrc = SCRIPTS.find(s=>s.id===id);
   $$('.scriptbtn').forEach(b=>b.classList.toggle('active', b.dataset.id===id));
-  renderForm(curSrc);
+  curSavedArgs = await loadScriptConfig(id);
+  renderForm(curSrc, curSavedArgs);
 }
 
 // ---------------------------------------------------------------- 渲染表单
-function renderForm(s){
+async function loadScriptConfig(id){
+  try{
+    const r = await (await fetch(`/api/script-config/${encodeURIComponent(id)}`)).json();
+    return r.args || {};
+  }catch(e){
+    return {};
+  }
+}
+
+function argValue(a, saved){
+  if(saved && Object.prototype.hasOwnProperty.call(saved, a.flag)) return saved[a.flag];
+  return a.default;
+}
+
+function renderForm(s, saved={}){
   const p = $('#form-panel');
   p.innerHTML = '';
+  p.classList.toggle('two-col-form', ['register_outlook_ruoyi','register_outlook_camonfox'].includes(s.id));
   const h = document.createElement('div');
+  h.className = 'form-head';
   h.innerHTML = `<h2 class="form-title">${s.title}</h2><p class="form-desc">${s.desc||''}</p>`;
   p.appendChild(h);
 
   s.args.forEach(a=>{
     const f = document.createElement('div'); f.className='field';
     const label = a.flag.replace(/^--/,'');
+    const val = argValue(a, saved);
     if(a.type==='bool'){
       f.className='field checkbox';
-      f.innerHTML = `<input type="checkbox" id="f_${label}" ${a.default?'checked':''}>
+      f.innerHTML = `<input type="checkbox" id="f_${label}" ${val?'checked':''}>
         <label for="f_${label}">${label}</label>`;
       if(a.help){ const hh=document.createElement('div'); hh.className='fhelp'; hh.textContent=a.help; f.appendChild(hh); }
     }else if(a.type==='choice'){
-      f.innerHTML = `<label>${label}</label>
-        <select id="f_${label}">${a.choices.map(c=>`<option ${c==a.default?'selected':''}>${c}</option>`).join('')}</select>
-        ${a.help?`<div class="fhelp">${a.help}</div>`:''}`;
+      const options = renderChoiceOptions(a.choices, val);
+      f.innerHTML = `<label>${escHtml(label)}</label>
+        <select id="f_${label}">${options}</select>
+        ${a.help?`<div class="fhelp">${escHtml(a.help)}</div>`:''}`;
     }else if(a.type==='multi'){
-      const def = a.default||[];
-      f.innerHTML = `<label>${label}</label>
-        <div class="multi">${a.choices.map(c=>`<label><input type="checkbox" value="${c}" ${def.includes(c)?'checked':''} data-multi="${label}">${c}</label>`).join('')}</div>
-        ${a.help?`<div class="fhelp">${a.help}</div>`:''}`;
+      const def = Array.isArray(val) ? val.map(String) : (val ? [String(val)] : []);
+      f.innerHTML = `<label>${escHtml(label)}</label>
+        <div class="multi">${(a.choices||[]).map(c=>{
+          const value = choiceValue(c);
+          const text = choiceLabel(c);
+          return `<label><input type="checkbox" value="${escAttr(value)}" ${def.includes(String(value))?'checked':''} data-multi="${escAttr(label)}">${escHtml(text)}</label>`;
+        }).join('')}</div>
+        ${a.help?`<div class="fhelp">${escHtml(a.help)}</div>`:''}`;
     }else{
       const t = a.type==='int' ? 'number' : 'text';
-      f.innerHTML = `<label>${label}</label>
-        <input type="${t}" id="f_${label}" value="${a.default!==undefined&&a.default!==''?a.default:''}" placeholder="${a.help||''}">
-        ${a.help?`<div class="fhelp">${a.help}</div>`:''}`;
+      f.innerHTML = `<label>${escHtml(label)}</label>
+        <input type="${t}" id="f_${label}" value="${escAttr(val!==undefined&&val!==null?val:'')}" placeholder="${escAttr(a.help||'')}">
+        ${a.help?`<div class="fhelp">${escHtml(a.help)}</div>`:''}`;
     }
     p.appendChild(f);
   });
 
+  const actions = document.createElement('div');
+  actions.className = 'form-actions';
   const btn = document.createElement('button');
   btn.className='btn-run'; btn.textContent='▶ 运行';
   btn.onclick = runScript;
-  p.appendChild(btn);
+  actions.appendChild(btn);
+  if(['register_outlook_ruoyi','register_outlook_camonfox'].includes(s.id)){
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn-run';
+    saveBtn.textContent = '保存当前配置';
+    saveBtn.onclick = saveScriptConfig;
+    actions.appendChild(saveBtn);
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'btn-run';
+    resetBtn.textContent = '清除保存';
+    resetBtn.onclick = clearScriptConfig;
+    actions.appendChild(resetBtn);
+    const msg = document.createElement('span');
+    msg.id = 'script-config-msg';
+    msg.className = 'env-msg';
+    actions.appendChild(msg);
+  }
+  p.appendChild(actions);
   const cmd = document.createElement('div'); cmd.className='cmd-line'; cmd.id='cmd-preview';
   p.appendChild(cmd);
+}
+
+function collectFormValues(s){
+  const args = {};
+  s.args.forEach(a=>{
+    const label = a.flag.replace(/^--/,'');
+    if(a.type==='bool'){
+      args[a.flag] = $(`#f_${label}`).checked;
+    }else if(a.type==='multi'){
+      args[a.flag] = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+    }else{
+      args[a.flag] = $(`#f_${label}`).value.trim();
+    }
+  });
+  return args;
 }
 
 function collectArgs(s){
@@ -145,6 +229,47 @@ function collectArgs(s){
     }
   });
   return args;
+}
+
+async function saveScriptConfig(){
+  if(!curSrc) return;
+  const msg = $('#script-config-msg');
+  const args = collectFormValues(curSrc);
+  try{
+    const r = await (await fetch(`/api/script-config/${encodeURIComponent(curSrc.id)}`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({args})
+    })).json();
+    if(r.ok){
+      curSavedArgs = args;
+      msg.textContent = `✓ 已保存 ${r.saved} 项`;
+    }else{
+      msg.textContent = '保存失败: '+(r.error||'');
+    }
+  }catch(e){
+    msg.textContent = '保存失败: '+e;
+  }
+  setTimeout(()=>{ if(msg) msg.textContent=''; }, 3000);
+}
+
+async function clearScriptConfig(){
+  if(!curSrc) return;
+  const msg = $('#script-config-msg');
+  try{
+    const r = await (await fetch(`/api/script-config/${encodeURIComponent(curSrc.id)}`,{method:'DELETE'})).json();
+    if(r.ok){
+      curSavedArgs = {};
+      renderForm(curSrc, {});
+      const nextMsg = $('#script-config-msg');
+      if(nextMsg) nextMsg.textContent = '✓ 已清除，已恢复默认值';
+      setTimeout(()=>{ const m=$('#script-config-msg'); if(m) m.textContent=''; }, 3000);
+    }else{
+      msg.textContent = '清除失败: '+(r.error||'');
+    }
+  }catch(e){
+    msg.textContent = '清除失败: '+e;
+  }
 }
 
 // ---------------------------------------------------------------- 运行 + SSE 日志
@@ -188,14 +313,14 @@ async function loadEnv(){
       const type = it.secret ? 'password':'text';
       const value = it.value || it.default || '';
       const control = it.type === 'choice'
-        ? `<select data-env="${it.key}">${(it.choices||[]).map(c=>`<option value="${c}" ${c===value?'selected':''}>${c}</option>`).join('')}</select>`
-        : `<input type="${type}" data-env="${it.key}" value="${(it.value||'').replace(/"/g,'&quot;')}"
-                 placeholder="${it.default? '默认 '+it.default : ''}">`;
+        ? `<select data-env="${escAttr(it.key)}">${renderChoiceOptions(it.choices, value)}</select>`
+        : `<input type="${type}" data-env="${escAttr(it.key)}" value="${escAttr(it.value||'')}"
+                 placeholder="${escAttr(it.default? '默认 '+it.default : '')}">`;
       row.innerHTML = `
-        <div class="k">${it.key}${it.required?'<span class="req">*</span>':''}</div>
+        <div class="k">${escHtml(it.key)}${it.required?'<span class="req">*</span>':''}</div>
         <div class="v">
           ${control}
-          ${it.help?`<div class="ehelp">${it.help}</div>`:''}
+          ${it.help?`<div class="ehelp">${escHtml(it.help)}</div>`:''}
         </div>`;
       box.appendChild(row);
     });

@@ -10,6 +10,7 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 启动：  python -m uvicorn webui.server:app --port 8799   (或用 start.bat)
 """
 import asyncio
+import json
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEBUI = os.path.join(ROOT, "webui")
 ENV_PATH = os.path.join(ROOT, ".env")
 ENV_EXAMPLE = os.path.join(ROOT, ".env.example")
+SCRIPT_CONFIG_PATH = os.path.join(ROOT, "webui_script_configs.json")
 
 sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
@@ -298,6 +300,90 @@ def api_scripts():
     return {"scripts": schema.SCRIPTS}
 
 
+def _read_script_configs():
+    if not os.path.isfile(SCRIPT_CONFIG_PATH):
+        return {}
+    try:
+        with open(SCRIPT_CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_script_configs(data):
+    tmp = SCRIPT_CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, SCRIPT_CONFIG_PATH)
+
+
+def _normalize_script_args(script, args):
+    args = args or {}
+    out = {}
+    for spec in script.get("args", []):
+        flag = spec.get("flag")
+        if not flag or flag not in args:
+            continue
+        val = args.get(flag)
+        typ = spec.get("type")
+        if typ == "bool":
+            out[flag] = bool(val)
+        elif typ == "multi":
+            if isinstance(val, (list, tuple, set)):
+                out[flag] = [str(v).strip() for v in val if str(v).strip()]
+            elif val in (None, ""):
+                out[flag] = []
+            else:
+                out[flag] = [str(val).strip()]
+        elif typ == "int":
+            if val in (None, ""):
+                out[flag] = ""
+            else:
+                try:
+                    out[flag] = int(val)
+                except Exception:
+                    out[flag] = str(val).strip()
+        else:
+            out[flag] = "" if val is None else str(val).strip()
+    return out
+
+
+@app.get("/api/script-config/{sid}")
+def api_script_config_get(sid: str):
+    script = schema.script_by_id(sid)
+    if not script:
+        return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=404)
+    data = _read_script_configs()
+    return {"script": sid, "args": data.get(sid, {})}
+
+
+@app.post("/api/script-config/{sid}")
+async def api_script_config_set(sid: str, request: Request):
+    script = schema.script_by_id(sid)
+    if not script:
+        return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=404)
+    payload = await request.json()
+    saved_args = _normalize_script_args(script, (payload or {}).get("args") or {})
+    data = _read_script_configs()
+    data[sid] = saved_args
+    _write_script_configs(data)
+    return {"ok": True, "script": sid, "saved": len(saved_args)}
+
+
+@app.delete("/api/script-config/{sid}")
+def api_script_config_delete(sid: str):
+    script = schema.script_by_id(sid)
+    if not script:
+        return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=404)
+    data = _read_script_configs()
+    existed = sid in data
+    data.pop(sid, None)
+    _write_script_configs(data)
+    return {"ok": True, "deleted": existed}
+
+
 @app.get("/api/links")
 def api_links():
     return {"links": getattr(schema, "EXTERNAL_LINKS", [])}
@@ -558,6 +644,7 @@ async def api_env_set(request: Request):
 def _build_cmd(script, args):
     """把前端提交的 args(dict) 按 schema 拼成命令行 list。"""
     cmd = [sys.executable, "-u", os.path.join(ROOT, script["file"])]
+    cmd.extend(str(x) for x in script.get("fixed_args", []))
     positional = []
     by_flag = {a["flag"]: a for a in script["args"]}
     for flag, spec in by_flag.items():
@@ -575,7 +662,14 @@ def _build_cmd(script, args):
         elif typ == "multi":
             if val:
                 cmd.append(flag)
-                cmd.extend(str(v) for v in val)
+                items = [str(v) for v in (val if isinstance(val, (list, tuple, set)) else [val]) if str(v).strip()]
+                join = spec.get("join")
+                if join is not None:
+                    # 例：--email-suffixes outlook.com,hotmail.com
+                    cmd.append(str(join).join(items))
+                else:
+                    # 例：--platforms claude chatgpt grok  (nargs=+)
+                    cmd.extend(items)
         else:
             if val not in (None, "", []):
                 cmd.append(flag)
