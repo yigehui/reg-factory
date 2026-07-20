@@ -924,6 +924,7 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
     """
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     tag = f"[#{idx}]"
+    px_press_screenshots = _env_truthy("OUTLOOK_PX_PRESS_SCREENSHOTS", "0")
 
     try:
         print(f"  {tag} navigating to signup page...")
@@ -1598,6 +1599,11 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                         cx = bx + bw * random.uniform(0.42, 0.58)
                         cy = by + bh * random.uniform(0.48, 0.62)
                     print(f"  {tag} press #{press_count}: ({cx:.0f},{cy:.0f}){' [btn]' if box_is_button else ' [box]'}")
+                    if px_press_screenshots:
+                        try:
+                            await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_before_press_{press_count}.png")
+                        except Exception:
+                            pass
 
                     # Bezier mouse movement
                     sx, sy = random.uniform(200, 800), random.uniform(200, 400)
@@ -1652,6 +1658,11 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_hold_{press_count}.png")
                     except Exception:
                         pass
+                    if px_press_screenshots:
+                        try:
+                            await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_press_{press_count}.png")
+                        except Exception:
+                            pass
                 else:
                     no_btn_rounds += 1
                     # Scan frames for clickable buttons
@@ -2809,6 +2820,9 @@ async def main():
                         help="Do not verify Outlook login before writing successful accounts")
     parser.add_argument("--confirm-before-register", action="store_true",
                         help="Auto-click confirmation on the signup page before filling")
+    parser.add_argument("--px-press-screenshots", action=argparse.BooleanOptionalAction,
+                        default=_env_truthy("OUTLOOK_PX_PRESS_SCREENSHOTS", "0"),
+                        help="Save before/after screenshots around PX press-and-hold")
     parser.add_argument("--protocol-captcharun-px", action=argparse.BooleanOptionalAction,
                         default=_env_truthy("OUTLOOK_PROTOCOL_CAPTCHARUN_PX", "0"),
                         help="Protocol mode: use CaptchaRun PxCaptcha2 + Microsoft risk/verify before CreateAccount")
@@ -2837,6 +2851,7 @@ async def main():
     ACCOUNT_QUEUE = load_account_queue(args.account_file) if args.account_file else None
     if args.confirm_before_register:
         os.environ["OUTLOOK_CONFIRM_BEFORE_REGISTER"] = "1"
+    os.environ["OUTLOOK_PX_PRESS_SCREENSHOTS"] = "1" if args.px_press_screenshots else "0"
     os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_PX"] = "1" if args.protocol_captcharun_px else "0"
     if args.protocol_captcharun_token:
         os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_TOKEN"] = args.protocol_captcharun_token

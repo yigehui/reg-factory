@@ -16,6 +16,7 @@ Outlook 自注册养号(ruoyi) —— 完整链路版
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import os
@@ -24,6 +25,8 @@ import requests
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -37,6 +40,9 @@ RUOYI_FIREFOX_PATH = os.environ.get("RUOYI_FIREFOX_PATH", DEFAULT_RUOYI_FIREFOX)
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ENGINE_NAME = "ruoyi"
 PROXY_FILE = os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt")
+RUOYI_PROXY_SOURCE = os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file")
+AIMILI_POOL_URL = os.environ.get("OUTLOOK_AIMILI_POOL_URL") or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")
+AIMILI_POOL_TOKEN = os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", "")
 SCREENSHOT_DIR = os.path.join(ROOT, "screenshots_ruoyi")
 HAR_DIR = os.path.join(ROOT, "har_ruoyi")
 OUTPUT_DIR = os.path.join(ROOT, "outlook_accounts")
@@ -95,8 +101,73 @@ def _load_helpers():
     return mod
 
 
+def _strip_proxy_scheme(value):
+    s = str(value or "").strip()
+    for pfx in ("socks5h://", "socks5://", "socks4://", "http://", "https://"):
+        if s.lower().startswith(pfx):
+            return s[len(pfx):]
+    return s
+
+
+def _proxy_url_to_ruoyi(value):
+    """Normalize proxy URL / user:pass@host:port / host:port to ruyipage format."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            host = parsed.hostname or ""
+            port = parsed.port or 0
+            user = urllib.parse.unquote(parsed.username or "")
+            pwd = urllib.parse.unquote(parsed.password or "")
+            if host and port:
+                return f"{host}:{port}:{user}:{pwd}" if (user or pwd) else f"{host}:{port}"
+        except Exception:
+            pass
+    s = _strip_proxy_scheme(raw).replace(",", "@", 1) if "@" not in raw and "," in raw else _strip_proxy_scheme(raw)
+    if "@" in s:
+        auth, hostport = s.rsplit("@", 1)
+        if ":" in auth and ":" in hostport:
+            user, pwd = auth.split(":", 1)
+            host, port = hostport.rsplit(":", 1)
+            return f"{host}:{port}:{user}:{pwd}"
+    parts = s.split(":")
+    if len(parts) == 4:
+        return s
+    if len(parts) == 2 and parts[1].isdigit():
+        return s
+    return ""
+
+
+def _parse_ruoyi_proxy(proxy_str):
+    s = str(proxy_str or "").strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    if len(parts) >= 4:
+        host, port = parts[0], parts[1]
+        user = parts[2]
+        pwd = ":".join(parts[3:])
+        return {"host": host, "port": port, "username": user, "password": pwd}
+    if len(parts) == 2 and parts[1].isdigit():
+        return {"host": parts[0], "port": parts[1], "username": "", "password": ""}
+    normalized = _proxy_url_to_ruoyi(s)
+    if normalized and normalized != s:
+        return _parse_ruoyi_proxy(normalized)
+    return None
+
+
+def mask_ruoyi_proxy(proxy_str):
+    p = _parse_ruoyi_proxy(proxy_str)
+    if not p:
+        return "***" if proxy_str else "noproxy"
+    auth = f"{p['username'][:8]}...@" if p.get("username") else ""
+    return f"socks5://{auth}{p['host']}:{p['port']}"
+
+
 def parse_proxy_pool(path):
-    """读 user:pass@host:port 文件，转成 ruyipage 的 socks5 per-tab 格式。"""
+    """读本地代理文件，支持 URL、user:pass@host:port、host:port。"""
     if not path:
         return []
     if not os.path.isfile(path):
@@ -108,29 +179,111 @@ def parse_proxy_pool(path):
             ln = ln.strip()
             if not ln or ln.startswith("#"):
                 continue
-            for pfx in ("socks5://", "http://", "https://"):
-                if ln.lower().startswith(pfx):
-                    ln = ln[len(pfx):]
-                    break
-            if "@" not in ln:
-                log(f"跳过非法代理行(无 @): {ln[:60]}", "WARN")
+            normalized = _proxy_url_to_ruoyi(ln)
+            if not normalized:
+                log(f"跳过非法代理行: {ln[:80]}", "WARN")
                 continue
-            auth, hostport = ln.rsplit("@", 1)
-            if ":" not in auth or ":" not in hostport:
-                log(f"跳过非法代理行(缺 user/pass 或 host/port): {ln[:60]}", "WARN")
-                continue
-            user, pwd = auth.split(":", 1)
-            host, port = hostport.split(":", 1)
-            out.append(f"{host}:{port}:{user}:{pwd}")
+            out.append(normalized)
     return out
 
 
+def _aimili_endpoint(pool_url, source):
+    raw = str(pool_url or "").strip().rstrip("/")
+    if not raw:
+        raise RuntimeError("OUTLOOK_AIMILI_POOL_URL/--aimili-url 为空")
+    source = str(source or "aimili-list").replace("-", "_")
+    parsed = urllib.parse.urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    if path.startswith("/api/pool"):
+        if source == "aimili_random" and path.endswith("/proxies"):
+            path = path + "/random"
+        elif source == "aimili_list" and path.endswith("/proxies/random"):
+            path = path[: -len("/random")]
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+    suffix = "/api/pool/proxies/random" if source == "aimili_random" else "/api/pool/proxies"
+    return raw + suffix
+
+
+def _aimili_api_json(pool_url, token, source, timeout=12):
+    url = _aimili_endpoint(pool_url, source)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read().decode("utf-8", errors="replace")
+    return json.loads(data)
+
+
+def _aimili_proxy_entry_to_ruoyi(item):
+    if not isinstance(item, dict):
+        return ""
+    for key in ("socks5", "http"):
+        value = item.get(key)
+        if value:
+            normalized = _proxy_url_to_ruoyi(value)
+            if normalized:
+                return normalized
+    host = item.get("host") or item.get("public_host")
+    port = item.get("port")
+    if host and port:
+        user = item.get("username") or ""
+        pwd = item.get("password") or ""
+        return f"{host}:{port}:{user}:{pwd}" if (user or pwd) else f"{host}:{port}"
+    return ""
+
+
+class AimiliRandomProxySource:
+    def __init__(self, pool_url, token=""):
+        self.pool_url = pool_url
+        self.token = token
+
+    def __bool__(self):
+        return bool(self.pool_url)
+
+    def select(self):
+        data = _aimili_api_json(self.pool_url, self.token, "aimili_random")
+        item = data.get("proxy") if isinstance(data, dict) else None
+        proxy = _aimili_proxy_entry_to_ruoyi(item)
+        if not proxy:
+            raise RuntimeError(f"Aimili random API 未返回可用代理: {data}")
+        return [proxy]
+
+
+def fetch_aimili_proxy_list(pool_url, token=""):
+    data = _aimili_api_json(pool_url, token, "aimili_list")
+    proxies = data.get("proxies") if isinstance(data, dict) else None
+    out = []
+    for item in proxies or []:
+        proxy = _aimili_proxy_entry_to_ruoyi(item)
+        if proxy:
+            out.append(proxy)
+    return out
+
+
+def build_proxy_source(args):
+    source = (getattr(args, "proxy_source", None) or RUOYI_PROXY_SOURCE or "file").strip().lower().replace("-", "_")
+    if source in ("aimili-random",):
+        source = "aimili_random"
+    if source in ("aimili-list",):
+        source = "aimili_list"
+    if source in ("file", "local", "proxy_file"):
+        return parse_proxy_pool(getattr(args, "proxy_file", "") or PROXY_FILE)
+    pool_url = getattr(args, "aimili_url", "") or getattr(args, "aimili_base_url", "") or AIMILI_POOL_URL
+    token = getattr(args, "aimili_token", "") or AIMILI_POOL_TOKEN
+    if source == "aimili_random":
+        return AimiliRandomProxySource(pool_url, token=token)
+    if source == "aimili_list":
+        return fetch_aimili_proxy_list(pool_url, token=token)
+    raise ValueError(f"未知 ruoyi 代理来源: {source}")
+
+
 def select_proxy_for_account(proxy_pool):
-    """每个账号开跑前随机挑一个代理。"""
+    """每个账号开跑前选一个代理：文件/列表本地随机，Aimili random 远端随机。"""
     if not proxy_pool:
         return []
-    return [random.choice(proxy_pool)]
-
+    if hasattr(proxy_pool, "select") and callable(proxy_pool.select):
+        return proxy_pool.select()
+    return [random.choice(list(proxy_pool))]
 
 def append_graph_account_to_emails_pool(email, password, graph):
     token = (graph or {}).get("refresh_token") or ""
@@ -181,11 +334,11 @@ def _shot(page, name, idx):
     try:
         page.screenshot(path=path, full_page=True)
         if os.path.isfile(path) and os.path.getsize(path) > 0:
-            log(f"??: {path}", "OK")
+            log(f"截图已保存: {path}", "OK")
         else:
-            log(f"????????: {path}", "WARN")
+            log(f"截图为空或缺失: {path}", "WARN")
     except Exception as e:
-        log(f"???? {path}: {e}", "WARN")
+        log(f"截图保存失败 {path}: {e}", "WARN")
     try:
         state_path = f"{base}.html"
         url = getattr(page, "url", "") or ""
@@ -237,9 +390,9 @@ def _shot(page, name, idx):
         )
         with open(state_path, "w", encoding="utf-8") as f:
             f.write(state)
-        log(f"??: {state_path}", "OK")
+        log(f"页面已保存: {state_path}", "OK")
     except Exception as e:
-        log(f"?????? {base}.html: {e}", "WARN")
+        log(f"页面保存失败 {base}.html: {e}", "WARN")
     return path
 
 
@@ -2173,17 +2326,15 @@ def _proxy_for_ip_lookup(proxy_pool, tag):
     if not proxy_pool:
         return None
     proxy_str = str(proxy_pool[0] or "").strip()
-    if not proxy_str:
-        return None
-    try:
-        host, port, user, pwd = proxy_str.split(":", 3)
-    except Exception:
+    p = _parse_ruoyi_proxy(proxy_str)
+    if not p:
         log(f"  {tag} IP probe proxy format invalid: {proxy_str[:80]!r}", "WARN")
         return None
-    auth = f"{quote(user, safe='')}:{quote(pwd, safe='')}"
-    proxy_url = f"socks5h://{auth}@{host}:{port}"
+    user = quote(p.get("username") or "", safe="")
+    pwd = quote(p.get("password") or "", safe="")
+    auth = f"{user}:{pwd}@" if (user or pwd) else ""
+    proxy_url = f"socks5h://{auth}{p['host']}:{p['port']}"
     return {"http": proxy_url, "https": proxy_url}
-
 
 def _log_current_ip(proxy_pool, tag):
     proxies = _proxy_for_ip_lookup(proxy_pool, tag)
@@ -2297,6 +2448,10 @@ def register_outlook(opts, proxy_pool, idx):
     need_verify = not bool(getattr(opts, "no_verify", False))
     confirm_before_register = bool(getattr(opts, "confirm_before_register", False))
     is_headless = bool(getattr(opts, "headless", False))
+    capture_har = bool(getattr(opts, "har", False)) or _env_bool("OUTLOOK_RUOYI_HAR", False)
+    px_press_screenshots = bool(getattr(opts, "px_press_screenshots", False)) or _env_bool(
+        "OUTLOOK_PX_PRESS_SCREENSHOTS", False
+    )
 
     tb = FirefoxOptions()
     tb.set_browser_path(RUOYI_FIREFOX_PATH)
@@ -2357,7 +2512,7 @@ def register_outlook(opts, proxy_pool, idx):
         if is_headless and not signup_opened:
             _apply_ruoyi_headless_page_patches(page, tag, log_once=True)
             headless_patch_logged = True
-        if is_headless:
+        if capture_har:
             har_collector = _RuoyiHarCollector(page, tag, idx, email_getter=lambda: email or "")
             har_collector.start()
         if not signup_opened:
@@ -2569,7 +2724,11 @@ def register_outlook(opts, proxy_pool, idx):
                         no_target_rounds = 0
                         press_count += 1
                         _focus_page_before_captcha_press(page, tag)
+                        if px_press_screenshots:
+                            _save_screenshot(page, f"before_press_{press_count}", idx, tag)
                         if _perform_hold(page, ctx, target, idx, press_count, tag):
+                            if px_press_screenshots:
+                                _save_screenshot(page, f"after_press_{press_count}", idx, tag)
                             validation_wait_started = time.time()
                             awaiting_reappear = True
                             post_press_saw_gap = False
@@ -2577,6 +2736,8 @@ def register_outlook(opts, proxy_pool, idx):
                             if press_count >= max_press:
                                 press_wait_started = time.time()
                             continue
+                        if px_press_screenshots:
+                            _save_screenshot(page, f"after_press_failed_{press_count}", idx, tag)
                         awaiting_reappear = True
                         post_press_saw_gap = False
                         post_press_started_at = time.time()
@@ -2642,9 +2803,9 @@ def register_outlook(opts, proxy_pool, idx):
         return None, None
     finally:
         if har_collector is not None:
-            if is_headless and not success:
+            if capture_har:
                 try:
-                    har_collector.save(reason=failure_reason)
+                    har_collector.save(reason="success" if success else failure_reason)
                 except Exception as exc:
                     log(f"  {tag} HAR save failed: {type(exc).__name__}: {exc}", "WARN")
             else:
@@ -2686,15 +2847,72 @@ def _save_direct_result(email, password, graph, live_file, token_file):
     append_graph_account_to_emails_pool(email, password, graph)
 
 
+async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock):
+    tag = f"#{idx}"
+    log(f"========== 注册 {tag}/{total} ==========")
+    selected_pool = select_proxy_for_account(proxy_pool)
+    if selected_pool:
+        log(f"{tag} 代理 -> {mask_ruoyi_proxy(selected_pool[0])}")
+
+    email = password = None
+    try:
+        email, password = await asyncio.to_thread(register_outlook, args, selected_pool, idx)
+    except Exception as exc:
+        log(f"{tag} register task raised {type(exc).__name__}: {exc}", "ERR")
+    if not email:
+        log(f"{tag} 结果: FAIL", "WARN")
+        return False
+
+    log(f"{tag} Graph token extracting…")
+    graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx)
+    if not graph or not graph.get("refresh_token"):
+        log(f"{tag} registered but graph RT missing; not saved: {email}", "WARN")
+        return False
+
+    async with save_lock:
+        await asyncio.to_thread(_save_direct_result, email, password, graph, args.live_file, args.token_file)
+    log(f"{tag} 结果: OK {email}", "OK")
+    return True
+
+
+async def _run_direct_batch(args, helpers, proxy_pool):
+    count = max(0, int(args.count or 0))
+    concurrency = max(1, int(args.concurrency or 1))
+    sem = asyncio.Semaphore(concurrency)
+    save_lock = asyncio.Lock()
+
+    async def runner(i):
+        async with sem:
+            if i > 0:
+                await asyncio.sleep(random.uniform(1.5, 4.0))
+            return await _run_one_direct(args, helpers, proxy_pool, i + 1, count, save_lock)
+
+    results = await asyncio.gather(*(runner(i) for i in range(count)))
+    return sum(1 for ok in results if ok)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Outlook 自注册养号(ruoyi) — 完整链路版")
     ap.add_argument("--proxy-file", "-p", default=PROXY_FILE, help=f"代理池文件(默认 {PROXY_FILE})")
+    ap.add_argument("--proxy-source", default=RUOYI_PROXY_SOURCE,
+                    choices=["file", "aimili-random", "aimili-list"],
+                    help="ruoyi 代理来源：file=本地文件；aimili-random=每号请求 Aimili 随机接口；aimili-list=请求 Aimili 列表 URL 后本地随机")
+    ap.add_argument("--aimili-url", default=AIMILI_POOL_URL,
+                    help="AimiliVPN URL：可填管理端根地址 http://host:8787，也可直接填 /api/pool/proxies 或 /api/pool/proxies/random 完整地址")
+    ap.add_argument("--aimili-token", default=AIMILI_POOL_TOKEN,
+                    help="AimiliVPN 代理池 API Token")
     ap.add_argument("--count", "-n", type=int, default=1, help="注册次数(默认 1)")
+    ap.add_argument("--concurrency", "-c", type=int, default=1, help="并发注册数(默认 1)")
     ap.add_argument("--headless", action="store_true", help="无头模式")
     ap.add_argument("--timeout", "-t", type=int, default=REGISTER_TIMEOUT, help="单号超时(秒)")
     ap.add_argument("--max-press", default=os.environ.get("OUTLOOK_REG_MAX_PRESS", "5"), help="按住次数上限")
     ap.add_argument("--no-verify", action="store_true", help="跳过 Outlook 登录校验")
     ap.add_argument("--confirm-before-register", action="store_true", help="页面打开后先尝试点确认")
+    ap.add_argument("--px-press-screenshots", action=argparse.BooleanOptionalAction,
+                    default=_env_bool("OUTLOOK_PX_PRESS_SCREENSHOTS", False),
+                    help="保存 PX 按压前/按压后截图")
+    ap.add_argument("--har", action="store_true", default=_env_bool("OUTLOOK_RUOYI_HAR", False),
+                    help="保存完整链路 HAR；开启后成功/失败都会保存，默认关闭")
     ap.add_argument(
         "--email-suffixes",
         default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES") or os.environ.get("OUTLOOK_EMAIL_SUFFIXES") or "outlook.com",
@@ -2735,34 +2953,21 @@ def main():
     except Exception:
         pass
 
-    proxy_pool = parse_proxy_pool(args.proxy_file) if args.proxy_file else []
-    log(f"代理池准备完毕: {len(proxy_pool)} 条")
+    proxy_pool = build_proxy_source(args)
+    if hasattr(proxy_pool, "select"):
+        log(f"代理池准备完毕: Aimili random {args.aimili_url}")
+    else:
+        log(f"代理池准备完毕: {len(proxy_pool)} 条(source={args.proxy_source})")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     live_file = os.path.join(OUTPUT_DIR, f"accounts_ruoyi_{ts}.txt")
     token_file = os.path.join(OUTPUT_DIR, f"graph_tokens_ruoyi_{ts}.json")
+    args.live_file = live_file
+    args.token_file = token_file
 
-    ok = 0
-    for i in range(args.count):
-        log(f"========== 注册 #{i + 1}/{args.count} ==========")
-        selected_pool = select_proxy_for_account(proxy_pool)
-        if selected_pool:
-            masked = selected_pool[0].split(":")
-            masked_proxy = f"{masked[0]}:{masked[1]}:{masked[2]}:***" if len(masked) == 4 else "***"
-            log(f"#{i + 1} 随机代理 -> {masked_proxy}")
-        email, password = register_outlook(args, selected_pool, i + 1)
-        if not email:
-            log(f"#{i + 1} 结果: FAIL", "WARN")
-            continue
-        log(f"#{i + 1} Graph token extracting…")
-        graph = helpers.extract_graph_token_http(email, password, i + 1)
-        if not graph or not graph.get("refresh_token"):
-            log(f"#{i + 1} registered but graph RT missing; not saved: {email}", "WARN")
-            continue
-        _save_direct_result(email, password, graph, live_file, token_file)
-        ok += 1
-        log(f"#{i + 1} 结果: OK {email}", "OK")
+    log(f"开始: count={args.count} concurrency={max(1, int(args.concurrency or 1))} timeout={args.timeout}s")
+    ok = asyncio.run(_run_direct_batch(args, helpers, proxy_pool))
 
     log(f"完成: success={ok}/{args.count}")
     if ok:

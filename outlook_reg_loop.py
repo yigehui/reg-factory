@@ -527,18 +527,33 @@ async def one_attempt_standalone(mod, proxy_str, idx):
 def _one_attempt_ruoyi(
     mod,
     proxy_file,
+    proxy_source,
+    aimili_url,
+    aimili_token,
     idx,
     timeout,
     max_press,
     confirm_before_register,
     headless,
+    har=False,
     email_suffixes="",
     account_format_mode="name",
     account_format="",
     password_format="",
+    px_press_screenshots=False,
 ):
     proxy_path = proxy_file or getattr(mod, "PROXY_FILE", "")
-    proxy_pool = mod.parse_proxy_pool(proxy_path) if proxy_path else []
+    build_proxy_source = getattr(mod, "build_proxy_source", None)
+    if callable(build_proxy_source):
+        source_args = SimpleNamespace(
+            proxy_file=proxy_path,
+            proxy_source=proxy_source,
+            aimili_url=aimili_url,
+            aimili_token=aimili_token,
+        )
+        proxy_pool = build_proxy_source(source_args)
+    else:
+        proxy_pool = mod.parse_proxy_pool(proxy_path) if proxy_path else []
     selected_pool = []
     if proxy_pool:
         select_proxy = getattr(mod, "select_proxy_for_account", None)
@@ -546,8 +561,8 @@ def _one_attempt_ruoyi(
             selected_pool = select_proxy(proxy_pool)
         else:
             selected_pool = [random.choice(proxy_pool)]
-        masked = selected_pool[0].split(":")
-        masked_proxy = f"{masked[0]}:{masked[1]}:{masked[2]}:***" if len(masked) == 4 else "***"
+        mask_fn = getattr(mod, "mask_ruoyi_proxy", None)
+        masked_proxy = mask_fn(selected_pool[0]) if callable(mask_fn) else "***"
         log(f"{getattr(mod, 'ENGINE_NAME', 'ruoyi')} attempt #{idx} proxy -> {masked_proxy}")
     opts = SimpleNamespace(
         headless=headless,
@@ -555,11 +570,16 @@ def _one_attempt_ruoyi(
         timeout=timeout,
         max_press=max_press,
         confirm_before_register=confirm_before_register,
+        har=har,
         proxy_file=proxy_path,
+        proxy_source=proxy_source,
+        aimili_url=aimili_url,
+        aimili_token=aimili_token,
         email_suffixes=email_suffixes,
         account_format_mode=account_format_mode,
         account_format=account_format,
         password_format=password_format,
+        px_press_screenshots=px_press_screenshots,
     )
     email, password = mod.register_outlook(opts, selected_pool, idx)
     return email, password, []
@@ -571,15 +591,20 @@ async def one_attempt(engine, mod, proxy_str, idx, args):
             _one_attempt_ruoyi,
             mod,
             args.proxy_file,
+            getattr(args, "proxy_source", "file"),
+            getattr(args, "aimili_url", ""),
+            getattr(args, "aimili_token", ""),
             idx,
             args.timeout,
             args.max_press,
             args.confirm_before_register,
             args.headless,
+            getattr(args, "har", False),
             getattr(args, "email_suffixes", "") or "",
             getattr(args, "account_format_mode", "name") or "name",
             getattr(args, "account_format", "") or "",
             getattr(args, "password_format", "") or "",
+            getattr(args, "px_press_screenshots", False),
         )
     return await one_attempt_standalone(mod, proxy_str, idx)
 
@@ -600,10 +625,22 @@ def main():
                     help="auto-click confirmation on the signup page before filling")
     ap.add_argument("--headless", action="store_true",
                     help="仅 ruoyi 后端：以无头模式启动 Firefox")
+    ap.add_argument("--har", action="store_true",
+                    help="ruoyi 后端保存完整链路 HAR；开启后成功/失败都会保存")
+    ap.add_argument("--px-press-screenshots", action=argparse.BooleanOptionalAction,
+                    default=(os.environ.get("OUTLOOK_PX_PRESS_SCREENSHOTS", "0").strip().lower() in {"1", "true", "yes", "on"}),
+                    help="ruoyi/camonfox 后端保存 PX 按压前/按压后截图")
     ap.add_argument("--timeout", type=int, default=180,
                     help="hard cap per attempt (seconds)")
     ap.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
                     help="代理池文件(每行 user:pass@host:port)；standalone/BitBrowser 每次随机取一个")
+    ap.add_argument("--proxy-source", default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
+                    choices=["file", "aimili-random", "aimili-list"],
+                    help="仅 ruoyi/camonfox：file=本地文件；aimili-random=每号远端随机；aimili-list=请求列表 URL 后本地随机")
+    ap.add_argument("--aimili-url", default=(os.environ.get("OUTLOOK_AIMILI_POOL_URL") or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")),
+                    help="AimiliVPN URL：管理端根地址或 /api/pool/proxies(/random) 完整地址")
+    ap.add_argument("--aimili-token", default=os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", ""),
+                    help="AimiliVPN 代理池 API Token")
     ap.add_argument("--email-suffixes",
                     default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES") or os.environ.get("OUTLOOK_EMAIL_SUFFIXES") or "outlook.com",
                     help="邮箱后缀池，逗号/空格分隔，如 outlook.com,hotmail.com")
@@ -623,10 +660,16 @@ def main():
     args = ap.parse_args()
 
     os.environ.setdefault("OUTLOOK_REG_MAX_PRESS", args.max_press)
+    os.environ["OUTLOOK_PX_PRESS_SCREENSHOTS"] = "1" if args.px_press_screenshots else "0"
     if args.confirm_before_register:
         os.environ["OUTLOOK_CONFIRM_BEFORE_REGISTER"] = "1"
     if args.proxy_file:
         os.environ["OUTLOOK_PROXY_FILE"] = args.proxy_file
+    os.environ["OUTLOOK_RUOYI_PROXY_SOURCE"] = args.proxy_source
+    if args.aimili_url:
+        os.environ["OUTLOOK_AIMILI_POOL_URL"] = args.aimili_url
+    if args.aimili_token:
+        os.environ["OUTLOOK_AIMILI_POOL_TOKEN"] = args.aimili_token
     if args.email_suffixes:
         os.environ["OUTLOOK_ACCOUNT_SUFFIXES"] = args.email_suffixes
     os.environ["OUTLOOK_ACCOUNT_FORMAT_MODE"] = args.account_format_mode
@@ -649,8 +692,10 @@ def main():
             log(f"standalone BitBrowser random proxy pool: {len(proxy_pool)} from {args.proxy_file}")
         else:
             log("standalone proxy pool empty — BitBrowser will run noproxy", "WARN")
-    elif args.proxy_file:
+    elif args.proxy_source == "file" and args.proxy_file:
         log(f"ruoyi proxy file: {args.proxy_file}")
+    elif args.engine in ("ruoyi", "camonfox"):
+        log(f"{args.engine} proxy source: {args.proxy_source} url={args.aimili_url or 'EMPTY'}")
 
     log(f"pool dir: {POOL_DIR}")
     os.makedirs(POOL_DIR, exist_ok=True)

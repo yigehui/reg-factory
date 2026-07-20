@@ -3150,6 +3150,9 @@ def register_outlook(opts, proxy_pool, idx):
     need_verify = not bool(getattr(opts, "no_verify", False))
     confirm_before_register = bool(getattr(opts, "confirm_before_register", False))
     is_headless = bool(getattr(opts, "headless", False))
+    px_press_screenshots = bool(getattr(opts, "px_press_screenshots", False)) or _env_bool(
+        "OUTLOOK_PX_PRESS_SCREENSHOTS", False
+    )
     if proxy_pool:
         log(f"原生 Camoufox 使用本次账号代理: {_mask_proxy_raw(proxy_pool[0])}")
     else:
@@ -3387,10 +3390,10 @@ def register_outlook(opts, proxy_pool, idx):
                     else:
                         no_target_rounds = 0
                         press_count += 1
-                        if is_headless:
+                        if px_press_screenshots:
                             _save_screenshot(page, f"before_press_{press_count}", idx, tag)
                         if _perform_hold(page, ctx, target, idx, press_count, tag):
-                            if is_headless:
+                            if px_press_screenshots:
                                 _save_screenshot(page, f"after_press_{press_count}", idx, tag)
                             validation_wait_started = time.time()
                             awaiting_reappear = True
@@ -3399,7 +3402,7 @@ def register_outlook(opts, proxy_pool, idx):
                             if press_count >= max_press:
                                 press_wait_started = time.time()
                             continue
-                        if is_headless:
+                        if px_press_screenshots:
                             _save_screenshot(page, f"after_press_failed_{press_count}", idx, tag)
                         awaiting_reappear = True
                         post_press_saw_gap = False
@@ -3520,6 +3523,9 @@ def main():
     ap.add_argument("--max-press", default=os.environ.get("OUTLOOK_REG_MAX_PRESS", "5"), help="按住次数上限")
     ap.add_argument("--no-verify", action="store_true", help="跳过 Outlook 登录校验")
     ap.add_argument("--confirm-before-register", action="store_true", help="页面打开后先尝试点确认")
+    ap.add_argument("--px-press-screenshots", action=argparse.BooleanOptionalAction,
+                    default=_env_bool("OUTLOOK_PX_PRESS_SCREENSHOTS", False),
+                    help="保存 PX 按压前/按压后截图")
     ap.add_argument(
         "--email-suffixes",
         default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES") or os.environ.get("OUTLOOK_EMAIL_SUFFIXES") or "outlook.com",
