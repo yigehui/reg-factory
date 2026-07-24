@@ -30,8 +30,6 @@ screenshots_outlook/*
 !screenshots_outlook/.gitkeep
 screenshots_ruoyi/*
 !screenshots_ruoyi/.gitkeep
-screenshots_camonfox/*
-!screenshots_camonfox/.gitkeep
 screenshots_px_debug/
 har_ruoyi/
 .px_debug_profiles/

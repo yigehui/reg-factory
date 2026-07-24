@@ -9,6 +9,12 @@ let curSavedArgs = {}; // 当前脚本已保存的参数
 
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const LogAutoScroll = globalThis.LogAutoScroll || {
+  appendLogLineWithAutoScroll(log, line){
+    log.textContent += line + '\n';
+    log.scrollTop = log.scrollHeight;
+  }
+};
 
 function escHtml(v){
   return String(v ?? '').replace(/[&<>"']/g, ch => ({
@@ -135,7 +141,7 @@ function argValue(a, saved){
 function renderForm(s, saved={}){
   const p = $('#form-panel');
   p.innerHTML = '';
-  p.classList.toggle('two-col-form', ['register_outlook_ruoyi','register_outlook_camonfox'].includes(s.id));
+  p.classList.toggle('two-col-form', ['register_outlook_ruoyi'].includes(s.id));
   const h = document.createElement('div');
   h.className = 'form-head';
   h.innerHTML = `<h2 class="form-title">${s.title}</h2><p class="form-desc">${s.desc||''}</p>`;
@@ -179,7 +185,7 @@ function renderForm(s, saved={}){
   btn.className='btn-run'; btn.textContent='▶ 运行';
   btn.onclick = runScript;
   actions.appendChild(btn);
-  if(['register_outlook_ruoyi','register_outlook_camonfox'].includes(s.id)){
+  if(['register_outlook_ruoyi'].includes(s.id)){
     const saveBtn = document.createElement('button');
     saveBtn.className = 'btn-run';
     saveBtn.textContent = '保存当前配置';
@@ -285,7 +291,7 @@ async function runScript(){
   $('#cmd-preview').textContent = '$ '+r.cmd;
   $('#btn-stop').disabled = false;
   evtSrc = new EventSource(`/api/logs/${curRun}`);
-  evtSrc.onmessage = e=>{ log.textContent += e.data+'\n'; log.scrollTop = log.scrollHeight; };
+  evtSrc.onmessage = e=>{ LogAutoScroll.appendLogLineWithAutoScroll(log, e.data); };
   evtSrc.addEventListener('done', ()=>{ evtSrc.close(); $('#btn-stop').disabled = true; pollStatus(); });
   evtSrc.onerror = ()=>{ evtSrc.close(); $('#btn-stop').disabled = true; };
 }

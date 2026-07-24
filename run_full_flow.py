@@ -31,6 +31,8 @@ import sys
 import time
 from datetime import datetime
 
+from process_utils import child_creationflags, stop_process_gracefully
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -99,7 +101,18 @@ def build_child_env(args):
     env.setdefault("CLASH_API", args.clash_api)
     env.setdefault("CLASH_SECRET", args.clash_secret)
     env.setdefault("CLASH_GROUP", args.clash_group)
+    env["OUTLOOK_LOG_LEVEL"] = args.log_level
     return env
+
+
+def build_stage_a_env(env):
+    stage_env = dict(env)
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+        "CLASH_API", "CLASH_SECRET", "CLASH_GROUP", "CLASH_PROXY",
+    ):
+        stage_env.pop(key, None)
+    return stage_env
 
 
 # ---------------------------------------------------------------- Stage A
@@ -115,6 +128,7 @@ def stage_email(args, env):
         "--timeout", str(args.email_timeout),
         "--max-press", str(args.max_press),
         "--sleep", "3",
+        "--log-level", args.log_level,
     ]
     if args.outlook_proxy_file:
         cmd += ["--proxy-file", args.outlook_proxy_file]
@@ -135,9 +149,10 @@ def stage_email(args, env):
         return ("dry-run@outlook.com", "DryRunPass1!", "", "")
 
     proc = subprocess.Popen(
-        cmd, cwd=ROOT, env=env,
+        cmd, cwd=ROOT, env=build_stage_a_env(env),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
+        creationflags=child_creationflags(),
     )
     new_email = None
     try:
@@ -168,9 +183,8 @@ def stage_email(args, env):
                 time.sleep(0.2)
     finally:
         if proc.poll() is None:
-            proc.terminate()
             try:
-                proc.wait(timeout=15)
+                stop_process_gracefully(proc, timeout=15)
             except subprocess.TimeoutExpired:
                 proc.kill()
     return new_email
@@ -250,7 +264,7 @@ def main():
     ap.add_argument("--email-attempts", type=int, default=30, help="邮箱注册最多尝试次数")
     ap.add_argument("--email-timeout", type=int, default=180, help="单次邮箱注册硬超时(s)")
     ap.add_argument("--email-total-timeout", type=int, default=1800, help="Stage A 总超时(s)")
-    ap.add_argument("--outlook-engine", choices=["ruoyi", "camonfox", "standalone"],
+    ap.add_argument("--outlook-engine", choices=["ruoyi", "standalone"],
                     default=os.environ.get("OUTLOOK_REG_ENGINE", "ruoyi"),
                     help="Outlook 自注册后端；默认 ruoyi")
     ap.add_argument("--outlook-proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
@@ -295,6 +309,9 @@ def main():
     ap.add_argument("--clash-group", default="GLOBAL",
                     help="Clash 组名（proxy_switch 探节点用）；global 模式下出口由 GLOBAL 决定，"
                          "传 'auto' 会 404。claude/grok 的节点选择模式见 --node")
+    ap.add_argument("--log-level", default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
+                    choices=["DEBUG", "INFO", "WARN", "ERR"],
+                    help="Outlook/Graph 日志等级")
     ap.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
     args = ap.parse_args()
 

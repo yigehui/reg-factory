@@ -248,7 +248,7 @@ async def _press_hold(page, box):
         await asyncio.sleep(random.uniform(0.005, 0.025))
     await asyncio.sleep(random.uniform(0.1, 0.3))
     await page.mouse.down()
-    hold = random.uniform(8, 18)
+    hold = random.uniform(9.0, 11.0)
     t0 = asyncio.get_event_loop().time()
     while asyncio.get_event_loop().time() - t0 < hold:
         await page.mouse.move(cx + random.uniform(-0.8, 0.8),

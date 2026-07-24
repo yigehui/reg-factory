@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -56,28 +57,6 @@ except Exception:
 BITBROWSER_API = os.environ.get("BITBROWSER_API", "http://127.0.0.1:54345")
 
 
-def ensure_clash_proxy_env():
-    """Use .env CLASH_PROXY for direct standalone runs, while local APIs stay direct."""
-    existing = (
-        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        or ""
-    ).strip()
-    proxy = existing or os.environ.get("CLASH_PROXY", "").strip()
-    if not proxy:
-        return ""
-    if not existing:
-        os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
-        os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
-    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-    parts = [p.strip() for p in no_proxy.split(",") if p.strip()]
-    for item in ("127.0.0.1", "localhost", "::1"):
-        if item not in parts:
-            parts.append(item)
-    os.environ["NO_PROXY"] = os.environ["no_proxy"] = ",".join(parts)
-    return proxy
-
-
 def _fingerprint_provider():
     return (
         os.environ.get("FINGERPRINT_BROWSER")
@@ -107,6 +86,7 @@ REGISTER_TIMEOUT = 300
 VERIFY_AFTER_REGISTER = True
 ACCOUNT_QUEUE = None
 _ACCOUNT_CONTEXT = threading.local()
+_ACCOUNT_OPTIONS_CONTEXT = threading.local()
 
 
 def verify_registered_outlook(email, password, tag=""):
@@ -383,24 +363,30 @@ def _expand_random_template(template, default_generator):
 
 
 def _email_suffixes():
-    raw = (
-        os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES")
-        or os.environ.get("OUTLOOK_EMAIL_SUFFIXES")
-        or "outlook.com"
-    )
+    raw = getattr(_ACCOUNT_OPTIONS_CONTEXT, "email_suffixes", None)
+    if raw is None:
+        raw = (
+            os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES")
+            or os.environ.get("OUTLOOK_EMAIL_SUFFIXES")
+            or "outlook.com"
+        )
     suffixes = [s.strip().lstrip("@") for s in re.split(r"[,;\s]+", raw) if s.strip()]
     return suffixes or ["outlook.com"]
 
 
 def _generate_prefix():
-    fmt = os.environ.get("OUTLOOK_ACCOUNT_FORMAT", "").strip()
+    fmt = getattr(_ACCOUNT_OPTIONS_CONTEXT, "account_format", None)
+    if fmt is None:
+        fmt = os.environ.get("OUTLOOK_ACCOUNT_FORMAT", "").strip()
     if fmt:
         return _expand_random_template(fmt, lambda: "")
     return random.choice(string.ascii_lowercase) + _random_chars(string.ascii_lowercase + string.digits, 11)
 
 
 def _generate_password():
-    fmt = os.environ.get("OUTLOOK_PASSWORD_FORMAT", "").strip()
+    fmt = getattr(_ACCOUNT_OPTIONS_CONTEXT, "password_format", None)
+    if fmt is None:
+        fmt = os.environ.get("OUTLOOK_PASSWORD_FORMAT", "").strip()
     if fmt:
         return _expand_random_template(fmt, lambda: "")
     return "Aa1!" + _random_chars(string.ascii_letters + string.digits, 12)
@@ -498,18 +484,39 @@ ACCOUNT_FORMAT_PRESETS = {
 }
 
 
-def apply_account_format_mode(mode, custom_format=""):
+def resolve_account_format(mode, custom_format=""):
     mode = (mode or "").strip().lower()
     if mode == "custom":
-        if custom_format:
-            os.environ["OUTLOOK_ACCOUNT_FORMAT"] = custom_format
-        return
-    if mode in ACCOUNT_FORMAT_PRESETS:
-        value = ACCOUNT_FORMAT_PRESETS[mode]
-        if value:
-            os.environ["OUTLOOK_ACCOUNT_FORMAT"] = value
+        return (custom_format or "").strip()
+    return ACCOUNT_FORMAT_PRESETS.get(mode, "")
+
+
+def apply_account_format_mode(mode, custom_format=""):
+    value = resolve_account_format(mode, custom_format)
+    if value:
+        os.environ["OUTLOOK_ACCOUNT_FORMAT"] = value
+    else:
+        os.environ.pop("OUTLOOK_ACCOUNT_FORMAT", None)
+
+
+def set_account_generation_options(email_suffixes=None, account_format_mode=None, account_format="", password_format=None):
+    normalized_suffixes = None
+    if email_suffixes is not None:
+        if isinstance(email_suffixes, (list, tuple, set)):
+            normalized_suffixes = ",".join(str(x).strip() for x in email_suffixes if str(x).strip())
         else:
-            os.environ.pop("OUTLOOK_ACCOUNT_FORMAT", None)
+            normalized_suffixes = str(email_suffixes or "").strip()
+        normalized_suffixes = normalized_suffixes or None
+    setattr(_ACCOUNT_OPTIONS_CONTEXT, "email_suffixes", normalized_suffixes)
+    setattr(_ACCOUNT_OPTIONS_CONTEXT, "account_format", resolve_account_format(account_format_mode, account_format) or "")
+    normalized_password_format = None if password_format is None else str(password_format or "").strip()
+    setattr(_ACCOUNT_OPTIONS_CONTEXT, "password_format", normalized_password_format)
+
+
+def clear_account_generation_options():
+    for name in ("email_suffixes", "account_format", "password_format"):
+        if hasattr(_ACCOUNT_OPTIONS_CONTEXT, name):
+            delattr(_ACCOUNT_OPTIONS_CONTEXT, name)
 
 
 # ======================== CAPTCHA Solvers ========================
@@ -731,17 +738,25 @@ GRAPH_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclie
 GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read"
 
 
-def extract_graph_token_http(email, password, idx=0, attempts=3):
-    """Extract Graph refresh_token through the shared pure-HTTP OAuth flow."""
+def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None):
+    """Extract Graph refresh_token through the shared pure-HTTP OAuth flow.
+
+    Graph 授权一律直连（proxies=None + trust_env=False）。
+    proxy_str 仅保留兼容签名，注册代理不带到授权链路。
+    """
     try:
         from extract_graph_tokens import get_graph_token
     except Exception as exc:
         print(f"  [#{idx}] [graph] import error: {exc}")
         return None
 
+    if proxy_str:
+        print(f"  [#{idx}] [graph] ignore reg proxy; force direct")
     for attempt in range(attempts):
         try:
-            res = get_graph_token(email, password, idx)
+            print(f"  [#{idx}] [graph] attempt {attempt + 1}/{attempts} proxy=direct")
+            # 强制直连：不传 proxies，session.trust_env=False 已在 get_graph_token 内保证。
+            res = get_graph_token(email, password, idx, proxies=None)
         except Exception as exc:
             print(f"  [#{idx}] [graph] attempt {attempt + 1}/{attempts} error: {exc}")
             res = None
@@ -751,7 +766,7 @@ def extract_graph_token_http(email, password, idx=0, attempts=3):
                 "client_id": res.get("client_id") or "",
             }
         if attempt < attempts - 1:
-            print(f"  [#{idx}] [graph] no refresh_token, retrying...")
+            print(f"  [#{idx}] [graph] no refresh_token on attempt {attempt + 1}/{attempts}; direct retry...")
             time.sleep(3 * (attempt + 1))
     return None
 
@@ -1625,7 +1640,7 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                     # 拟人按住：关键是按住到进度条走满(captcha 消失)才松手 —— 不能固定短时长，
                     # 太短(3-5s)进度没满就松手 => 不过。策略：持续按住并每 ~0.5s 检测 captcha 是否
                     # 消失(进度满/通过)，一消失立刻松手；设一个较长上限(~14s)兜底防止卡死。
-                    max_hold = random.uniform(11.0, 15.0)
+                    max_hold = random.uniform(9.0, 11.0)
                     hold_start = asyncio.get_event_loop().time()
                     drift_phase = random.uniform(0, 2 * math.pi)
                     drift_freq = random.uniform(1.5, 2.8)
@@ -1792,12 +1807,50 @@ def _proxy_for_requests(proxy_str):
     """Convert proxy string to requests proxies dict."""
     if not proxy_str:
         return None
-    p = BitBrowserClient._parse_proxy(proxy_str)
+    raw = str(proxy_str or "").strip()
+    if "://" not in raw:
+        parts = raw.split(":")
+        if len(parts) >= 4 and str(parts[1]).isdigit():
+            host = parts[0]
+            port = parts[1]
+            username = parts[2]
+            password = ":".join(parts[3:])
+            auth = f"{username}:{password}@" if username else ""
+            url = f"socks5h://{auth}{host}:{port}"
+            return {"http": url, "https": url}
+        if len(parts) == 2 and str(parts[1]).isdigit():
+            url = f"socks5h://{parts[0]}:{parts[1]}"
+            return {"http": url, "https": url}
+    p = BitBrowserClient._parse_proxy(raw)
     if not p:
         return None
     auth = f"{p['username']}:{p['password']}@" if p.get("username") else ""
-    url = f"{p.get('type', 'http')}://{auth}{p['host']}:{p['port']}"
+    scheme = p.get("type", "http")
+    if scheme == "socks5":
+        scheme = "socks5h"
+    url = f"{scheme}://{auth}{p['host']}:{p['port']}"
     return {"http": url, "https": url}
+
+
+@contextmanager
+def _proxy_env_context(proxy_str):
+    proxy_env_keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+    old = {key: os.environ.get(key) for key in proxy_env_keys}
+    try:
+        for key in proxy_env_keys:
+            os.environ.pop(key, None)
+        proxies = _proxy_for_requests(proxy_str) or {}
+        proxy_url = proxies.get("https") or proxies.get("http") or ""
+        if proxy_url:
+            os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy_url
+            os.environ["http_proxy"] = os.environ["https_proxy"] = proxy_url
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _proxy_for_playwright(proxy_str):
@@ -2758,10 +2811,11 @@ async def register_one(bb, idx, proxy_str, results, results_lock, live_fh=None, 
 
     graph = None
     if email:
-        print(f"  {tag} [graph] extracting refresh_token...")
+        print(f"  {tag} [graph] extracting refresh_token (direct)...")
         loop = asyncio.get_event_loop()
+        # Graph 授权强制直连；注册代理 proxy_str 不传入。
         graph = await loop.run_in_executor(
-            None, extract_graph_token_http, email, password, idx
+            None, extract_graph_token_http, email, password, idx, 3, None
         )
 
     # ── Save result ───────────────────────────────────────────────
@@ -2860,10 +2914,6 @@ async def main():
     if args.protocol_captcharun_timezone:
         os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEZONE"] = args.protocol_captcharun_timezone
     os.environ["OUTLOOK_PROTOCOL_CAPTCHARUN_TIMEOUT"] = str(args.protocol_captcharun_timeout)
-    proxy_env = ensure_clash_proxy_env()
-    if proxy_env:
-        print(f"  proxy env ready: {proxy_env}")
-
     # Load proxies
     proxy_pool = []
     if args.proxy_file:

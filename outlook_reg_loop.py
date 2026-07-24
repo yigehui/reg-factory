@@ -44,6 +44,8 @@ ARTIFACT_DIR = os.path.dirname(os.path.abspath(__file__))
 POOL_DIR = os.path.join(ARTIFACT_DIR, "_outlook_pool")
 # 账号注册侧消费的池（common/emails.next_email 读取），格式 email----password----token----clientid
 EMAILS_POOL = os.path.join(ARTIFACT_DIR, "emails.txt")
+OUTPUT_DIR = os.path.join(ARTIFACT_DIR, "outlook_accounts")
+EMAIL_NOGRAPH = os.path.join(OUTPUT_DIR, "email_nograph.txt")
 STANDALONE_PATH = os.environ.get(
     "SELF_REG_SCRIPT_PATH",
     os.path.join(ARTIFACT_DIR, "register_outlook_standalone.py"),
@@ -51,10 +53,6 @@ STANDALONE_PATH = os.environ.get(
 RUOYI_PATH = os.environ.get(
     "SELF_REG_RUOYI_PATH",
     os.path.join(ARTIFACT_DIR, "register_outlook_ruoyi.py"),
-)
-CAMONFOX_PATH = os.environ.get(
-    "SELF_REG_CAMONFOX_PATH",
-    os.path.join(ARTIFACT_DIR, "register_outlook_camonfox.py"),
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +67,46 @@ def _env_bool(name, default=False):
     if value is None:
         return bool(default)
     return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+@contextmanager
+def _interprocess_lock(target_path):
+    lock_path = f"{target_path}.lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    fh = open(lock_path, "a+b")
+    try:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"0")
+            fh.flush()
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
@@ -196,22 +234,9 @@ def load_ruoyi():
     return m
 
 
-def load_camonfox():
-    if not os.path.isfile(CAMONFOX_PATH):
-        log(f"camonfox backend not found at {CAMONFOX_PATH}", "ERR")
-        sys.exit(1)
-    spec = importlib.util.spec_from_file_location("_self_reg_camonfox", CAMONFOX_PATH)
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    log(f"loaded camonfox from {CAMONFOX_PATH}")
-    return m
-
-
 def load_engine(engine):
     if engine == "ruoyi":
         return load_ruoyi()
-    if engine == "camonfox":
-        return load_camonfox()
     return load_standalone()
 
 
@@ -315,26 +340,38 @@ def count_pool():
         return 0
 
 
-def extract_graph_for_account(email, password, attempts=3, proxy_str=None):
-    """Return Graph token data for a freshly registered Outlook account."""
+def extract_graph_for_account(email, password, idx=0, attempts=3, proxy_str=None):
+    """Return Graph token data for a freshly registered Outlook account.
+
+    Graph OAuth 一律直连（trust_env=False + 不挂 proxies）。
+    proxy_str 仅保留兼容签名，注册代理不带到授权链路。
+    """
     try:
         from extract_graph_tokens import get_graph_token
+        # 注册代理不参与 Graph 授权；强制直连，避免住宅代理/地区风控拖死 OAuth。
+        if proxy_str:
+            log(f"[#{idx}] graph auth ignores reg proxy ({mask_proxy(proxy_str)}); force direct")
+        else:
+            log(f"[#{idx}] graph proxy -> direct")
         for attempt in range(attempts):
-            with account_proxy_env(proxy_str):
-                res = get_graph_token(email, password)
+            res = get_graph_token(email, password, idx=idx, proxies=None)
             if res and res.get("refresh_token"):
                 graph = {
                     "refresh_token": res["refresh_token"],
                     "client_id": res.get("client_id") or "",
                 }
-                log(f"graph token extracted for {email}", "OK")
+                log(f"[#{idx}] graph token extracted for {email}", "OK")
                 return graph
             if attempt < attempts - 1:
-                log(f"graph token attempt {attempt + 1}/{attempts} failed, retry: {email}", "WARN")
+                log(
+                    f"[#{idx}] graph token attempt {attempt + 1}/{attempts} "
+                    f"failed via direct; retry: {email}",
+                    "WARN",
+                )
                 time.sleep(3 * (attempt + 1))
-        log(f"graph token missing after {attempts} attempts: {email}", "WARN")
+        log(f"[#{idx}] graph token missing after {attempts} attempts: {email}", "WARN")
     except Exception as exc:
-        log(f"graph token extraction error: {type(exc).__name__}: {exc}", "WARN")
+        log(f"[#{idx}] graph token extraction error: {type(exc).__name__}: {exc}", "WARN")
     return None
 
 
@@ -361,6 +398,30 @@ def append_graph_account_to_emails_pool(email, password, graph):
         return True
     except Exception as exc:
         log(f"append_to_emails_pool failed: {type(exc).__name__}: {exc}", "WARN")
+        return False
+
+
+def append_account_to_email_nograph(email, password):
+    if not email or not password:
+        return False
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        existing = set()
+        with _interprocess_lock(EMAIL_NOGRAPH):
+            if os.path.isfile(EMAIL_NOGRAPH):
+                with open(EMAIL_NOGRAPH, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            existing.add(line.split("----")[0].strip().lower())
+            if email.lower() in existing:
+                return True
+            with open(EMAIL_NOGRAPH, "a", encoding="utf-8") as f:
+                f.write(f"{email}----{password}\n")
+        log(f"email_nograph += {email}", "OK")
+        return True
+    except Exception as exc:
+        log(f"append_account_to_email_nograph failed: {type(exc).__name__}: {exc}", "WARN")
         return False
 
 
@@ -503,17 +564,17 @@ async def one_attempt_standalone(mod, proxy_str, idx):
                 log(f"create_browser err (try {_r+1}/5): {m[:200]}", "WARN")
                 await asyncio.sleep(3 + _r)
         if not profile_id:
-            return None, None, []
+            return None, None, [], proxy_str
         info = bb.open_browser(profile_id)
         ws = info.get("ws", "")
         if not ws:
-            return None, None, []
+            return None, None, [], proxy_str
         from playwright.async_api import async_playwright as _apw
         async with _apw() as p:
             browser = await p.chromium.connect_over_cdp(ws)
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
             email, password, cookies = await _run_outlook_on_ctx(mod, ctx, idx)
-        return email, password, cookies
+        return email, password, cookies, proxy_str
     finally:
         if profile_id:
             try:
@@ -541,29 +602,48 @@ def _one_attempt_ruoyi(
     account_format="",
     password_format="",
     px_press_screenshots=False,
+    consumable_pool=None,
 ):
-    proxy_path = proxy_file or getattr(mod, "PROXY_FILE", "")
-    build_proxy_source = getattr(mod, "build_proxy_source", None)
-    if callable(build_proxy_source):
+    # 进程级可消耗代理池：take 一条删一条；空则 reload
+    PoolCls = getattr(mod, "ConsumableProxyPool", None) or getattr(mod, "SessionProxyRuntime", None)
+    set_pool = getattr(mod, "set_consumable_proxy_pool", None) or getattr(mod, "set_session_proxy_runtime", None)
+    get_pool = getattr(mod, "get_consumable_proxy_pool", None) or getattr(mod, "get_session_proxy_runtime", None)
+    pool = consumable_pool
+    if pool is None and callable(get_pool):
+        pool = get_pool()
+    if pool is None and callable(PoolCls) and callable(set_pool):
         source_args = SimpleNamespace(
-            proxy_file=proxy_path,
+            proxy_file=proxy_file or getattr(mod, "PROXY_FILE", ""),
             proxy_source=proxy_source,
             aimili_url=aimili_url,
             aimili_token=aimili_token,
         )
-        proxy_pool = build_proxy_source(source_args)
-    else:
-        proxy_pool = mod.parse_proxy_pool(proxy_path) if proxy_path else []
+        if hasattr(PoolCls, "from_args"):
+            pool = PoolCls.from_args(source_args).start()
+        else:
+            pool = PoolCls(source_args)
+            if hasattr(pool, "start"):
+                pool.start()
+        set_pool(pool)
+        st = pool.stats() if hasattr(pool, "stats") else {}
+        log(f"proxy list init source={st.get('source', proxy_source)} size={st.get('remaining', '?')}")
+
     selected_pool = []
-    if proxy_pool:
+    if pool is not None:
         select_proxy = getattr(mod, "select_proxy_for_account", None)
         if callable(select_proxy):
-            selected_pool = select_proxy(proxy_pool)
-        else:
-            selected_pool = [random.choice(proxy_pool)]
+            selected_pool = select_proxy(pool, runtime=pool) or []
+        elif hasattr(pool, "take"):
+            selected_pool = pool.take() or []
         mask_fn = getattr(mod, "mask_ruoyi_proxy", None)
-        masked_proxy = mask_fn(selected_pool[0]) if callable(mask_fn) else "***"
-        log(f"{getattr(mod, 'ENGINE_NAME', 'ruoyi')} attempt #{idx} proxy -> {masked_proxy}")
+        if selected_pool:
+            masked_proxy = mask_fn(selected_pool[0]) if callable(mask_fn) else "***"
+            rem = pool.remaining() if hasattr(pool, "remaining") else "?"
+            log(f"{getattr(mod, 'ENGINE_NAME', 'ruoyi')} attempt #{idx} proxy -> {masked_proxy} remaining={rem}")
+        else:
+            log(f"{getattr(mod, 'ENGINE_NAME', 'ruoyi')} attempt #{idx} no proxy available", "WARN")
+
+    proxy_path = proxy_file or getattr(mod, "PROXY_FILE", "")
     opts = SimpleNamespace(
         headless=headless,
         no_verify=False,
@@ -580,13 +660,25 @@ def _one_attempt_ruoyi(
         account_format=account_format,
         password_format=password_format,
         px_press_screenshots=px_press_screenshots,
+        log_level=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
     )
-    email, password = mod.register_outlook(opts, selected_pool, idx)
-    return email, password, []
+    result = mod.register_outlook(opts, selected_pool, idx)
+    fail_reason = ""
+    if isinstance(result, tuple) and len(result) >= 3:
+        email, password, fail_reason = result[0], result[1], (result[2] or "")
+    elif isinstance(result, tuple) and len(result) >= 2:
+        email, password = result[0], result[1]
+        fail_reason = "" if email else "failure"
+    else:
+        email = password = None
+        fail_reason = "failure"
+    selected_proxy = selected_pool[0] if selected_pool else None
+    # 纯消耗队列：不再 mark_success / mark_blocked
+    return email, password, [], selected_proxy
 
 
-async def one_attempt(engine, mod, proxy_str, idx, args):
-    if engine in ("ruoyi", "camonfox"):
+async def one_attempt(engine, mod, proxy_str, idx, args, consumable_pool=None):
+    if engine == "ruoyi":
         return await asyncio.to_thread(
             _one_attempt_ruoyi,
             mod,
@@ -605,15 +697,16 @@ async def one_attempt(engine, mod, proxy_str, idx, args):
             getattr(args, "account_format", "") or "",
             getattr(args, "password_format", "") or "",
             getattr(args, "px_press_screenshots", False),
+            consumable_pool,
         )
     return await one_attempt_standalone(mod, proxy_str, idx)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--engine", choices=["standalone", "ruoyi", "camonfox"],
+    ap.add_argument("--engine", choices=["standalone", "ruoyi"],
                     default=os.environ.get("OUTLOOK_REG_ENGINE", "ruoyi"),
-                    help="Outlook 自注册后端；ruoyi=Firefox BiDi，camonfox=原生 Camoufox，standalone=BitBrowser/Playwright")
+                    help="Outlook 自注册后端；ruoyi=Firefox BiDi，standalone=BitBrowser/Playwright")
     ap.add_argument("--count", type=int, default=0,
                     help="run this many attempts then exit (0 = loop forever)")
     ap.add_argument("--target-pool", type=int, default=0,
@@ -629,14 +722,14 @@ def main():
                     help="ruoyi 后端保存完整链路 HAR；开启后成功/失败都会保存")
     ap.add_argument("--px-press-screenshots", action=argparse.BooleanOptionalAction,
                     default=(os.environ.get("OUTLOOK_PX_PRESS_SCREENSHOTS", "0").strip().lower() in {"1", "true", "yes", "on"}),
-                    help="ruoyi/camonfox 后端保存 PX 按压前/按压后截图")
+                    help="ruoyi 后端保存 PX/失败相关截图")
     ap.add_argument("--timeout", type=int, default=180,
                     help="hard cap per attempt (seconds)")
     ap.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
                     help="代理池文件(每行 user:pass@host:port)；standalone/BitBrowser 每次随机取一个")
     ap.add_argument("--proxy-source", default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
                     choices=["file", "aimili-random", "aimili-list"],
-                    help="仅 ruoyi/camonfox：file=本地文件；aimili-random=每号远端随机；aimili-list=请求列表 URL 后本地随机")
+                    help="仅 ruoyi：file/aimili-list/aimili-random 启动时装 list，注册取删，空则重载，任务停销毁")
     ap.add_argument("--aimili-url", default=(os.environ.get("OUTLOOK_AIMILI_POOL_URL") or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")),
                     help="AimiliVPN URL：管理端根地址或 /api/pool/proxies(/random) 完整地址")
     ap.add_argument("--aimili-token", default=os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", ""),
@@ -653,6 +746,9 @@ def main():
                     help="指定格式模板，如 {first}.{last}{digits:3}")
     ap.add_argument("--password-format", default=os.environ.get("OUTLOOK_PASSWORD_FORMAT", ""),
                     help="密码模板，如 Aa1!{rand:12}")
+    ap.add_argument("--log-level", default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
+                    choices=["DEBUG", "INFO", "WARN", "ERR"],
+                    help="log verbosity for loop/ruoyi")
     ap.add_argument("--sleep", type=int, default=5,
                     help="seconds between attempts (after fail or success)")
     ap.add_argument("--sleep-when-full", type=int, default=60,
@@ -661,6 +757,7 @@ def main():
 
     os.environ.setdefault("OUTLOOK_REG_MAX_PRESS", args.max_press)
     os.environ["OUTLOOK_PX_PRESS_SCREENSHOTS"] = "1" if args.px_press_screenshots else "0"
+    os.environ["OUTLOOK_LOG_LEVEL"] = args.log_level
     if args.confirm_before_register:
         os.environ["OUTLOOK_CONFIRM_BEFORE_REGISTER"] = "1"
     if args.proxy_file:
@@ -686,16 +783,40 @@ def main():
     clear_inherited_local_proxy_env()
     mod = load_engine(args.engine)
     proxy_pool = []
+    consumable_pool = None
     if args.engine == "standalone":
         proxy_pool = load_proxy_pool(args.proxy_file, mod=mod)
         if proxy_pool:
             log(f"standalone BitBrowser random proxy pool: {len(proxy_pool)} from {args.proxy_file}")
         else:
             log("standalone proxy pool empty — BitBrowser will run noproxy", "WARN")
-    elif args.proxy_source == "file" and args.proxy_file:
-        log(f"ruoyi proxy file: {args.proxy_file}")
-    elif args.engine in ("ruoyi", "camonfox"):
-        log(f"{args.engine} proxy source: {args.proxy_source} url={args.aimili_url or 'EMPTY'}")
+    elif args.engine == "ruoyi":
+        PoolCls = getattr(mod, "ConsumableProxyPool", None)
+        set_pool = getattr(mod, "set_consumable_proxy_pool", None) or getattr(mod, "set_session_proxy_runtime", None)
+        if callable(PoolCls):
+            source_args = SimpleNamespace(
+                proxy_file=args.proxy_file,
+                proxy_source=args.proxy_source,
+                aimili_url=args.aimili_url,
+                aimili_token=args.aimili_token,
+            )
+            if hasattr(PoolCls, "from_args"):
+                consumable_pool = PoolCls.from_args(source_args).start()
+            else:
+                consumable_pool = PoolCls(source_args)
+                if hasattr(consumable_pool, "start"):
+                    consumable_pool.start()
+            if callable(set_pool):
+                set_pool(consumable_pool)
+            st = consumable_pool.stats() if hasattr(consumable_pool, "stats") else {}
+            log(
+                f"ruoyi proxy list: source={st.get('source', args.proxy_source)} "
+                f"size={st.get('remaining', '?')} url={args.aimili_url or 'N/A'}"
+            )
+        elif args.proxy_source == "file" and args.proxy_file:
+            log(f"ruoyi proxy file: {args.proxy_file}")
+        else:
+            log(f"{args.engine} proxy source: {args.proxy_source} url={args.aimili_url or 'EMPTY'}")
 
     log(f"pool dir: {POOL_DIR}")
     os.makedirs(POOL_DIR, exist_ok=True)
@@ -704,55 +825,75 @@ def main():
     n = 0
     succ = 0
     failed = 0
-    while True:
-        n += 1
-        if args.count and n > args.count:
-            log(f"reached --count {args.count}, exit (success={succ}, fail={failed})")
-            break
-        ps = count_pool()
-        if args.target_pool and ps >= args.target_pool:
-            log(f"pool at target ({ps}/{args.target_pool}) — sleep {args.sleep_when_full}s")
-            time.sleep(args.sleep_when_full)
-            continue
-        selected_proxy = random.choice(proxy_pool) if args.engine == "standalone" and proxy_pool else None
-        if args.engine == "standalone":
-            log(f"attempt #{n} BitBrowser proxy -> {mask_proxy(selected_proxy)}")
-        log(f"=== attempt #{n}  (pool={ps}, succ={succ}, fail={failed}) ===")
-        t0 = time.time()
-        email = password = None
-        cookies = []
-        try:
-            email, password, cookies = asyncio.run(
-                asyncio.wait_for(one_attempt(args.engine, mod, selected_proxy, n, args), timeout=args.timeout)
-            )
-        except Exception as e:
-            log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")
-        elapsed = time.time() - t0
-        if email and password:
-            graph = extract_graph_for_account(email, password, proxy_str=selected_proxy)
-            if not graph or not graph.get("refresh_token"):
-                failed += 1
-                log(f"registered but graph RT missing; not saved: {email}", "WARN")
-                time.sleep(args.sleep)
+    try:
+        while True:
+            n += 1
+            if args.count and n > args.count:
+                log(f"reached --count {args.count}, exit (success={succ}, fail={failed})")
+                break
+            ps = count_pool()
+            if args.target_pool and ps >= args.target_pool:
+                log(f"pool at target ({ps}/{args.target_pool}) — sleep {args.sleep_when_full}s")
+                time.sleep(args.sleep_when_full)
                 continue
-            fname = write_record({
-                "email": email,
-                "password": password,
-                "refresh_token": graph["refresh_token"],
-                "client_id": graph.get("client_id") or "",
-                "graph": graph,
-                "outlook_cookies": cookies,
-                "source": "self-loop",
-                "ts": datetime.now().isoformat(),
-            })
-            globals()["_CURRENT_GRAPH_ACCOUNT"] = graph
-            append_to_emails_pool(email, password)   # 桥接进账号注册池
-            succ += 1
-            log(f"OK in {elapsed:.1f}s: {email} -> {fname} (pool now {count_pool()})", "OK")
-        else:
-            failed += 1
-            log(f"FAIL in {elapsed:.1f}s (success rate {succ}/{n} = {100*succ/n:.0f}%)", "WARN")
-        time.sleep(args.sleep)
+            selected_proxy = random.choice(proxy_pool) if args.engine == "standalone" and proxy_pool else None
+            if args.engine == "standalone":
+                log(f"attempt #{n} BitBrowser proxy -> {mask_proxy(selected_proxy)}")
+            log(f"=== attempt #{n}  (pool={ps}, succ={succ}, fail={failed}) ===")
+            t0 = time.time()
+            email = password = None
+            cookies = []
+            account_proxy = selected_proxy
+            try:
+                email, password, cookies, account_proxy = asyncio.run(
+                    asyncio.wait_for(
+                        one_attempt(args.engine, mod, selected_proxy, n, args, consumable_pool),
+                        timeout=args.timeout,
+                    )
+                )
+            except Exception as e:
+                log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")
+            elapsed = time.time() - t0
+            if email and password:
+                # Graph 授权强制直连；account_proxy 仅用于注册链路。
+                graph = extract_graph_for_account(email, password, idx=n, proxy_str=None)
+                if not graph or not graph.get("refresh_token"):
+                    append_account_to_email_nograph(email, password)
+                    succ += 1
+                    log(
+                        f"[#{n}] registered but graph RT missing via direct; "
+                        f"saved to email_nograph: {email}",
+                        "WARN",
+                    )
+                    log(f"OK(no_graph) in {elapsed:.1f}s: {email}", "OK")
+                    time.sleep(args.sleep)
+                    continue
+                fname = write_record({
+                    "email": email,
+                    "password": password,
+                    "refresh_token": graph["refresh_token"],
+                    "client_id": graph.get("client_id") or "",
+                    "graph": graph,
+                    "outlook_cookies": cookies,
+                    "source": "self-loop",
+                    "ts": datetime.now().isoformat(),
+                })
+                globals()["_CURRENT_GRAPH_ACCOUNT"] = graph
+                append_to_emails_pool(email, password)   # 桥接进账号注册池
+                succ += 1
+                log(f"OK in {elapsed:.1f}s: {email} -> {fname} (pool now {count_pool()})", "OK")
+            else:
+                failed += 1
+                log(f"FAIL in {elapsed:.1f}s (success rate {succ}/{n} = {100*succ/n:.0f}%)", "WARN")
+            time.sleep(args.sleep)
+    finally:
+        if consumable_pool is not None:
+            if hasattr(consumable_pool, "stop"):
+                consumable_pool.stop()
+            set_pool = getattr(mod, "set_consumable_proxy_pool", None) or getattr(mod, "set_session_proxy_runtime", None)
+            if callable(set_pool):
+                set_pool(None)
+            log("proxy list destroyed")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -30,6 +31,7 @@ SCRIPT_CONFIG_PATH = os.path.join(ROOT, "webui_script_configs.json")
 sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
 import scripts as schema  # noqa: E402
+from process_utils import child_creationflags, stop_process_gracefully  # noqa: E402
 
 
 def _ensure_proxy_env():
@@ -55,6 +57,90 @@ _run_seq = [0]
 # 接码助手：内存记录当前租用的 sms-man 号  pkey -> {phone, rented_at, codes:[], service}
 SMS_RENTS = {}
 SMS_RENT_TTL = 1200  # 20 分钟租期(秒)
+
+
+def _extract_run_counts(lines):
+    counts = None
+    total_elapsed = None
+    avg_success_elapsed = None
+    patterns = (
+        # 新版三分类：success=a/t fail=b no_graph=c
+        (re.compile(r"success=(\d+)/(\d+)\s+fail=(\d+)\s+no_graph=(\d+)", re.I), "success_fail_nograph"),
+        (re.compile(r"完成:\s*success=(\d+)/(\d+)\s+fail=(\d+)\s+no_graph=(\d+)", re.I), "success_fail_nograph"),
+        (re.compile(r"汇总:\s*成功\s+(\d+)\s*\|\s*失败\s+(\d+)\s*\|\s*未授权\s+(\d+)", re.I), "cn_three"),
+        (re.compile(r"success=(\d+)/(\d+)(?:\s+fail=(\d+))?", re.I), "success_total"),
+        (re.compile(r"完成:\s*success=(\d+)/(\d+)(?:\s+fail=(\d+))?", re.I), "success_total"),
+        (re.compile(r"exit\s+\(success=(\d+),\s*fail=(\d+)\)", re.I), "success_fail"),
+        (re.compile(r"全部结束.*?成功\s+(\d+)\s+失败\s+(\d+)", re.I), "success_fail"),
+        (re.compile(r"RESULTS:\s*(\d+)/(\d+)", re.I), "success_total"),
+    )
+    time_patterns = (
+        re.compile(r"汇总耗时:\s*任务总耗时\s*([0-9]+(?:\.[0-9]+)?)s\s*\|\s*成功账号平均耗时\s*([0-9]+(?:\.[0-9]+)?)s", re.I),
+        re.compile(r"任务总耗时\s*([0-9]+(?:\.[0-9]+)?)s.*?成功账号平均耗时\s*([0-9]+(?:\.[0-9]+)?)s", re.I),
+        re.compile(r"SUMMARY_TIME:\s*total_elapsed\s*([0-9]+(?:\.[0-9]+)?)s\s*\|\s*avg_success_elapsed\s*([0-9]+(?:\.[0-9]+)?)s", re.I),
+    )
+    for line in reversed(lines or []):
+        raw = str(line or "").strip()
+        if total_elapsed is None or avg_success_elapsed is None:
+            for time_regex in time_patterns:
+                time_match = time_regex.search(raw)
+                if time_match:
+                    total_elapsed = float(time_match.group(1))
+                    avg_success_elapsed = float(time_match.group(2))
+                    break
+        for regex, kind in patterns:
+            match = regex.search(raw)
+            if not match:
+                continue
+            if kind == "success_fail_nograph":
+                success = int(match.group(1))
+                total = int(match.group(2))
+                fail = int(match.group(3))
+                no_graph = int(match.group(4))
+                counts = {"success": success, "fail": fail, "no_graph": no_graph, "total": total}
+                break
+            if kind == "cn_three":
+                success = int(match.group(1))
+                fail = int(match.group(2))
+                no_graph = int(match.group(3))
+                counts = {"success": success, "fail": fail, "no_graph": no_graph, "total": success + fail + no_graph}
+                break
+            if kind == "success_fail":
+                success = int(match.group(1))
+                fail = int(match.group(2))
+                counts = {"success": success, "fail": fail, "no_graph": 0}
+                break
+            success = int(match.group(1))
+            total = int(match.group(2))
+            explicit_fail = match.group(3) if match.lastindex and match.lastindex >= 3 else None
+            fail = int(explicit_fail) if explicit_fail is not None else max(total - success, 0)
+            counts = {"success": success, "fail": fail, "no_graph": 0, "total": total}
+            break
+        if counts and total_elapsed is not None and avg_success_elapsed is not None:
+            break
+    if counts:
+        if total_elapsed is not None:
+            counts["total_elapsed"] = total_elapsed
+        if avg_success_elapsed is not None:
+            counts["avg_success_elapsed"] = avg_success_elapsed
+        return counts
+    return None
+
+
+def _format_webui_run_summary(counts):
+    no_graph = int((counts or {}).get("no_graph") or 0)
+    total_elapsed = counts.get("total_elapsed") if counts else None
+    avg_success_elapsed = counts.get("avg_success_elapsed") if counts else None
+    parts = []
+    if no_graph:
+        parts.append(f"[webui] 本次 成功={counts['success']} 失败={counts['fail']} 未授权={no_graph}")
+    else:
+        parts.append(f"[webui] 本次 success={counts['success']} fail={counts['fail']}")
+    if total_elapsed is not None:
+        parts.append(f"总耗时={float(total_elapsed):.2f}s")
+    if avg_success_elapsed is not None:
+        parts.append(f"均耗={float(avg_success_elapsed):.2f}s")
+    return " ".join(parts)
 
 
 # ============================================================ 配置/状态读取
@@ -678,12 +764,35 @@ def _build_cmd(script, args):
     return cmd
 
 
-def _child_env():
+_OUTLOOK_WEBUI_SCRIPTS = {
+    "outlook_reg_loop",
+    "register_outlook_ruoyi",
+    "register_outlook_standalone",
+}
+
+
+def _child_env(script_id=""):
     """子进程环境：注入 PYTHONUNBUFFERED + 代理(对齐 run_full_flow.build_child_env)。
-    proxy 走 .env 的 CLASH_PROXY；localhost API 直连(NO_PROXY)。"""
+    proxy 走 .env 的 CLASH_PROXY；localhost API 直连(NO_PROXY)。
+    同时把 .env 里未进入进程环境的 key 补进子进程。"""
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    # 把 .env 里未进入进程环境的 key 补进子进程（优先 os.environ 已有值）
+    try:
+        file_env = _parse_env_file(ENV_PATH)
+        for k, v in (file_env or {}).items():
+            if k and v is not None and k not in env:
+                env[k] = str(v)
+    except Exception:
+        pass
+    if script_id in _OUTLOOK_WEBUI_SCRIPTS:
+        for key in (
+            "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+            "CLASH_API", "CLASH_SECRET", "CLASH_GROUP", "CLASH_PROXY",
+        ):
+            env.pop(key, None)
+        return env
     proxy = _read_config_val("CLASH_PROXY", "http://127.0.0.1:7897")
     if proxy:
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = proxy
@@ -702,8 +811,9 @@ async def api_run(request: Request):
         return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=400)
     cmd = _build_cmd(script, args)
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=ROOT, env=_child_env(),
+        *cmd, cwd=ROOT, env=_child_env(sid),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        creationflags=child_creationflags(),
     )
     _run_seq[0] += 1
     run_id = f"r{_run_seq[0]}"
@@ -722,6 +832,12 @@ async def api_run(request: Request):
         finally:
             await proc.wait()
             rec["done"] = True
+            counts = _extract_run_counts(rec["lines"])
+            if counts:
+                rec["lines"].append(_format_webui_run_summary(counts))
+            elif proc.returncode == 0:
+                # 有进程正常退出但没抽到汇总时，至少给个提示
+                rec["lines"].append("[webui] 本次未解析到 success/fail 汇总行")
             rec["lines"].append(f"[webui] 进程结束 exit={proc.returncode}")
 
     asyncio.create_task(_pump())
@@ -756,7 +872,7 @@ async def api_stop(run_id: str):
         return JSONResponse({"error": "无此任务"}, status_code=404)
     if not rec["done"]:
         try:
-            rec["proc"].terminate()
+            stop_process_gracefully(rec["proc"])
         except Exception:
             pass
     return {"ok": True}

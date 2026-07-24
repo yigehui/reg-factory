@@ -25,6 +25,30 @@ if sys.platform == "win32":
 
 import requests
 
+
+def _load_dotenv_if_present():
+    """CLI 直接跑时也吃项目根 .env（不覆盖已有环境变量）。"""
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(root, ".env")
+        if not os.path.isfile(path):
+            return
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, _, v = s.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv_if_present()
+
 # Thunderbird client — public, supports personal accounts.
 # 用 Graph Mail.Read 资源域：下游 common/mailbox.get_code_by_token 走 Graph REST
 # (/me/mailFolders/.../messages) 取码，必须拿 graph.microsoft.com 资源的 refresh_token；
@@ -33,19 +57,144 @@ CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 REDIRECT_URI = "http://localhost"
 SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
 OUTPUT_DIR = "outlook_accounts"
+LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERR": 40}
 
 
-def get_graph_token(email, password, idx=0):
+def _normalize_log_level(value, default="INFO"):
+    raw = str(value or default).strip().upper()
+    aliases = {"TRACE": "DEBUG", "WARNING": "WARN", "ERROR": "ERR"}
+    raw = aliases.get(raw, raw)
+    return raw if raw in LOG_LEVELS else default
+
+
+def _log_level_value(value):
+    return LOG_LEVELS.get(_normalize_log_level(value), LOG_LEVELS["INFO"])
+
+
+def _should_demote_graph_log(msg, level):
+    normalized = _normalize_log_level(level)
+    if normalized != "INFO":
+        return False
+    low = str(msg or "").lower()
+    debug_patterns = (
+        "proxy=",
+        "fetching auth page",
+        "auth page ",
+        "submitting credentials",
+        "submit credentials ",
+        "auto-submit intermediate",
+        "got auth code!",
+        "accepting consent/update",
+        "skipping proofs/add",
+        "submitting consent",
+        "exchanging code for tokens",
+        "token exchange ",
+    )
+    return any(pat in low for pat in debug_patterns)
+
+
+def _graph_log(tag, msg, level="INFO"):
+    normalized = _normalize_log_level(level)
+    effective = "DEBUG" if _should_demote_graph_log(msg, normalized) else normalized
+    current = _normalize_log_level(os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"))
+    if _log_level_value(effective) < _log_level_value(current):
+        return
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{normalized}] {tag} [graph] {msg}")
+
+
+def _mask_proxy_url(proxy_url):
+    if not proxy_url:
+        return "direct"
+    parsed = urllib.parse.urlsplit(str(proxy_url))
+    host = parsed.hostname or ""
+    port = parsed.port or ""
+    user = urllib.parse.unquote(parsed.username or "")
+    auth = f"{user[:6]}...@" if user else ""
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{auth}{host}:{port}" if port else f"{scheme}://{auth}{host}"
+
+
+def _save_graph_debug_html(email, idx, reason, html):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    safe = str(email or f"idx_{idx}").replace("@", "_").replace("/", "_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    path = os.path.join(OUTPUT_DIR, f"graph_debug_{idx}_{reason}_{safe}_{ts}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html or "")
+    return path
+
+
+def _extract_login_error(html):
+    text = str(html or "")
+    code = ""
+    err = ""
+    for pattern in (
+        r'"sErrorCode":"([^"]+)"',
+        r"<!-- HR=([A-F0-9]+) -->",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            code = match.group(1)
+            break
+    err_match = re.search(r'"sErrTxt":"([^"]+)"', text)
+    if err_match:
+        err = err_match.group(1)
+    err = re.sub(r"<[^>]+>", " ", err)
+    err = err.replace("\\u0027", "'").replace("\\/", "/").replace('\\"', '"')
+    err = re.sub(r"\s+", " ", err).strip()
+    return code, err
+
+
+def _probe_proxy_exit_ip(proxies):
+    if not proxies:
+        return ""
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies.update(proxies)
+    try:
+        resp = session.get("https://api.ipify.org?format=json", timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        return str(data.get("ip") or "").strip()
+    except Exception:
+        return ""
+
+
+def _extract_flow_token(text):
+    raw = str(text or "")
+    patterns = (
+        r'sFTTag.*?value=\\+"([^"\\]+)',
+        r'sFTTag.*?value=["\']([^"\']+)["\']',
+        r'name=\\"PPFT\\"[^>]*value=\\"([^"\\]+)\\"',
+        r'"sFT"\s*:\s*"([^"]+)"',
+        r'name="PPFT"[^>]*value="([^"]+)"',
+    )
+    for pattern in patterns:
+        try:
+            match = re.search(pattern, raw, re.DOTALL)
+        except re.error as exc:
+            raise RuntimeError(f"bad flow-token regex {pattern!r}: {exc}") from exc
+        if match:
+            return match.group(1)
+    return ""
+
+
+def get_graph_token(email, password, idx=0, proxies=None):
     """Get refresh_token via pure HTTP OAuth flow (no browser)."""
     tag = f"[#{idx}]"
     session = requests.Session()
-    session.trust_env = True  # Use system proxy (Clash) — avoids rate-limiting on account.live.com
+    session.trust_env = False
+    if proxies:
+        session.proxies.update(proxies)
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     })
 
     try:
-        # Step 1: GET authorize URL
+        proxy_url = (proxies or {}).get("https") or (proxies or {}).get("http") or ""
+        proxy_exit_ip = _probe_proxy_exit_ip(proxies)
+        _graph_log(tag, f"proxy={_mask_proxy_url(proxy_url)} trust_env=False exit_ip={proxy_exit_ip or 'unknown'}")
+
         auth_url = (
             f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
             f"?client_id={CLIENT_ID}"
@@ -54,45 +203,33 @@ def get_graph_token(email, password, idx=0):
             f"&scope={urllib.parse.quote(SCOPE)}"
             f"&response_mode=query"
         )
-        print(f"  {tag} {email} — fetching auth page...")
+        _graph_log(tag, f"{email} - fetching auth page...")
+        t_auth = datetime.now()
         resp = session.get(auth_url, timeout=30, allow_redirects=True)
+        _graph_log(tag, f"auth page {(datetime.now() - t_auth).total_seconds():.2f}s status={resp.status_code} url={resp.url[:120]}")
 
-        # Extract form data from MS login page
         text = resp.text
+        flow_token = _extract_flow_token(text)
 
-        # Flow token (PPFT) — embedded in sFTTag as escaped HTML input
-        flow_token = ""
-        sft_tag = re.search(r'sFTTag.*?value=\\?"([^"\\]+)', text)
-        if sft_tag:
-            flow_token = sft_tag.group(1)
-        if not flow_token:
-            # Fallback: look for PPFT hidden input directly
-            ppft = re.search(r'name="PPFT"[^>]*value="([^"]+)"', text)
-            if ppft:
-                flow_token = ppft.group(1)
-
-        # Post URL
         post_url = ""
         urlpost_match = re.search(r'"urlPost"\s*:\s*"([^"]+)"', text)
         if urlpost_match:
-            post_url = urlpost_match.group(1).replace("\\u0026", "&")
+            post_url = urlpost_match.group(1).replace("\u0026", "&")
 
-        # Context
         ctx = ""
         sctx_match = re.search(r'"sCtx"\s*:\s*"([^"]+)"', text)
         if sctx_match:
             ctx = sctx_match.group(1)
 
         if not flow_token:
-            print(f"  {tag} FAIL: no flow token found")
+            debug_path = _save_graph_debug_html(email, idx, "no_flow_token", text)
+            _graph_log(tag, f"FAIL: no flow token found debug={debug_path}", "WARN")
             return None
 
         if not post_url:
             post_url = "https://login.live.com/ppsecure/post.srf"
 
-        print(f"  {tag} submitting credentials...")
-
-        # Step 2: POST credentials
+        _graph_log(tag, "submitting credentials...")
         login_data = {
             "login": email,
             "loginfmt": email,
@@ -108,9 +245,10 @@ def get_graph_token(email, password, idx=0):
             "i19": "16393",
         }
 
+        t_submit = datetime.now()
         resp2 = session.post(post_url, data=login_data, timeout=30, allow_redirects=True)
+        _graph_log(tag, f"submit credentials {(datetime.now() - t_submit).total_seconds():.2f}s status={resp2.status_code} url={getattr(resp2, 'url', '')[:120]}")
 
-        # Follow JS auto-submit intermediate pages (Microsoft uses onload="DoSubmit()" forms)
         for _ in range(5):
             _html = resp2.text or ''
             if ('DoSubmit' in _html or ('fmHF' in _html and 'onload' in _html)) and 'action=' in _html:
@@ -120,13 +258,12 @@ def get_graph_token(email, password, idx=0):
                     _hid = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', _html)
                     _fd = {n: v for n, v in _hid}
                     resp2 = session.post(_fa, data=_fd, timeout=30, allow_redirects=True)
+                    _graph_log(tag, f"auto-submit intermediate -> {getattr(resp2, 'url', '')[:120]}", "DEBUG")
                     continue
             break
 
-        # Follow redirects manually, catching localhost redirect
         auth_code = None
-        for step in range(15):
-            # Handle HTTP redirects
+        for _step in range(15):
             while resp2.status_code in (301, 302, 303, 307):
                 loc = resp2.headers.get("Location", "")
                 if "localhost" in loc and "code=" in loc:
@@ -140,24 +277,20 @@ def get_graph_token(email, password, idx=0):
             url = resp2.url
             text = resp2.text if hasattr(resp2, 'text') and resp2.text else ''
 
-            # Check if we landed on localhost with code
             if "localhost" in url and "code=" in url:
                 parsed = urllib.parse.urlparse(url)
                 params = urllib.parse.parse_qs(parsed.query)
                 auth_code = params.get("code", [None])[0]
                 if auth_code:
-                    print(f"  {tag} got auth code!")
+                    _graph_log(tag, "got auth code!")
                     break
 
-            # Check for error
             if "localhost" in url and "error" in url:
                 parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
                 err = parsed.get("error_description", parsed.get("error", ["?"]))[0]
-                print(f"  {tag} OAuth error: {err[:100]}")
+                _graph_log(tag, f"OAuth error: {err[:100]}", "WARN")
                 return None
 
-            # Consent/Update — Microsoft app consent page (React SPA, no static form).
-            # Accept by POSTing ucaction=Yes with fields extracted from ServerData JS config.
             if "Consent/Update" in url or "Consent/update" in url:
                 m_sd = re.search(r'ServerData\s*=\s*(\{.*?\});', text, re.DOTALL)
                 if m_sd:
@@ -169,33 +302,31 @@ def get_graph_token(email, password, idx=0):
                         'cscope': sd.get('sRawInputGrantedScopes', ''),
                         'canary': sd.get('sCanary', ''),
                     }
-                    print(f"  {tag} accepting Consent/Update...")
+                    _graph_log(tag, "accepting Consent/Update...")
                     resp2 = session.post(url, data=form_data_consent, timeout=30, allow_redirects=False)
                     continue
-                print(f"  {tag} FAIL: Consent/Update with no ServerData")
+                debug_path = _save_graph_debug_html(email, idx, "consent_update", text)
+                _graph_log(tag, f"FAIL: Consent/Update with no ServerData debug={debug_path}", "WARN")
                 return None
 
-            # proofs/Add — Microsoft asking to add security info.
-            # Skip by setting action="Skip" and submitting the form (mirrors JS: jQuery("#action").val("Skip"))
             if "proofs/Add" in url or "proofs/add" in url:
-                form_match2 = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
-                                        text, re.DOTALL | re.IGNORECASE)
+                form_match2 = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>', text, re.DOTALL | re.IGNORECASE)
                 if form_match2:
                     form_action2 = form_match2.group(1).replace("&amp;", "&")
                     form_body2 = form_match2.group(2)
                     hidden2 = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', form_body2)
                     form_data2 = {n: v for n, v in hidden2}
-                    form_data2["action"] = "Skip"  # simulate Skip button click
+                    form_data2["action"] = "Skip"
                     if not form_action2.startswith("http"):
                         base2 = urllib.parse.urlparse(url)
                         form_action2 = f"{base2.scheme}://{base2.netloc}{form_action2}"
-                    print(f"  {tag} skipping proofs/Add (action=Skip) -> {form_action2[:80]}...")
+                    _graph_log(tag, f"skipping proofs/Add (action=Skip) -> {form_action2[:80]}...")
                     resp2 = session.post(form_action2, data=form_data2, timeout=30, allow_redirects=False)
                     continue
-                print(f"  {tag} FAIL: proofs/Add with no form")
+                debug_path = _save_graph_debug_html(email, idx, "proofs_add", text)
+                _graph_log(tag, f"FAIL: proofs/Add with no form debug={debug_path}", "WARN")
                 return None
 
-            # Find and submit any form on the page (consent, redirect, etc.)
             form_match = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>', text, re.DOTALL | re.IGNORECASE)
             if form_match:
                 form_action = form_match.group(1).replace("&amp;", "&")
@@ -203,18 +334,15 @@ def get_graph_token(email, password, idx=0):
                 hidden = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', form_body)
                 form_data = {name: val for name, val in hidden}
 
-                # For consent pages, add accept
                 if "consent" in form_action.lower() or "consent" in url.lower():
                     form_data["ucaccept"] = "Yes"
-                    print(f"  {tag} submitting consent...")
+                    _graph_log(tag, "submitting consent...", "DEBUG")
 
                 if not form_action.startswith("http"):
                     base = urllib.parse.urlparse(url)
                     form_action = f"{base.scheme}://{base.netloc}{form_action}"
 
-                # Don't follow redirect to localhost (it will fail)
                 resp2 = session.post(form_action, data=form_data, timeout=30, allow_redirects=False)
-                # Follow redirects but catch localhost
                 while resp2.status_code in (301, 302, 303, 307):
                     loc = resp2.headers.get("Location", "")
                     if "localhost" in loc:
@@ -226,15 +354,37 @@ def get_graph_token(email, password, idx=0):
                         break
                 continue
 
-            print(f"  {tag} FAIL: stuck at {url[:100]} (status={resp2.status_code})")
+            debug_path = _save_graph_debug_html(email, idx, "stuck", text)
+            err_code, err_text = _extract_login_error(text)
+            plain = re.sub(r"\s+", " ", (text or "")).strip()
+            # 纯文本错误页（如 "Bad user credential or too many signin attempts..."）
+            if not err_text and plain and len(plain) < 300 and "<html" not in plain.lower():
+                err_text = plain
+            detail = f" code={err_code}" if err_code else ""
+            if err_text:
+                detail += f" err={err_text[:200]!r}"
+            low = (err_text or plain or "").lower()
+            if "bad user credential" in low or "too many signin" in low:
+                _graph_log(
+                    tag,
+                    f"FAIL: bad_cred_or_rate_limit at {url[:100]} "
+                    f"(status={resp2.status_code}){detail} debug={debug_path}",
+                    "WARN",
+                )
+            else:
+                _graph_log(
+                    tag,
+                    f"FAIL: stuck at {url[:100]} (status={resp2.status_code}){detail} debug={debug_path}",
+                    "WARN",
+                )
             return None
 
         if not auth_code:
-            print(f"  {tag} FAIL: no auth code extracted")
+            _graph_log(tag, "FAIL: no auth code extracted", "WARN")
             return None
 
-        # Step 3: Exchange code for tokens
-        print(f"  {tag} exchanging code for tokens...")
+        _graph_log(tag, "exchanging code for tokens...")
+        t_token = datetime.now()
         token_resp = session.post(
             "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
             data={
@@ -246,11 +396,18 @@ def get_graph_token(email, password, idx=0):
             },
             timeout=30,
         )
-        token_data = token_resp.json()
+        try:
+            token_data = token_resp.json()
+        except Exception:
+            token_data = {"error": "non_json", "error_description": (token_resp.text or "")[:200]}
 
         if "access_token" in token_data:
             rt = token_data.get("refresh_token", "")
-            print(f"  {tag} OK! refresh_token={'yes' if rt else 'no'}")
+            _graph_log(
+                tag,
+                f"token exchange {(datetime.now() - t_token).total_seconds():.2f}s "
+                f"refresh_token={'yes' if rt else 'no'}",
+            )
             return {
                 "email": email,
                 "password": password,
@@ -259,11 +416,11 @@ def get_graph_token(email, password, idx=0):
             }
         else:
             err = token_data.get("error_description", token_data.get("error", "?"))
-            print(f"  {tag} token error: {err[:150]}")
+            _graph_log(tag, f"token error: {str(err)[:150]}", "WARN")
             return None
 
     except Exception as e:
-        print(f"  {tag} error: {e}")
+        _graph_log(tag, f"error: {type(e).__name__}: {e}", "ERR")
         return None
 
 
@@ -273,7 +430,10 @@ def main():
     parser.add_argument("--email", "-e", type=str)
     parser.add_argument("--password", "-p", type=str)
     parser.add_argument("--concurrency", "-c", type=int, default=5)
+    parser.add_argument("--log-level", default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
+                        choices=["DEBUG", "INFO", "WARN", "ERR"])
     args = parser.parse_args()
+    os.environ["OUTLOOK_LOG_LEVEL"] = _normalize_log_level(args.log_level)
 
     accounts = []
     if args.email and args.password:
