@@ -58,8 +58,62 @@ RUOYI_PATH = os.environ.get(
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+LOG_LEVELS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "OK": 20,
+    "WARN": 30,
+    "PROD": 35,
+    "ERR": 40,
+}
+LOG_LEVEL = str(os.environ.get("OUTLOOK_LOG_LEVEL", "INFO") or "INFO").strip().upper()
+
+
+def _normalize_log_level(value, default="INFO"):
+    raw = str(value or default).strip().upper()
+    aliases = {
+        "WARNING": "WARN",
+        "ERROR": "ERR",
+        "PRODUCTION": "PROD",
+        "SUCCESS": "OK",
+    }
+    raw = aliases.get(raw, raw)
+    return raw if raw in LOG_LEVELS else default
+
+
+def _log_level_value(value):
+    return LOG_LEVELS.get(_normalize_log_level(value), LOG_LEVELS["INFO"])
+
+
+def set_log_level(value):
+    global LOG_LEVEL
+    LOG_LEVEL = _normalize_log_level(value)
+    os.environ["OUTLOOK_LOG_LEVEL"] = LOG_LEVEL
+    return LOG_LEVEL
+
+
+def _should_keep_prod_log(msg, level):
+    if _normalize_log_level(level) == "ERR":
+        return True
+    low = str(msg or "").strip().lower()
+    if not low:
+        return False
+    return (
+        low.startswith("ok in ")
+        or low.startswith("ok(no_graph) in ")
+        or low.startswith("fail in ")
+        or low.startswith("reached --count ")
+    )
+
+
 def log(msg, level="INFO"):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
+    rendered = _normalize_log_level(level, default="INFO")
+    if LOG_LEVEL == "PROD":
+        if not _should_keep_prod_log(msg, rendered):
+            return
+    elif _log_level_value(rendered) < _log_level_value(LOG_LEVEL):
+        return
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{rendered}] {msg}", flush=True)
 
 
 def _env_bool(name, default=False):
@@ -747,7 +801,7 @@ def main():
     ap.add_argument("--password-format", default=os.environ.get("OUTLOOK_PASSWORD_FORMAT", ""),
                     help="密码模板，如 Aa1!{rand:12}")
     ap.add_argument("--log-level", default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
-                    choices=["DEBUG", "INFO", "WARN", "ERR"],
+                    choices=["DEBUG", "INFO", "WARN", "PROD", "ERR"],
                     help="log verbosity for loop/ruoyi")
     ap.add_argument("--sleep", type=int, default=5,
                     help="seconds between attempts (after fail or success)")
@@ -757,7 +811,7 @@ def main():
 
     os.environ.setdefault("OUTLOOK_REG_MAX_PRESS", args.max_press)
     os.environ["OUTLOOK_PX_PRESS_SCREENSHOTS"] = "1" if args.px_press_screenshots else "0"
-    os.environ["OUTLOOK_LOG_LEVEL"] = args.log_level
+    set_log_level(args.log_level)
     if args.confirm_before_register:
         os.environ["OUTLOOK_CONFIRM_BEFORE_REGISTER"] = "1"
     if args.proxy_file:

@@ -10,9 +10,12 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 启动：  python -m uvicorn webui.server:app --port 8799   (或用 start.bat)
 """
 import asyncio
+import inspect
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import time
 import urllib.request
@@ -57,6 +60,51 @@ _run_seq = [0]
 # 接码助手：内存记录当前租用的 sms-man 号  pkey -> {phone, rented_at, codes:[], service}
 SMS_RENTS = {}
 SMS_RENT_TTL = 1200  # 20 分钟租期(秒)
+
+
+def _append_run_line(rec, line):
+    rec["lines"].append(str(line))
+    if len(rec["lines"]) > 5000:
+        dropped = len(rec["lines"]) - 4000
+        rec["lines"] = rec["lines"][-4000:]
+        rec["line_offset"] = int(rec.get("line_offset") or 0) + dropped
+
+
+async def _stop_asyncio_process_gracefully(proc, timeout=15):
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return
+    if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            return
+        except Exception:
+            pass
+        pid = getattr(proc, "pid", None)
+        if pid:
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                return
+            except Exception:
+                pass
+    try:
+        proc.terminate()
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except Exception:
+        pass
 
 
 def _extract_run_counts(lines):
@@ -817,28 +865,26 @@ async def api_run(request: Request):
     )
     _run_seq[0] += 1
     run_id = f"r{_run_seq[0]}"
-    rec = {"proc": proc, "lines": [], "done": False, "script": sid,
+    rec = {"proc": proc, "lines": [], "line_offset": 0, "done": False, "script": sid,
            "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S")}
     RUNS[run_id] = rec
 
     async def _pump():
         try:
             async for raw in proc.stdout:
-                rec["lines"].append(raw.decode("utf-8", "replace").rstrip("\n"))
-                if len(rec["lines"]) > 5000:
-                    rec["lines"] = rec["lines"][-4000:]
+                _append_run_line(rec, raw.decode("utf-8", "replace").rstrip("\n"))
         except Exception as e:
-            rec["lines"].append(f"[webui] 读取输出异常: {e}")
+            _append_run_line(rec, f"[webui] 读取子进程输出异常: {e}")
         finally:
             await proc.wait()
             rec["done"] = True
             counts = _extract_run_counts(rec["lines"])
             if counts:
-                rec["lines"].append(_format_webui_run_summary(counts))
+                _append_run_line(rec, _format_webui_run_summary(counts))
             elif proc.returncode == 0:
-                # 有进程正常退出但没抽到汇总时，至少给个提示
-                rec["lines"].append("[webui] 本次未解析到 success/fail 汇总行")
-            rec["lines"].append(f"[webui] 进程结束 exit={proc.returncode}")
+                # 子脚本未输出可解析汇总时，仍给出一条兜底提示。
+                _append_run_line(rec, "[webui] 未解析到 success/fail 汇总")
+            _append_run_line(rec, f"[webui] 任务结束 exit={proc.returncode}")
 
     asyncio.create_task(_pump())
     return {"run_id": run_id, "cmd": rec["cmd"]}
@@ -851,16 +897,22 @@ async def api_logs(run_id: str):
         return JSONResponse({"error": "无此任务"}, status_code=404)
 
     async def _stream():
-        idx = 0
+        idx = int(rec.get("line_offset") or 0)
         while True:
             lines = rec["lines"]
-            while idx < len(lines):
-                yield f"data: {lines[idx]}\n\n"
+            offset = int(rec.get("line_offset") or 0)
+            if idx < offset:
+                idx = offset
+            rel = idx - offset
+            while rel < len(lines):
+                yield f"data: {lines[rel]}\n\n"
                 idx += 1
-            if rec["done"] and idx >= len(rec["lines"]):
+                rel += 1
+            if rec["done"] and rel >= len(rec["lines"]):
                 yield "event: done\ndata: end\n\n"
                 break
             await asyncio.sleep(0.4)
+
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
@@ -869,10 +921,14 @@ async def api_logs(run_id: str):
 async def api_stop(run_id: str):
     rec = RUNS.get(run_id)
     if not rec:
-        return JSONResponse({"error": "无此任务"}, status_code=404)
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
     if not rec["done"]:
         try:
-            stop_process_gracefully(rec["proc"])
+            stopped = stop_process_gracefully(rec["proc"])
+            if inspect.isawaitable(stopped):
+                await stopped
+            elif hasattr(rec["proc"], "wait") and not hasattr(rec["proc"], "poll"):
+                await _stop_asyncio_process_gracefully(rec["proc"])
         except Exception:
             pass
     return {"ok": True}

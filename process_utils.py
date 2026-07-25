@@ -9,18 +9,34 @@ def child_creationflags():
     return 0
 
 
+def _taskkill_process_tree(proc, timeout):
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return False
+    subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        check=False,
+        capture_output=True,
+        timeout=timeout,
+    )
+    proc.wait(timeout=timeout)
+    return True
+
+
 def stop_process_gracefully(proc, timeout=15):
     if proc is None or proc.poll() is not None:
         return
-    waited = False
     if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
         try:
             proc.send_signal(signal.CTRL_BREAK_EVENT)
             proc.wait(timeout=timeout)
-            waited = True
+            return
         except Exception:
             pass
-    if waited:
-        return
+        try:
+            if _taskkill_process_tree(proc, timeout):
+                return
+        except Exception:
+            pass
     proc.terminate()
     proc.wait(timeout=timeout)

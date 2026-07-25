@@ -54,8 +54,59 @@ CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
 PROXY_DEFAULT = os.environ.get("CLASH_PROXY", "http://127.0.0.1:7897")
 
 
+LOG_LEVELS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "OK": 20,
+    "A": 20,
+    "B": 20,
+    "WARN": 30,
+    "PROD": 35,
+    "ERR": 40,
+}
+LOG_LEVEL = str(os.environ.get("OUTLOOK_LOG_LEVEL", "INFO") or "INFO").strip().upper()
+
+
+def _normalize_log_level(value, default="INFO"):
+    raw = str(value or default).strip().upper()
+    aliases = {
+        "WARNING": "WARN",
+        "ERROR": "ERR",
+        "PRODUCTION": "PROD",
+        "SUCCESS": "OK",
+    }
+    raw = aliases.get(raw, raw)
+    return raw if raw in LOG_LEVELS else default
+
+
+def _log_level_value(value):
+    return LOG_LEVELS.get(_normalize_log_level(value), LOG_LEVELS["INFO"])
+
+
+def set_log_level(value):
+    global LOG_LEVEL
+    LOG_LEVEL = _normalize_log_level(value)
+    os.environ["OUTLOOK_LOG_LEVEL"] = LOG_LEVEL
+    return LOG_LEVEL
+
+
+def _should_keep_prod_log(msg, level):
+    if _normalize_log_level(level) == "ERR":
+        return True
+    low = str(msg or "").strip().lower()
+    if not low:
+        return False
+    return low.startswith("本轮结束") or low.startswith("全部结束")
+
+
 def log(msg, level="INFO"):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}", flush=True)
+    rendered = _normalize_log_level(level, default="INFO")
+    if LOG_LEVEL == "PROD":
+        if not _should_keep_prod_log(msg, rendered):
+            return
+    elif _log_level_value(rendered) < _log_level_value(LOG_LEVEL):
+        return
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{rendered}] {msg}", flush=True)
 
 
 def _env_bool(name, default=False):
@@ -310,7 +361,7 @@ def main():
                     help="Clash 组名（proxy_switch 探节点用）；global 模式下出口由 GLOBAL 决定，"
                          "传 'auto' 会 404。claude/grok 的节点选择模式见 --node")
     ap.add_argument("--log-level", default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
-                    choices=["DEBUG", "INFO", "WARN", "ERR"],
+                    choices=["DEBUG", "INFO", "WARN", "PROD", "ERR"],
                     help="Outlook/Graph 日志等级")
     ap.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
     args = ap.parse_args()
@@ -319,6 +370,7 @@ def main():
         # --skip-email 每轮都用同一个固定邮箱，循环没意义（甚至会重复注册同号）
         raise SystemExit("--skip-email 只能跑单轮，不能配合 --rounds")
 
+    set_log_level(args.log_level)
     env = build_child_env(args)
     t_all = time.time()
     print("=" * 64)
