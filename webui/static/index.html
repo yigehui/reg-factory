@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>reg-factory 控制面板</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20260726-task-pages">
 </head>
 <body>
 <header class="topbar">
@@ -21,6 +21,8 @@
   <nav class="sidebar">
     <div class="nav-section">
       <button class="navbtn active" data-view="run">▶ 运行任务</button>
+      <button class="navbtn" data-view="tasks">📊 任务记录</button>
+      <button class="navbtn" data-view="accounts">🗂 账号管理</button>
       <button class="navbtn" data-view="mailpool">📥 邮箱池</button>
       <button class="navbtn" data-view="env">⚙️ 配置 (.env)</button>
     </div>
@@ -87,6 +89,143 @@
       </div>
     </section>
 
+    <section id="view-tasks" style="display:none">
+      <div class="panel">
+        <div class="env-head">
+          <h2>任务记录与统计</h2>
+          <button id="btn-refresh-tasks" class="btn-run">刷新</button>
+          <span id="task-msg" class="env-msg"></span>
+        </div>
+        <div id="task-cards" class="stats-grid"></div>
+        <div class="chart-grid">
+          <div class="chart-box">
+            <div class="chart-title">最近任务数</div>
+            <div id="chart-task-trend" class="mini-bars"></div>
+          </div>
+          <div class="chart-box">
+            <div class="chart-title">最近成功账号数</div>
+            <div id="chart-success-trend" class="mini-bars"></div>
+          </div>
+          <div class="chart-box">
+            <div class="chart-title">注册地区 Top</div>
+            <div id="chart-regions" class="mini-bars"></div>
+          </div>
+        </div>
+        <div id="task-table-wrap"></div>
+        <div class="pagination-footer">
+          <div id="tasks-pagination" class="pagination-bar"></div>
+          <div class="pagination-size">
+            <select id="tasks-page-size">
+              <option value="20">20 / 页</option>
+              <option value="50">50 / 页</option>
+              <option value="100">100 / 页</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="env-head">
+          <h2>任务详情</h2>
+          <span id="task-detail-title" class="env-msg"></span>
+        </div>
+        <div id="task-detail-meta" class="detail-meta"></div>
+        <div id="task-detail-accounts" class="table-wrap"></div>
+        <div id="task-detail-accounts-pagination" class="pagination-bar"></div>
+      </div>
+    </section>
+
+    <div id="task-log-modal" class="modal-mask" style="display:none">
+      <div class="modal-card modal-card-log">
+        <div class="env-head">
+          <h2>任务日志</h2>
+          <button id="btn-close-task-log" class="btn-stop">关闭</button>
+        </div>
+        <div id="task-log-title" class="hint"></div>
+        <pre id="task-log-content" class="log log-modal-body"></pre>
+      </div>
+    </div>
+
+    <section id="view-accounts" style="display:none">
+      <div class="panel">
+        <div class="env-head">
+          <h2>账号管理</h2>
+          <button id="btn-refresh-accounts" class="btn-run">刷新</button>
+          <button id="btn-open-import-accounts" class="btn-run">导入</button>
+          <button id="btn-export-accounts" class="btn-run">导出 TXT</button>
+          <span id="accounts-msg" class="env-msg"></span>
+        </div>
+        <div class="toolbar-row">
+          <input id="accounts-task-filter" type="number" placeholder="按任务ID筛选">
+          <input id="accounts-email-filter" type="text" placeholder="按邮箱筛选">
+          <select id="accounts-status-filter">
+            <option value="">全部状态</option>
+            <option value="ok">ok</option>
+            <option value="no_graph">no_graph</option>
+            <option value="imported">imported</option>
+          </select>
+          <button id="btn-query-accounts" class="btn-run">查询</button>
+        </div>
+        <div id="accounts-table-wrap"></div>
+        <div class="pagination-footer">
+          <div id="accounts-pagination" class="pagination-bar"></div>
+          <div class="pagination-size">
+            <select id="accounts-page-size">
+              <option value="20">20 / 页</option>
+              <option value="50">50 / 页</option>
+              <option value="100">100 / 页</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div id="accounts-import-modal" class="modal-mask" style="display:none">
+      <div class="modal-card">
+        <div class="env-head">
+          <h2>导入账号</h2>
+          <button id="btn-close-import-accounts" class="btn-stop">关闭</button>
+        </div>
+        <p class="hint">支持粘贴文本或选择 txt 文件，格式：email----password----refresh_token----client_id</p>
+        <textarea id="accounts-import-input" class="mailpool-input" spellcheck="false"
+          placeholder="aaa@outlook.com----Pass123----refresh_token----client_id"></textarea>
+        <div class="toolbar-row">
+          <input id="accounts-import-file" type="file" accept=".txt,text/plain">
+        </div>
+        <div>
+          <button id="btn-import-accounts" class="btn-run">开始导入</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="accounts-edit-modal" class="modal-mask" style="display:none">
+      <div class="modal-card modal-card-sm">
+        <div class="env-head">
+          <h2>编辑账号</h2>
+          <button id="btn-close-edit-accounts" class="btn-stop">关闭</button>
+        </div>
+        <input id="accounts-edit-id" type="hidden">
+        <div class="field">
+          <label for="accounts-edit-email">邮箱</label>
+          <input id="accounts-edit-email" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="accounts-edit-password">密码</label>
+          <input id="accounts-edit-password" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="accounts-edit-client-id">client_id</label>
+          <input id="accounts-edit-client-id" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="accounts-edit-refresh-token">授权码</label>
+          <textarea id="accounts-edit-refresh-token" class="mailpool-input account-token-input" spellcheck="false"></textarea>
+        </div>
+        <div>
+          <button id="btn-save-edit-accounts" class="btn-run">保存</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 配置视图 -->
     <section id="view-env" style="display:none">
       <div class="panel">
@@ -102,7 +241,7 @@
   </main>
 </div>
 
-<script src="/static/log_autoscroll.js?v=20260724-log-scroll"></script>
-<script src="/static/app.js?v=20260724-log-scroll"></script>
+<script src="/static/log_autoscroll.js?v=20260726-task-pages"></script>
+<script src="/static/app.js?v=20260726-task-pages"></script>
 </body>
 </html>

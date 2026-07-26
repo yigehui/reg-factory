@@ -1,3 +1,4 @@
+import inspect
 import time
 import unittest
 from unittest.mock import patch
@@ -49,6 +50,14 @@ class BrowserQuitTimeoutTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(browser.closed, 1)
         self.assertLess(elapsed, 0.15)
+
+
+class LeftSignupLogTests(unittest.TestCase):
+    def test_register_outlook_uses_microsoft_loading_wording_for_left_signup_log(self):
+        source = inspect.getsource(mod.register_outlook)
+
+        self.assertIn("Microsoft Loading page, keep waiting for redirect", source)
+        self.assertNotIn("left signup ->", source)
 
 
 if __name__ == "__main__":

@@ -56,27 +56,36 @@ class PxHoldEarlyReleaseTests(unittest.TestCase):
         clock = _FakeClock()
         ctx = _FakeContext(clock)
         poll_times = []
+        logs = []
 
         def fake_hold_state(_ctx, hold_p_id=None):
             poll_times.append(clock.time())
             return {"id": "hold-label", "text": "按住", "display": "none"}
 
+        def fake_uniform(a, b):
+            if (a, b) == (0.5, 1.5):
+                return 1.0
+            return (a + b) / 2.0
+
         with (
             patch.object(mod.time, "time", side_effect=clock.time),
             patch.object(mod.time, "sleep", side_effect=clock.sleep),
-            patch.object(mod.random, "uniform", side_effect=lambda a, b: (a + b) / 2.0),
+            patch.object(mod.random, "uniform", side_effect=fake_uniform),
             patch.object(mod.random, "randint", return_value=320),
+            patch.object(mod, "log", side_effect=lambda msg, level="INFO": logs.append((level, msg))),
             patch.object(mod, "_resolve_hold_label_for_target", return_value={"id": "hold-label", "text": "Press and hold"}, create=True),
             patch.object(mod, "_px_hold_instruction_state", side_effect=fake_hold_state, create=True),
         ):
             ok = mod._perform_hold("page", ctx, {"x": 100, "y": 200}, 1, 1, "[#1][ruoyi]")
 
-        self.assertAlmostEqual(ok, 5.0, delta=0.01)
+        self.assertAlmostEqual(ok, 6.0, delta=0.01)
         self.assertTrue(poll_times)
         self.assertGreaterEqual(poll_times[0], 105.0)
-        self.assertLess(clock.time(), 106.0)
+        self.assertAlmostEqual(clock.time(), 106.0, delta=0.01)
         self.assertIn(("release",), ctx.actions.calls)
         self.assertNotIn(("release_all",), ctx.actions.calls)
+        self.assertTrue(any("released early after 6.0s" in msg for _level, msg in logs))
+        self.assertTrue(any("extra wait 1.00s" in msg for _level, msg in logs))
 
 
     def test_hold_state_returns_exact_press_and_hold_p(self):
@@ -109,8 +118,10 @@ class PxHoldEarlyReleaseTests(unittest.TestCase):
             ok = mod._perform_hold("page", ctx, {"x": 100, "y": 200}, 1, 1, "[#1][ruoyi]")
 
         self.assertTrue(ok)
-        self.assertEqual(["target-p-1"], seen_ids)
-        self.assertLess(clock.time(), 106.0)
+        self.assertTrue(seen_ids)
+        self.assertEqual("target-p-1", seen_ids[0])
+        self.assertTrue(all(v == "target-p-1" for v in seen_ids))
+        self.assertAlmostEqual(clock.time(), 106.0, delta=0.01)
 
 
     def test_perform_hold_refinds_hold_p_id_when_old_id_disappears(self):
@@ -137,7 +148,7 @@ class PxHoldEarlyReleaseTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(["old-p-1", "new-p-2"], seen_ids)
-        self.assertLess(clock.time(), 106.0)
+        self.assertAlmostEqual(clock.time(), 106.0, delta=0.01)
 
 
     def test_find_hold_context_preserves_iframe_box_fallback(self):
@@ -184,7 +195,7 @@ class PxHoldEarlyReleaseTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn(("state", frame_ctx, "frame-p-7"), seen)
-        self.assertLess(clock.time(), 106.0)
+        self.assertAlmostEqual(clock.time(), 106.0, delta=0.01)
 
 
 if __name__ == "__main__":

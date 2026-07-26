@@ -77,6 +77,25 @@ class PxI18nSelectorTests(unittest.TestCase):
         self.assertEqual("hold-label", (state or {}).get("id"))
         self.assertEqual("none", (state or {}).get("display"))
 
+    def test_find_hold_target_prefers_px_subtree_over_global_hold_button(self):
+        self.page.set_content(
+            """
+<!doctype html>
+<html>
+  <body>
+    <button id="global-btn" aria-label="Press and hold verification"
+            style="display:block;width:120px;height:36px;">Global</button>
+    <div id="px-captcha">
+      <button id="px-btn" aria-label="Press and hold verification"
+              style="display:block;width:320px;height:48px;">PX</button>
+    </div>
+  </body>
+</html>
+"""
+        )
+        target = mod._find_hold_target(self.ctx)
+        self.assertEqual("px-btn", (target or {}).get("id"))
+
 
 if __name__ == "__main__":
     unittest.main()

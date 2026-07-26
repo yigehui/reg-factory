@@ -479,6 +479,46 @@ def append_account_to_email_nograph(email, password):
         return False
 
 
+def _webui_task_store_enabled():
+    return bool(
+        os.environ.get("WEBUI_TASK_RUN_ID")
+        and os.environ.get("WEBUI_MYSQL_HOST")
+        and os.environ.get("WEBUI_MYSQL_USER")
+        and os.environ.get("WEBUI_MYSQL_DATABASE")
+    )
+
+
+def _record_webui_account(email, password, graph=None, status="ok"):
+    if not _webui_task_store_enabled() or not email:
+        return False
+    try:
+        import task_store as _task_store
+        _task_store.add_task_account(
+            run_id=os.environ.get("WEBUI_TASK_RUN_ID") or "",
+            email=email,
+            password=password or "",
+            client_id=(graph or {}).get("client_id") or "",
+            refresh_token=(graph or {}).get("refresh_token") or "",
+            generated_at=datetime.now().isoformat(),
+            register_ip="",
+            register_region="",
+            status=status,
+            source="runtime",
+        )
+        return True
+    except Exception as exc:
+        log(f"task_store account save failed: {type(exc).__name__}: {exc}", "WARN")
+        return False
+
+
+def _persist_success_account(email, password, graph, record):
+    fname = write_record(record)
+    globals()["_CURRENT_GRAPH_ACCOUNT"] = graph
+    append_to_emails_pool(email, password)
+    _record_webui_account(email, password, graph, "ok")
+    return fname
+
+
 def append_to_emails_pool(email, password):
     """把成功号桥接进 emails.txt 池，供账号注册侧 common/emails.next_email 消费。
     注册成功后立即用纯 HTTP OAuth 抽 Graph refresh_token（extract_graph_tokens.get_graph_token），
@@ -913,6 +953,7 @@ def main():
                 graph = extract_graph_for_account(email, password, idx=n, proxy_str=None)
                 if not graph or not graph.get("refresh_token"):
                     append_account_to_email_nograph(email, password)
+                    _record_webui_account(email, password, None, "no_graph")
                     succ += 1
                     log(
                         f"[#{n}] registered but graph RT missing via direct; "
@@ -922,7 +963,11 @@ def main():
                     log(f"OK(no_graph) in {elapsed:.1f}s: {email}", "OK")
                     time.sleep(args.sleep)
                     continue
-                fname = write_record({
+                fname = _persist_success_account(
+                    email=email,
+                    password=password,
+                    graph=graph,
+                    record={
                     "email": email,
                     "password": password,
                     "refresh_token": graph["refresh_token"],
@@ -931,9 +976,8 @@ def main():
                     "outlook_cookies": cookies,
                     "source": "self-loop",
                     "ts": datetime.now().isoformat(),
-                })
-                globals()["_CURRENT_GRAPH_ACCOUNT"] = graph
-                append_to_emails_pool(email, password)   # 桥接进账号注册池
+                },
+                )
                 succ += 1
                 log(f"OK in {elapsed:.1f}s: {email} -> {fname} (pool now {count_pool()})", "OK")
             else:

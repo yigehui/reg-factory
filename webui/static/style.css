@@ -4,6 +4,10 @@
   --mono:'Consolas','Menlo','Monaco',monospace;
 }
 *{box-sizing:border-box}
+*::-webkit-scrollbar{width:10px;height:10px}
+*::-webkit-scrollbar-track{background:#13171d}
+*::-webkit-scrollbar-thumb{background:#3a4250;border-radius:999px;border:2px solid #13171d}
+*::-webkit-scrollbar-thumb:hover{background:#556174}
 body{margin:0;background:var(--bg);color:var(--text);
   font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;font-size:14px}
 .topbar{display:flex;align-items:center;justify-content:space-between;
@@ -44,6 +48,10 @@ body{margin:0;background:var(--bg);color:var(--text);
 .field input[type=text],.field input[type=number],.field input[type=password],.field select{
   width:100%;max-width:520px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);
   border-radius:6px;color:var(--text);font-size:14px}
+.field textarea{
+  width:100%;max-width:520px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);
+  border-radius:6px;color:var(--text);font-size:14px;font-family:var(--mono);resize:vertical
+}
 .two-col-form{display:grid;grid-template-columns:repeat(2,minmax(260px,1fr));column-gap:18px;row-gap:0}
 .two-col-form .form-head,.two-col-form .form-actions,.two-col-form .cmd-line{grid-column:1 / -1}
 .two-col-form .field input[type=text],.two-col-form .field input[type=number],
@@ -139,3 +147,50 @@ body{margin:0;background:var(--bg);color:var(--text);
 .multi-badge{font-size:11px;padding:1px 7px;border-radius:4px;margin-left:4px}
 .multi-badge.ok{background:rgba(63,191,107,.18);color:var(--green);border:1px solid var(--green)}
 .multi-badge.no{background:rgba(154,163,178,.15);color:var(--dim);border:1px solid var(--line)}
+
+/* ---- 任务记录 / 账号管理 ---- */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:14px}
+.stat-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px}
+.stat-card .label{color:var(--dim);font-size:12px}
+.stat-card .value{font-size:24px;font-weight:700;margin-top:6px}
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin:16px 0}
+.chart-box{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:16px;min-height:220px}
+.chart-title{font-size:15px;font-weight:600;margin-bottom:12px}
+.mini-bars{display:flex;align-items:flex-end;gap:8px;min-height:180px;overflow-x:auto}
+.mini-bar{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:6px}
+.mini-bar .bar{width:100%;max-width:28px;background:var(--accent);border-radius:6px 6px 0 0;min-height:2px}
+.mini-bar .bar.green{background:var(--green)}
+.mini-bar .bar.dim{background:#6b7484}
+.mini-bar .top{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.mini-bar .bottom{font-size:10px;color:var(--dim);text-align:center;word-break:break-all}
+.table-wrap{overflow:auto}
+.data-table{width:100%;border-collapse:collapse;margin-top:12px}
+.data-table th,.data-table td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+.data-table th{color:var(--dim);font-size:12px}
+.data-table td{font-size:13px}
+.data-table button{margin:0;padding:4px 10px;font-size:12px}
+.table-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn-lite{background:var(--panel2);color:var(--text);border:1px solid var(--line);padding:4px 10px;border-radius:6px;cursor:pointer}
+.btn-lite:hover{border-color:var(--accent);color:var(--accent)}
+.detail-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin:12px 0}
+.detail-item{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+.detail-item .k{color:var(--dim);font-size:12px}
+.detail-item .v{font-family:var(--mono);margin-top:4px;word-break:break-all}
+.toolbar-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.toolbar-row input,.toolbar-row select{padding:8px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);font-size:13px}
+.pagination-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px}
+.pagination-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:1 1 480px;flex-wrap:wrap}
+.pagination-meta{color:var(--dim);font-size:12.5px}
+.pagination-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pagination-pages{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pagination-ellipsis{color:var(--dim);padding:0 4px}
+.pagination-actions .btn-lite.is-active{border-color:var(--accent);color:var(--accent);background:rgba(79,140,255,.12)}
+.pagination-size{display:flex;align-items:center;justify-content:flex-end}
+.pagination-size select{padding:8px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--text);font-size:13px}
+.modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:20px;z-index:99}
+.modal-card{width:min(820px,100%);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}
+.modal-card-sm{width:min(720px,100%)}
+.account-token-input{min-height:180px}
+
+.modal-card-log{width:min(1000px,100%)}
+.log-modal-body{height:420px;min-height:420px;max-height:420px;margin-top:12px}

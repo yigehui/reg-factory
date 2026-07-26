@@ -7,3 +7,4 @@ Appium-Python-Client>=4.0.0
 selenium>=4.0.0
 fastapi
 uvicorn[standard]
+PyMySQL

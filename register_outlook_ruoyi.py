@@ -144,7 +144,7 @@ SIGNUP_ENTRY_TIMEOUT = 20
 
 SUBMIT_RESULT_TIMEOUT = 15
 
-PROXY_PRECHECK_TIMEOUT = 10
+PROXY_PRECHECK_TIMEOUT = 30
 
 PROXY_PRECHECK_URL = SIGNUP_URL
 
@@ -1846,6 +1846,74 @@ def append_account_to_email_nograph(email, password):
         return False
 
 
+
+
+
+def _webui_task_store_enabled():
+
+    return bool(
+
+        os.environ.get("WEBUI_TASK_RUN_ID")
+
+        and os.environ.get("WEBUI_MYSQL_HOST")
+
+        and os.environ.get("WEBUI_MYSQL_USER")
+
+        and os.environ.get("WEBUI_MYSQL_DATABASE")
+
+    )
+
+
+
+def _record_webui_account(email, password, graph=None, status="ok"):
+
+    if not _webui_task_store_enabled() or not email:
+
+        return False
+
+    try:
+
+        import task_store as _task_store
+
+        _task_store.add_task_account(
+
+            run_id=os.environ.get("WEBUI_TASK_RUN_ID") or "",
+
+            email=email,
+
+            password=password or "",
+
+            client_id=(graph or {}).get("client_id") or "",
+
+            refresh_token=(graph or {}).get("refresh_token") or "",
+
+            generated_at=datetime.now().isoformat(),
+
+            register_ip="",
+
+            register_region="",
+
+            status=status,
+
+            source="runtime",
+
+        )
+
+        return True
+
+    except Exception as exc:
+
+        log(f"task_store account save failed: {type(exc).__name__}: {exc}", "WARN")
+
+        return False
+
+
+
+def _save_no_graph_result(email, password):
+
+    append_account_to_email_nograph(email, password)
+
+    _record_webui_account(email, password, None, "no_graph")
 
 
 
@@ -7017,51 +7085,61 @@ return (() => {
       holdLabelId: labelEl && labelEl.id ? labelEl.id : ''
     };
   };
-  const candidates = [];
-  const seen = new Set();
-  const addCandidate = (el, quality, source, labelEl = null) => {
-    if (!el || seen.has(el) || !visible(el) || !buttonish(el)) return;
-    seen.add(el);
-    candidates.push(pack(el, quality, source, labelEl));
+  const collectCandidates = (root) => {
+    const candidates = [];
+    const seen = new Set();
+    const addCandidate = (el, quality, source, labelEl = null) => {
+      if (!el || seen.has(el) || !visible(el) || !buttonish(el)) return;
+      seen.add(el);
+      candidates.push(pack(el, quality, source, labelEl));
+    };
+
+    if (root && root.id === 'px-captcha' && visible(root) && buttonish(root)) {
+      addCandidate(root, 0, '#px-captcha');
+    }
+
+    for (const el of root.querySelectorAll('[role="button"][aria-label], button[aria-label], a[role="button"][aria-label], input[aria-label]')) {
+      const aria = norm(el.getAttribute('aria-label'));
+      if (!aria) continue;
+      const hasHold = matchesAny(aria, HOLD_PATTERNS);
+      const hasChallenge = matchesAny(aria, CHALLENGE_PATTERNS);
+      if (hasHold && hasChallenge) addCandidate(el, 1, 'aria-label:hold+challenge');
+      else if (hasHold) addCandidate(el, 2, 'aria-label:hold');
+    }
+
+    for (const node of root.querySelectorAll('p, span, div')) {
+      if (!visible(node)) continue;
+      const txt = norm(node.innerText || node.textContent || '');
+      if (!txt || txt.length > SHORT_LABEL_MAX || !matchesAny(txt, HOLD_PATTERNS)) continue;
+      let cur = node;
+      while (cur && cur !== document.body && cur !== document.documentElement) {
+        if (buttonish(cur) && visible(cur)) {
+          addCandidate(cur, 3, 'label->ancestor-button', node);
+          break;
+        }
+        cur = cur.parentElement;
+      }
+    }
+
+    for (const el of root.querySelectorAll('[role="button"], button, a[role="button"], input[type="button"], input[type="submit"]')) {
+      if (matchesAny(textOf(el), HOLD_PATTERNS)) addCandidate(el, 5, 'button-text-hold');
+    }
+
+    if (!candidates.length) return null;
+    candidates.sort((a, b) =>
+      (a.quality - b.quality) ||
+      ((a.width * a.height) - (b.width * b.height)) ||
+      ((b.ariaLabel || '').length - (a.ariaLabel || '').length)
+    );
+    return candidates[0];
   };
 
   const px = document.querySelector('#px-captcha');
-  if (px && visible(px) && buttonish(px)) addCandidate(px, 0, '#px-captcha');
-
-  for (const el of document.querySelectorAll('[role="button"][aria-label], button[aria-label], a[role="button"][aria-label], input[aria-label]')) {
-    const aria = norm(el.getAttribute('aria-label'));
-    if (!aria) continue;
-    const hasHold = matchesAny(aria, HOLD_PATTERNS);
-    const hasChallenge = matchesAny(aria, CHALLENGE_PATTERNS);
-    if (hasHold && hasChallenge) addCandidate(el, 1, 'aria-label:hold+challenge');
-    else if (hasHold) addCandidate(el, 2, 'aria-label:hold');
+  if (px) {
+    const scoped = collectCandidates(px);
+    if (scoped) return scoped;
   }
-
-  for (const node of document.querySelectorAll('p, span, div')) {
-    if (!visible(node)) continue;
-    const txt = norm(node.innerText || node.textContent || '');
-    if (!txt || txt.length > SHORT_LABEL_MAX || !matchesAny(txt, HOLD_PATTERNS)) continue;
-    let cur = node;
-    while (cur && cur !== document.body && cur !== document.documentElement) {
-      if (buttonish(cur) && visible(cur)) {
-        addCandidate(cur, 3, 'label->ancestor-button', node);
-        break;
-      }
-      cur = cur.parentElement;
-    }
-  }
-
-  for (const el of document.querySelectorAll('[role="button"], button, a[role="button"], input[type="button"], input[type="submit"]')) {
-    if (matchesAny(textOf(el), HOLD_PATTERNS)) addCandidate(el, 5, 'button-text-hold');
-  }
-
-  if (!candidates.length) return null;
-  candidates.sort((a, b) =>
-    (a.quality - b.quality) ||
-    ((a.width * a.height) - (b.width * b.height)) ||
-    ((b.ariaLabel || '').length - (a.ariaLabel || '').length)
-  );
-  return candidates[0];
+  return collectCandidates(document);
 })()
 """ % (json.dumps(hold_patterns, ensure_ascii=True), json.dumps(challenge_patterns, ensure_ascii=True)))
     try:
@@ -7813,6 +7891,8 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
     release_state = None
 
+    extra_release_wait = 0.0
+
     try:
 
         actions.move_to({"x": cx, "y": cy}, duration=random.randint(250, 550)).hold().perform()
@@ -7859,6 +7939,10 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
                 if release_state and str(release_state.get("display") or "").strip().lower() == "none":
 
+                    extra_release_wait = random.uniform(0.5, 1.5)
+
+                    time.sleep(extra_release_wait)
+
                     break
 
                 next_check += PX_HOLD_EARLY_RELEASE_INTERVAL
@@ -7879,9 +7963,11 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
             label_text = str(release_state.get("text") or "").strip()
 
-            extra = f" id={label_id}" if label_id else ""
+            extra = ""
 
-            extra += " display=none"
+            if extra_release_wait > 0:
+
+                extra += f" extra wait {extra_release_wait:.2f}s"
 
             if label_text:
 
@@ -8743,7 +8829,7 @@ def register_outlook(opts, proxy_pool, idx):
 
             ):
 
-                log(f"  {tag} captcha passed, left signup -> {current_url[:70]}")
+                log(f"  {tag} Microsoft Loading page, keep waiting for redirect")
 
                 break
 
@@ -9457,6 +9543,8 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
     append_graph_account_to_emails_pool(email, password, graph)
 
+    _record_webui_account(email, password, graph, "ok")
+
 
 
 
@@ -9568,7 +9656,7 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
         async with save_lock:
 
-            await asyncio.to_thread(append_account_to_email_nograph, email, password)
+            await asyncio.to_thread(_save_no_graph_result, email, password)
 
         total_elapsed = time.perf_counter() - started
 

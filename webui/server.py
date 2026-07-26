@@ -10,6 +10,7 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 启动：  python -m uvicorn webui.server:app --port 8799   (或用 start.bat)
 """
 import asyncio
+from datetime import datetime
 import inspect
 import json
 import os
@@ -19,9 +20,10 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # 项目根 = webui 的上一级
@@ -30,10 +32,12 @@ WEBUI = os.path.join(ROOT, "webui")
 ENV_PATH = os.path.join(ROOT, ".env")
 ENV_EXAMPLE = os.path.join(ROOT, ".env.example")
 SCRIPT_CONFIG_PATH = os.path.join(ROOT, "webui_script_configs.json")
+TASK_LOG_ROOT = os.path.join(ROOT, "exports", "logs", "tasks")
 
 sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
 import scripts as schema  # noqa: E402
+import task_store  # noqa: E402
 from process_utils import child_creationflags, stop_process_gracefully  # noqa: E402
 
 
@@ -55,7 +59,6 @@ app = FastAPI(title="reg-factory WebUI")
 
 # 运行中的任务：run_id -> {proc, lines:[], done:bool, script, cmd, started}
 RUNS = {}
-_run_seq = [0]
 
 # 接码助手：内存记录当前租用的 sms-man 号  pkey -> {phone, rented_at, codes:[], service}
 SMS_RENTS = {}
@@ -64,10 +67,79 @@ SMS_RENT_TTL = 1200  # 20 分钟租期(秒)
 
 def _append_run_line(rec, line):
     rec["lines"].append(str(line))
+    log_file = rec.get("log_file")
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(str(line) + "\n")
+        except Exception:
+            pass
     if len(rec["lines"]) > 5000:
         dropped = len(rec["lines"]) - 4000
         rec["lines"] = rec["lines"][-4000:]
         rec["line_offset"] = int(rec.get("line_offset") or 0) + dropped
+
+
+def _active_run():
+    for run_id, rec in RUNS.items():
+        if not rec.get("done"):
+            return run_id, rec
+    return None, None
+
+
+def _task_log_path(run_id, now_ts=None):
+    stamp = datetime.fromtimestamp(now_ts or time.time())
+    return os.path.join(TASK_LOG_ROOT, stamp.strftime("%Y-%m-%d"), f"{run_id}.txt")
+
+
+def _build_run_id():
+    return f"r{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+
+def _task_store_ready():
+    return bool(getattr(task_store, "is_configured", lambda: False)())
+
+
+def _maybe_create_task_run(run_id, script, args, log_file, started_at):
+    if not _task_store_ready():
+        return None
+    return task_store.create_task_run(
+        run_id=run_id,
+        script_id=script["id"],
+        script_title=script.get("title") or script["id"],
+        args=args,
+        log_file_path=log_file,
+        started_at=datetime.fromtimestamp(started_at),
+    )
+
+
+def _maybe_finish_task_run(rec, counts):
+    if not rec.get("store_task_row"):
+        return
+    success_count = int((counts or {}).get("success") or 0)
+    no_graph_count = int((counts or {}).get("no_graph") or 0)
+    if success_count <= 0 and no_graph_count <= 0:
+        task_store.delete_task_run(rec["store_task_row"])
+        return
+    task_store.finish_task_run(
+        run_id=rec["run_id"],
+        status=rec.get("status") or "fail",
+        ended_at=datetime.fromtimestamp(rec.get("ended_ts") or time.time()),
+        duration_seconds=rec.get("duration_seconds"),
+        success_count=success_count,
+        fail_count=(counts or {}).get("fail") or 0,
+        no_graph_count=no_graph_count,
+        total_count=(counts or {}).get("total") or 0,
+        avg_success_duration_seconds=(counts or {}).get("avg_success_elapsed") or 0,
+    )
+
+
+def _read_task_log_text(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 async def _stop_asyncio_process_gracefully(proc, timeout=15):
@@ -198,12 +270,13 @@ def _read_config_val(key, default=""):
     if val:
         return val
     try:
-        for line in open(ENV_PATH, encoding="utf-8"):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                if k.strip() == key:
-                    return v.strip().strip('"').strip("'") or default
+        with open(ENV_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'") or default
     except Exception:
         pass
     return default
@@ -225,12 +298,13 @@ def _parse_env_file(path):
     out = {}
     if not os.path.isfile(path):
         return out
-    for line in open(path, encoding="utf-8"):
-        s = line.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, _, v = s.partition("=")
-        out[k.strip()] = v.strip().strip('"').strip("'")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
     return out
 
 
@@ -565,11 +639,81 @@ def _parse_mail_line(line):
 def _existing_emails():
     emails = set()
     if os.path.isfile(EMAILS_FILE):
-        for line in open(EMAILS_FILE, encoding="utf-8"):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                emails.add(line.split("----")[0].strip().lower())
+        with open(EMAILS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    emails.add(line.split("----")[0].strip().lower())
     return emails
+
+
+def _maybe_import_accounts_to_store(parsed_rows):
+    if not parsed_rows or not _task_store_ready():
+        return 0, ""
+    rows = []
+    now = datetime.now().isoformat()
+    for parsed in parsed_rows:
+        rows.append(
+            {
+                "email": parsed[0],
+                "password": parsed[1] if len(parsed) >= 2 else "",
+                "refresh_token": parsed[2] if len(parsed) >= 3 else "",
+                "client_id": parsed[3] if len(parsed) >= 4 else "",
+                "generated_at": now,
+                "register_ip": "",
+                "register_region": "",
+            }
+        )
+    try:
+        saved = task_store.import_accounts(rows)
+        return int(saved or 0), ""
+    except Exception as exc:
+        return 0, str(exc)
+
+
+def _import_accounts_text(text):
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    existing = _existing_emails()
+    added, skipped, bad = 0, 0, 0
+    bad_samples = []
+    seen = set(existing)
+    out_lines = []
+    parsed_rows = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        parsed = _parse_mail_line(ln)
+        if not parsed:
+            bad += 1
+            if len(bad_samples) < 5:
+                bad_samples.append(ln.strip()[:60])
+            continue
+        email = parsed[0].lower()
+        if email in seen:
+            skipped += 1
+            continue
+        seen.add(email)
+        parsed_rows.append(parsed)
+        out_lines.append("----".join(parsed))
+        added += 1
+    if out_lines:
+        need_nl = os.path.isfile(EMAILS_FILE) and os.path.getsize(EMAILS_FILE) > 0
+        with open(EMAILS_FILE, "a", encoding="utf-8") as f:
+            if need_nl:
+                f.write("\n")
+            f.write("\n".join(out_lines) + "\n")
+    total = len(_existing_emails())
+    db_saved, db_error = _maybe_import_accounts_to_store(parsed_rows)
+    return {
+        "ok": True,
+        "added": added,
+        "skipped": skipped,
+        "bad": bad,
+        "bad_samples": bad_samples,
+        "total": total,
+        "db_saved": db_saved,
+        "db_error": db_error,
+    }
 
 
 @app.get("/api/mailpool")
@@ -587,38 +731,192 @@ def api_mailpool_get():
 async def api_mailpool_import(request: Request):
     data = await request.json()
     text = (data or {}).get("text") or ""
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    existing = _existing_emails()
-    added, skipped, bad = 0, 0, 0
-    bad_samples = []
-    seen = set(existing)
-    out_lines = []
-    for ln in lines:
-        if not ln.strip():
-            continue
-        parsed = _parse_mail_line(ln)
-        if not parsed:
-            bad += 1
-            if len(bad_samples) < 5:
-                bad_samples.append(ln.strip()[:60])
-            continue
-        email = parsed[0].lower()
-        if email in seen:
-            skipped += 1
-            continue
-        seen.add(email)
-        out_lines.append("----".join(parsed))
-        added += 1
-    if out_lines:
-        # 追加(确保前面有换行)
-        need_nl = os.path.isfile(EMAILS_FILE) and os.path.getsize(EMAILS_FILE) > 0
-        with open(EMAILS_FILE, "a", encoding="utf-8") as f:
-            if need_nl:
-                f.write("\n")
-            f.write("\n".join(out_lines) + "\n")
-    total = len(_existing_emails())
-    return {"ok": True, "added": added, "skipped": skipped, "bad": bad,
-            "bad_samples": bad_samples, "total": total}
+    return _import_accounts_text(text)
+
+
+def _account_to_txt_line(item):
+    return "----".join(
+        [
+            str(item.get("email") or "").strip(),
+            str(item.get("password") or "").strip(),
+            str(item.get("refresh_token") or "").strip(),
+            str(item.get("client_id") or "").strip(),
+        ]
+    ).rstrip("-")
+
+
+def _account_page_items(result):
+    if isinstance(result, dict):
+        return result.get("items") or []
+    return result or []
+
+
+@app.get("/api/task-runs")
+def api_task_runs(page: int = 1, page_size: int = 20):
+    try:
+        data = task_store.list_task_runs(page=page, page_size=page_size)
+        if not isinstance(data, dict):
+            rows = data or []
+            data = {"items": rows, "total": len(rows), "page": page, "page_size": page_size}
+        data["enabled"] = True
+        return data
+    except Exception as exc:
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "enabled": False, "error": str(exc)}
+
+
+@app.get("/api/task-runs/{task_id}")
+def api_task_run_get(task_id: int):
+    try:
+        item = task_store.get_task_run(task_id)
+        if not item:
+            return JSONResponse({"error": "无此任务"}, status_code=404)
+        return item
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/api/task-runs/{task_id}/accounts")
+def api_task_run_accounts(task_id: int, page: int = 1, page_size: int = 20):
+    try:
+        item = task_store.get_task_run(task_id)
+        if not item:
+            return JSONResponse({"error": "无此任务"}, status_code=404)
+        data = task_store.list_accounts(task_run_id=task_id, page=page, page_size=page_size)
+        if not isinstance(data, dict):
+            rows = data or []
+            data = {"items": rows, "total": len(rows), "page": page, "page_size": page_size}
+        data["enabled"] = True
+        return data
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/api/task-runs/{task_id}/log")
+def api_task_run_log(task_id: int):
+    try:
+        item = task_store.get_task_run(task_id)
+        if not item:
+            return JSONResponse({"error": "无此任务"}, status_code=404)
+        return PlainTextResponse(_read_task_log_text(item.get("log_file_path") or ""), media_type="text/plain; charset=utf-8")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.delete("/api/task-runs/{task_id}")
+def api_task_run_delete(task_id: int):
+    try:
+        item = task_store.get_task_run(task_id)
+        if not item:
+            return JSONResponse({"error": "无此任务"}, status_code=404)
+        run_id = str(item.get("run_id") or "").strip()
+        rec = RUNS.get(run_id) if run_id else None
+        if rec and not rec.get("done"):
+            return JSONResponse({"error": "任务仍在运行，请先停止"}, status_code=409)
+        ok = bool(task_store.delete_task_run(task_id))
+        log_file = str(item.get("log_file_path") or "").strip()
+        if log_file and os.path.isfile(log_file):
+            try:
+                os.remove(log_file)
+            except Exception:
+                pass
+        return {"ok": ok}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/api/accounts")
+def api_accounts(
+    page: int = 1,
+    page_size: int = 20,
+    task_run_id: int | None = None,
+    email: str = "",
+    status: str = "",
+    sort_by: str = "created_at",
+    sort_dir: str = "desc",
+):
+    try:
+        data = task_store.list_accounts(
+            page=page,
+            page_size=page_size,
+            task_run_id=task_run_id,
+            email=email,
+            status=status,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+        if not isinstance(data, dict):
+            data = {"items": data or [], "total": len(data or []), "page": page, "page_size": page_size}
+        data["enabled"] = True
+        return data
+    except Exception as exc:
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "enabled": False, "error": str(exc)}
+
+
+@app.put("/api/accounts/{account_id}")
+async def api_accounts_update(account_id: int, request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    fields = {
+        "email": (data or {}).get("email", ""),
+        "password": (data or {}).get("password", ""),
+        "client_id": (data or {}).get("client_id", ""),
+        "refresh_token": (data or {}).get("refresh_token", ""),
+    }
+    try:
+        item = task_store.update_account(account_id, fields)
+        if not item:
+            return JSONResponse({"error": "无此账号"}, status_code=404)
+        return {"ok": True, "item": item}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.post("/api/accounts/import")
+async def api_accounts_import(request: Request):
+    data = await request.json()
+    text = (data or {}).get("text") or ""
+    return _import_accounts_text(text)
+
+
+@app.get("/api/accounts/export")
+def api_accounts_export(task_run_id: int | None = None, limit: int = 2000, email: str = "", status: str = "", ids: str = ""):
+    picked_ids = [int(x) for x in ids.split(",") if x.strip().isdigit()] if ids else None
+    try:
+        rows = _account_page_items(task_store.list_accounts(
+            limit=limit,
+            task_run_id=task_run_id,
+            email=email,
+            status=status,
+            ids=picked_ids,
+        ))
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    text = "\n".join(_account_to_txt_line(row) for row in rows if row.get("email"))
+    if text:
+        text += "\n"
+    return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+
+
+@app.get("/api/stats/overview")
+def api_stats_overview(days: int = 7):
+    try:
+        return task_store.get_overview(days=days)
+    except Exception as exc:
+        return {
+            "cards": {
+                "total_tasks": 0,
+                "running_tasks": 0,
+                "total_success_accounts": 0,
+                "avg_task_duration_seconds": 0,
+                "avg_success_duration_seconds": 0,
+            },
+            "task_trend": [],
+            "success_trend": [],
+            "top_regions": [],
+            "error": str(exc),
+        }
 
 
 # ============================================================ sms-man 接码助手
@@ -857,17 +1155,43 @@ async def api_run(request: Request):
     script = schema.script_by_id(sid)
     if not script:
         return JSONResponse({"error": f"未知脚本: {sid}"}, status_code=400)
+    active_run_id, _ = _active_run()
+    if active_run_id:
+        return JSONResponse({"error": f"已有运行中任务: {active_run_id}"}, status_code=409)
+    run_id = _build_run_id()
+    started_ts = time.time()
+    log_file = _task_log_path(run_id, started_ts)
     cmd = _build_cmd(script, args)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=ROOT, env=_child_env(sid),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        creationflags=child_creationflags(),
-    )
-    _run_seq[0] += 1
-    run_id = f"r{_run_seq[0]}"
+    env = _child_env(sid)
+    env["WEBUI_TASK_RUN_ID"] = run_id
+    store_task_row = None
+    store_error = ""
+    try:
+        store_task_row = _maybe_create_task_run(run_id, script, args, log_file, started_ts)
+    except Exception as exc:
+        store_error = str(exc)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=ROOT, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            creationflags=child_creationflags(),
+        )
+    except Exception as exc:
+        if store_task_row:
+            try:
+                task_store.delete_task_run(store_task_row)
+            except Exception:
+                pass
+        return JSONResponse({"error": f"启动失败: {exc}"}, status_code=500)
     rec = {"proc": proc, "lines": [], "line_offset": 0, "done": False, "script": sid,
-           "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S")}
+           "cmd": " ".join(cmd), "started": time.strftime("%H:%M:%S", time.localtime(started_ts)),
+           "started_ts": started_ts, "run_id": run_id, "log_file": log_file,
+           "store_task_row": store_task_row, "stop_requested": False}
     RUNS[run_id] = rec
+    _append_run_line(rec, f"[webui] run_id={run_id}")
+    _append_run_line(rec, f"[webui] log_file={log_file}")
+    if store_error:
+        _append_run_line(rec, f"[webui] task_store unavailable: {store_error}")
 
     async def _pump():
         try:
@@ -878,12 +1202,19 @@ async def api_run(request: Request):
         finally:
             await proc.wait()
             rec["done"] = True
+            rec["ended_ts"] = time.time()
+            rec["duration_seconds"] = max(0.0, rec["ended_ts"] - rec["started_ts"])
             counts = _extract_run_counts(rec["lines"])
             if counts:
                 _append_run_line(rec, _format_webui_run_summary(counts))
             elif proc.returncode == 0:
                 # 子脚本未输出可解析汇总时，仍给出一条兜底提示。
                 _append_run_line(rec, "[webui] 未解析到 success/fail 汇总")
+            rec["status"] = "stopped" if rec.get("stop_requested") else ("success" if proc.returncode == 0 else "fail")
+            try:
+                _maybe_finish_task_run(rec, counts or {})
+            except Exception as exc:
+                _append_run_line(rec, f"[webui] task_store finish failed: {exc}")
             _append_run_line(rec, f"[webui] 任务结束 exit={proc.returncode}")
 
     asyncio.create_task(_pump())
@@ -923,12 +1254,14 @@ async def api_stop(run_id: str):
     if not rec:
         return JSONResponse({"error": "任务不存在"}, status_code=404)
     if not rec["done"]:
+        rec["stop_requested"] = True
         try:
-            stopped = stop_process_gracefully(rec["proc"])
-            if inspect.isawaitable(stopped):
-                await stopped
-            elif hasattr(rec["proc"], "wait") and not hasattr(rec["proc"], "poll"):
+            if hasattr(rec["proc"], "wait") and not hasattr(rec["proc"], "poll"):
                 await _stop_asyncio_process_gracefully(rec["proc"])
+            else:
+                stopped = stop_process_gracefully(rec["proc"])
+                if inspect.isawaitable(stopped):
+                    await stopped
         except Exception:
             pass
     return {"ok": True}

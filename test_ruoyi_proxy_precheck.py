@@ -8,7 +8,7 @@ import register_outlook_ruoyi as mod
 
 
 class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
-    def test_proxy_precheck_uses_10_second_default_timeout(self):
+    def test_proxy_precheck_uses_20_second_default_timeout(self):
         session = Mock()
         session.get.return_value = SimpleNamespace(status_code=200)
 
@@ -19,7 +19,7 @@ class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
             ok = mod._probe_proxy_before_browser(["127.0.0.1:1080"], "[#1][ruoyi]")
 
         self.assertTrue(ok)
-        self.assertEqual(session.get.call_args.kwargs["timeout"], 10.0)
+        self.assertEqual(session.get.call_args.kwargs["timeout"], 20.0)
 
     async def test_run_one_direct_skips_browser_when_proxy_precheck_fails(self):
         args = SimpleNamespace(live_file="emails.txt", token_file="tokens.json")

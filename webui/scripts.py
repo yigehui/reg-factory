@@ -365,6 +365,7 @@ SCRIPTS = [
 ]
 
 
+
 def script_by_id(sid):
     for s in SCRIPTS:
         if s["id"] == sid:
@@ -433,6 +434,14 @@ ENV_SCHEMA = [
         {"key": "OUTLOOK_AIMILI_POOL_URL", "default": "", "help": "AimiliVPN URL：管理端根地址或 /api/pool/proxies(/random) 完整地址"},
         {"key": "OUTLOOK_AIMILI_POOL_TOKEN", "secret": True, "help": "AimiliVPN 代理池 API Token"},
 
+    ]},
+    {"group": "任务记录 MySQL", "items": [
+        {"key": "WEBUI_MYSQL_HOST", "help": "任务记录/账号管理 MySQL 主机"},
+        {"key": "WEBUI_MYSQL_PORT", "default": "3306", "help": "MySQL 端口"},
+        {"key": "WEBUI_MYSQL_USER", "help": "MySQL 用户名"},
+        {"key": "WEBUI_MYSQL_PASSWORD", "secret": True, "help": "MySQL 密码"},
+        {"key": "WEBUI_MYSQL_DATABASE", "help": "MySQL 数据库名"},
+        {"key": "WEBUI_MYSQL_CHARSET", "default": "utf8mb4", "help": "字符集"},
     ]},
     {"group": "SUB2API(Codex 导入)", "items": [
         {"key": "SUB2API_URL", "help": "SUB2API 管理接口地址(用 --codex 时必填)"},
