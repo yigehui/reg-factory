@@ -177,6 +177,7 @@ POST_PRESS_LOADING_CHECK = 8
 # Max time to stay in one captcha wait state (reappear/validating/unclear).
 
 CAPTCHA_STATE_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_CAPTCHA_STATE_TIMEOUT", "20") or "20")
+MICROSOFT_LOADING_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_MICROSOFT_LOADING_TIMEOUT", "30") or "30")
 
 BIRTHDAY_ENTRY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_ENTRY_TIMEOUT", "2.5") or "2.5")
 
@@ -8938,7 +8939,7 @@ def register_outlook(opts, proxy_pool, idx):
                 microsoft_loading_wait_started,
                 loading=loading_page,
                 now=loop_now,
-                timeout=CAPTCHA_STATE_TIMEOUT,
+                timeout=MICROSOFT_LOADING_TIMEOUT,
             )
 
             submit_wait_started, _ = _update_submit_wait_state(

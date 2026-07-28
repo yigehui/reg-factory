@@ -23,6 +23,9 @@ class WaitStateTimeoutTests(unittest.TestCase):
 
 
 class MicrosoftLoadingGuardTests(unittest.TestCase):
+    def test_microsoft_loading_timeout_defaults_to_30_seconds(self):
+        self.assertEqual(30.0, mod.MICROSOFT_LOADING_TIMEOUT)
+
     def test_loading_pauses_max_press_deadline_and_starts_loading_timer(self):
         press_wait, loading_wait, timed_out = mod._update_loading_wait_state(
             100.0,
