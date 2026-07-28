@@ -62,7 +62,7 @@ import urllib.parse
 
 import urllib.request
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from types import SimpleNamespace
 
@@ -978,6 +978,7 @@ def _normalize_px_metrics(idx, metrics=None):
         "reg_elapsed": float(data.get("reg_elapsed") or 0.0),
         "register_ip": str(data.get("register_ip") or "").strip(),
         "register_region": str(data.get("register_region") or "").strip(),
+        "generated_at": str(data.get("generated_at") or "").strip(),
 
     }
 
@@ -986,6 +987,14 @@ def _normalize_px_metrics(idx, metrics=None):
 
 
 set_log_level(os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"))
+
+
+_BEIJING_TZ = timezone(timedelta(hours=8), name="UTC+08:00")
+
+
+def _beijing_now_iso():
+
+    return datetime.now(_BEIJING_TZ).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def _set_current_ip_info(tag, ip="", region=""):
@@ -1891,7 +1900,7 @@ def _webui_task_store_enabled():
 
 
 
-def _record_webui_account(email, password, graph=None, status="ok", register_ip="", register_region=""):
+def _record_webui_account(email, password, graph=None, status="ok", register_ip="", register_region="", generated_at=""):
 
     if not _webui_task_store_enabled() or not email:
 
@@ -1913,7 +1922,7 @@ def _record_webui_account(email, password, graph=None, status="ok", register_ip=
 
             refresh_token=(graph or {}).get("refresh_token") or "",
 
-            generated_at=datetime.now().isoformat(),
+            generated_at=generated_at or "",
 
             register_ip=register_ip or "",
 
@@ -1935,7 +1944,7 @@ def _record_webui_account(email, password, graph=None, status="ok", register_ip=
 
 
 
-def _save_no_graph_result(email, password, register_ip="", register_region=""):
+def _save_no_graph_result(email, password, register_ip="", register_region="", generated_at=""):
 
     append_account_to_email_nograph(email, password)
 
@@ -1946,6 +1955,7 @@ def _save_no_graph_result(email, password, register_ip="", register_region=""):
         "no_graph",
         register_ip=register_ip,
         register_region=register_region,
+        generated_at=generated_at,
     )
 
 
@@ -8507,6 +8517,7 @@ def register_outlook(opts, proxy_pool, idx):
             "reg_elapsed": max(0.0, time.perf_counter() - register_started),
             "register_ip": register_ip,
             "register_region": register_region,
+            "generated_at": _beijing_now_iso(),
 
         }
 
@@ -9534,7 +9545,7 @@ def register_outlook(opts, proxy_pool, idx):
 
 
 
-def _save_direct_result(email, password, graph, live_file, token_file, register_ip="", register_region=""):
+def _save_direct_result(email, password, graph, live_file, token_file, register_ip="", register_region="", generated_at=""):
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -9591,6 +9602,7 @@ def _save_direct_result(email, password, graph, live_file, token_file, register_
         "ok",
         register_ip=register_ip,
         register_region=register_region,
+        generated_at=generated_at,
     )
 
 
@@ -9710,6 +9722,7 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
                 password,
                 px_metrics.get("register_ip") or "",
                 px_metrics.get("register_region") or "",
+                px_metrics.get("generated_at") or "",
             )
 
         total_elapsed = time.perf_counter() - started
@@ -9735,6 +9748,7 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
             args.token_file,
             px_metrics.get("register_ip") or "",
             px_metrics.get("register_region") or "",
+            px_metrics.get("generated_at") or "",
         )
 
     total_elapsed = time.perf_counter() - started

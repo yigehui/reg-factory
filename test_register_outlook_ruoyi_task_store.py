@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from unittest.mock import mock_open
 from unittest.mock import patch
@@ -8,6 +9,18 @@ import task_store
 
 
 class RegisterOutlookRuoyiTaskStoreTests(unittest.TestCase):
+    def test_beijing_now_iso_uses_utc_plus_8(self):
+        class _FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                base = datetime(2026, 7, 28, 2, 16, 59, tzinfo=timezone.utc)
+                if tz is None:
+                    return base.replace(tzinfo=None)
+                return base.astimezone(tz)
+
+        with patch.object(ruoyi, "datetime", _FixedDateTime):
+            self.assertEqual("2026-07-28T10:16:59", ruoyi._beijing_now_iso())
+
     def test_save_direct_result_records_webui_account(self):
         graph = {"refresh_token": "rt-1", "client_id": "cid-1"}
 
@@ -27,6 +40,7 @@ class RegisterOutlookRuoyiTaskStoreTests(unittest.TestCase):
                 "",
                 register_ip="1.2.3.4",
                 register_region="Japan",
+                generated_at="2026-07-28T02:16:59",
             )
 
         append_pool.assert_called_once_with("a@outlook.com", "Pass123!", graph)
@@ -37,6 +51,7 @@ class RegisterOutlookRuoyiTaskStoreTests(unittest.TestCase):
             "ok",
             register_ip="1.2.3.4",
             register_region="Japan",
+            generated_at="2026-07-28T02:16:59",
         )
 
     def test_save_no_graph_result_records_webui_account(self):
@@ -49,6 +64,7 @@ class RegisterOutlookRuoyiTaskStoreTests(unittest.TestCase):
                 "Pass123!",
                 register_ip="1.2.3.4",
                 register_region="Japan",
+                generated_at="2026-07-28T02:16:59",
             )
 
         append_nograph.assert_called_once_with("a@outlook.com", "Pass123!")
@@ -59,6 +75,7 @@ class RegisterOutlookRuoyiTaskStoreTests(unittest.TestCase):
             "no_graph",
             register_ip="1.2.3.4",
             register_region="Japan",
+            generated_at="2026-07-28T02:16:59",
         )
 
     def test_record_webui_account_saves_register_ip_and_region(self):
@@ -87,10 +104,12 @@ class RegisterOutlookRuoyiTaskStoreTests(unittest.TestCase):
                 "ok",
                 register_ip="1.2.3.4",
                 register_region="Japan",
+                generated_at="2026-07-28T02:16:59",
             )
 
         self.assertEqual("1.2.3.4", captured["register_ip"])
         self.assertEqual("Japan", captured["register_region"])
+        self.assertEqual("2026-07-28T02:16:59", captured["generated_at"])
 
 
 if __name__ == "__main__":
