@@ -831,7 +831,7 @@ def api_accounts(
     task_run_id: int | None = None,
     email: str = "",
     status: str = "",
-    sort_by: str = "created_at",
+    sort_by: str = "generated_at",
     sort_dir: str = "desc",
 ):
     try:

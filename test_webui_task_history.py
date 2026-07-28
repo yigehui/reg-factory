@@ -135,7 +135,7 @@ class WebuiTaskHistoryTests(unittest.TestCase):
                 "total": 41,
                 "page": 3,
                 "page_size": 20,
-                "sort_by": "created_at",
+                "sort_by": "generated_at",
                 "sort_dir": "desc",
             }
         )
@@ -228,7 +228,7 @@ class WebuiTaskHistoryTests(unittest.TestCase):
                 "total": 41,
                 "page": 2,
                 "page_size": 50,
-                "sort_by": "created_at",
+                "sort_by": "generated_at",
                 "sort_dir": "asc",
             }
         )
@@ -249,6 +249,7 @@ class WebuiTaskHistoryTests(unittest.TestCase):
         self.assertEqual("no_graph", store.last_list_kwargs["status"])
         self.assertEqual(2, store.last_list_kwargs["page"])
         self.assertEqual(50, store.last_list_kwargs["page_size"])
+        self.assertEqual("generated_at", store.last_list_kwargs["sort_by"])
         self.assertEqual("asc", store.last_list_kwargs["sort_dir"])
 
     def test_accounts_update_endpoint_passes_editable_fields(self):

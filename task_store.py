@@ -338,7 +338,7 @@ def list_accounts(
     ids=None,
     page=1,
     page_size=20,
-    sort_by="created_at",
+    sort_by="generated_at",
     sort_dir="desc",
 ):
     ensure_schema()

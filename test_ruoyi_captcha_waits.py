@@ -15,7 +15,31 @@ class CaptchaDetectionTests(unittest.TestCase):
 
 
 class PostSignupSuccessDetectionTests(unittest.TestCase):
-    def test_proofs_add_frame_counts_as_registration_complete(self):
+    def test_top_level_proofs_add_counts_as_registration_complete(self):
+        page = type(
+            "Page",
+            (),
+            {
+                "url": "https://account.live.com/proofs/Add?mkt=zh-TW",
+                "get_all_frames": lambda self: [],
+            },
+        )()
+
+        self.assertTrue(mod._registration_completed(page))
+
+    def test_any_top_level_url_change_after_real_press_counts_as_registration_complete(self):
+        page = type(
+            "Page",
+            (),
+            {
+                "url": "https://example.com/post-signup",
+                "get_all_frames": lambda self: [],
+            },
+        )()
+
+        self.assertTrue(mod._registration_completed(page, after_captcha=True))
+
+    def test_frame_url_change_does_not_count_as_registration_complete(self):
         frame = type("Frame", (), {"url": "https://account.live.com/proofs/Add?mkt=zh-TW"})()
         page = type(
             "Page",
@@ -26,20 +50,7 @@ class PostSignupSuccessDetectionTests(unittest.TestCase):
             },
         )()
 
-        self.assertTrue(mod._registration_completed(page))
-
-    def test_any_url_change_after_captcha_counts_as_registration_complete(self):
-        frame = type("Frame", (), {"url": "https://example.com/post-signup"})()
-        page = type(
-            "Page",
-            (),
-            {
-                "url": "https://signup.live.com/signup?lic=1",
-                "get_all_frames": lambda self: [frame],
-            },
-        )()
-
-        self.assertTrue(mod._registration_completed(page, after_captcha=True))
+        self.assertFalse(mod._registration_completed(page, after_captcha=True))
 
 
 class WaitStateTimeoutTests(unittest.TestCase):

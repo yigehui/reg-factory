@@ -87,6 +87,17 @@ class ProdLogLevelTests(unittest.TestCase):
         self.assertNotIn('结果: OK foo@outlook.com total=12.34s', rendered)
         self.assertIn('captcha timeout', rendered)
 
+    def test_ruoyi_info_keeps_current_ip_log_visible(self):
+        lines = self._capture(
+            ruoyi,
+            'INFO',
+            [
+                ("  [#1][ruoyi] current IP: '115.38.96.152' country: 'Japan' via ipwhois", 'INFO'),
+            ],
+        )
+        rendered = '\n'.join(lines)
+        self.assertIn("current IP: '115.38.96.152' country: 'Japan' via ipwhois", rendered)
+
     def test_loop_prod_keeps_only_result_style_lines(self):
         lines = self._capture(
             loop,

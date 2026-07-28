@@ -113,6 +113,7 @@ IP_INFO_ENDPOINTS = [
 ]
 
 _CURRENT_IP_INFO = {}
+_CURRENT_IP_INFO_LOCK = threading.Lock()
 
 LOG_LEVELS = {
 
@@ -689,8 +690,6 @@ def _should_demote_to_debug(msg, level):
 
         "browser model:",
 
-        "current ip:",
-
         "filled email:",
 
         "filled prefix",
@@ -977,6 +976,8 @@ def _normalize_px_metrics(idx, metrics=None):
 
         "px_elapsed": float(data.get("px_elapsed") or 0.0),
         "reg_elapsed": float(data.get("reg_elapsed") or 0.0),
+        "register_ip": str(data.get("register_ip") or "").strip(),
+        "register_region": str(data.get("register_region") or "").strip(),
 
     }
 
@@ -985,6 +986,28 @@ def _normalize_px_metrics(idx, metrics=None):
 
 
 set_log_level(os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"))
+
+
+def _set_current_ip_info(tag, ip="", region=""):
+
+    key = str(tag or "").strip()
+    if not key:
+        return
+    with _CURRENT_IP_INFO_LOCK:
+        _CURRENT_IP_INFO[key] = {
+            "register_ip": str(ip or "").strip(),
+            "register_region": str(region or "").strip(),
+        }
+
+
+def _pop_current_ip_info(tag):
+
+    key = str(tag or "").strip()
+    if not key:
+        return "", ""
+    with _CURRENT_IP_INFO_LOCK:
+        info = dict(_CURRENT_IP_INFO.pop(key, {}) or {})
+    return str(info.get("register_ip") or "").strip(), str(info.get("register_region") or "").strip()
 
 
 
@@ -1868,7 +1891,7 @@ def _webui_task_store_enabled():
 
 
 
-def _record_webui_account(email, password, graph=None, status="ok"):
+def _record_webui_account(email, password, graph=None, status="ok", register_ip="", register_region=""):
 
     if not _webui_task_store_enabled() or not email:
 
@@ -1892,9 +1915,9 @@ def _record_webui_account(email, password, graph=None, status="ok"):
 
             generated_at=datetime.now().isoformat(),
 
-            register_ip="",
+            register_ip=register_ip or "",
 
-            register_region="",
+            register_region=register_region or "",
 
             status=status,
 
@@ -1912,11 +1935,18 @@ def _record_webui_account(email, password, graph=None, status="ok"):
 
 
 
-def _save_no_graph_result(email, password):
+def _save_no_graph_result(email, password, register_ip="", register_region=""):
 
     append_account_to_email_nograph(email, password)
 
-    _record_webui_account(email, password, None, "no_graph")
+    _record_webui_account(
+        email,
+        password,
+        None,
+        "no_graph",
+        register_ip=register_ip,
+        register_region=register_region,
+    )
 
 
 
@@ -3286,25 +3316,14 @@ def _on_signup_form(url):
 
 def _registration_completed(page, current_url=None, after_captcha=False):
 
-    urls = []
-    if current_url is not None:
-        urls.append(str(current_url or "").lower())
-    else:
-        urls.append(str(getattr(page, "url", "") or "").lower())
-    for ctx in _all_contexts(page):
-        url = str(getattr(ctx, "url", "") or "").lower()
-        if url:
-            urls.append(url)
-    meaningful_urls = []
-    for url in urls:
-        if not url or url.startswith(("about:", "data:", "javascript:")):
-            continue
-        if any(token in url for token in ("hsprotect", "arkose", "funcaptcha", "perimeterx")):
-            continue
-        meaningful_urls.append(url)
-    if any("account.live.com/proofs/add" in url for url in meaningful_urls):
+    url = str(current_url if current_url is not None else getattr(page, "url", "") or "").lower()
+    if not url or url.startswith(("about:", "data:", "javascript:")):
+        return False
+    if any(token in url for token in ("hsprotect", "arkose", "funcaptcha", "perimeterx")):
+        return False
+    if "account.live.com/proofs/add" in url:
         return True
-    return bool(after_captcha and any(not _on_signup_form(url) for url in meaningful_urls))
+    return bool(after_captcha and not _on_signup_form(url))
 
 
 
@@ -8128,6 +8147,7 @@ def _log_current_ip(proxy_pool, tag):
             if ip:
 
                 country_text = country or "UNKNOWN"
+                _set_current_ip_info(tag, ip, country_text)
 
                 log(f"  {tag} current IP: {ip!r} country: {country_text!r} via {source_name}")
 
@@ -8194,26 +8214,12 @@ def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT)
 def _log_current_ip_async(proxy_pool, tag):
 
     pool_snapshot = list(proxy_pool or [])
-
-
-
-    def _worker():
-
-        try:
-
-            _log_current_ip(pool_snapshot, tag)
-
-        except Exception as exc:
-
-            log(f"  {tag} async IP probe failed: {type(exc).__name__}: {exc}", "WARN")
-
-
-
-    th = threading.Thread(target=_worker, name=f"ruoyi-ip-probe-{tag}", daemon=True)
-
-    th.start()
-
-    return th
+    _set_current_ip_info(tag, "", "")
+    try:
+        _log_current_ip(pool_snapshot, tag)
+    except Exception as exc:
+        log(f"  {tag} IP probe failed: {type(exc).__name__}: {exc}", "WARN")
+    return None
 
 
 
@@ -8489,6 +8495,8 @@ def register_outlook(opts, proxy_pool, idx):
 
             px_elapsed = max(0.0, time.perf_counter() - captcha_started)
 
+        register_ip, register_region = _pop_current_ip_info(tag)
+
         return {
 
             "idx": idx,
@@ -8497,6 +8505,8 @@ def register_outlook(opts, proxy_pool, idx):
 
             "px_elapsed": float(px_elapsed or 0.0),
             "reg_elapsed": max(0.0, time.perf_counter() - register_started),
+            "register_ip": register_ip,
+            "register_region": register_region,
 
         }
 
@@ -8831,7 +8841,7 @@ def register_outlook(opts, proxy_pool, idx):
 
             low = body.lower()
 
-            if _registration_completed(page, current_url=current_url, after_captcha=bool(had_captcha or press_count > 0)):
+            if _registration_completed(page, current_url=current_url, after_captcha=bool(press_count > 0)):
 
                 log(f"  {tag} registration complete! url changed after captcha")
 
@@ -9524,7 +9534,7 @@ def register_outlook(opts, proxy_pool, idx):
 
 
 
-def _save_direct_result(email, password, graph, live_file, token_file):
+def _save_direct_result(email, password, graph, live_file, token_file, register_ip="", register_region=""):
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -9574,7 +9584,14 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
     append_graph_account_to_emails_pool(email, password, graph)
 
-    _record_webui_account(email, password, graph, "ok")
+    _record_webui_account(
+        email,
+        password,
+        graph,
+        "ok",
+        register_ip=register_ip,
+        register_region=register_region,
+    )
 
 
 
@@ -9687,7 +9704,13 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
         async with save_lock:
 
-            await asyncio.to_thread(_save_no_graph_result, email, password)
+            await asyncio.to_thread(
+                _save_no_graph_result,
+                email,
+                password,
+                px_metrics.get("register_ip") or "",
+                px_metrics.get("register_region") or "",
+            )
 
         total_elapsed = time.perf_counter() - started
 
@@ -9703,7 +9726,16 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
     async with save_lock:
 
-        await asyncio.to_thread(_save_direct_result, email, password, graph, args.live_file, args.token_file)
+        await asyncio.to_thread(
+            _save_direct_result,
+            email,
+            password,
+            graph,
+            args.live_file,
+            args.token_file,
+            px_metrics.get("register_ip") or "",
+            px_metrics.get("register_region") or "",
+        )
 
     total_elapsed = time.perf_counter() - started
 

@@ -659,7 +659,7 @@ function renderAccountTable(target, items, optsOrSelectable=false){
         <td>${escHtml(it.task_run_id ?? '')}</td>
         <td>${escHtml(it.email || '')}</td>
         <td>${escHtml(it.password || '')}</td>
-        <td>${escHtml(formatDisplayTime(it.created_at || it.generated_at || ''))}</td>
+        <td>${escHtml(formatDisplayTime(it.generated_at || it.created_at || ''))}</td>
         <td>${escHtml(it.register_ip || '')}</td>
         <td>${escHtml(it.register_region || '')}</td>
         <td>${escHtml(it.status || '')}</td>
@@ -949,7 +949,7 @@ async function loadAccounts(opts={}){
   const qs = new URLSearchParams({
     page: String(accountState.page || 1),
     page_size: String(accountState.pageSize || 20),
-    sort_by: 'created_at',
+    sort_by: 'generated_at',
     sort_dir: 'desc',
   });
   if(filters.taskId) qs.set('task_run_id', filters.taskId);
