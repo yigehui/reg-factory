@@ -1,0 +1,15 @@
+{
+  "case": "ruyi",
+  "goal": "PX ?????? captcha URL ?????????? INFO/PROD ?? email/password??????????",
+  "status": "implemented_pending_live_verify",
+  "next_steps": [
+    "? 1 ? ruyi ??????? 2026-07-28 ??? PX ? URL ???????????????? captcha did not reappear/change after press",
+    "?? PROD ????? registering: email / password?? verify_fail ???????"
+  ],
+  "evidence": [
+    "F:/officeProject/yigehui/reg-factory/register_outlook_ruoyi.py",
+    "F:/officeProject/yigehui/reg-factory/test_ruoyi_captcha_waits.py",
+    "F:/officeProject/yigehui/reg-factory/test_ruoyi_prod_log_level.py",
+    "F:/officeProject/yigehui/reg-factory/exports/logs/tasks/2026-07-29/r1785259090757_e99cb8.txt:33-45"
+  ]
+}

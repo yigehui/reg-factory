@@ -14,6 +14,34 @@ class CaptchaDetectionTests(unittest.TestCase):
             self.assertFalse(mod._captcha_is_validating(object()))
 
 
+class PostSignupSuccessDetectionTests(unittest.TestCase):
+    def test_proofs_add_frame_counts_as_registration_complete(self):
+        frame = type("Frame", (), {"url": "https://account.live.com/proofs/Add?mkt=zh-TW"})()
+        page = type(
+            "Page",
+            (),
+            {
+                "url": "https://signup.live.com/signup?lic=1",
+                "get_all_frames": lambda self: [frame],
+            },
+        )()
+
+        self.assertTrue(mod._registration_completed(page))
+
+    def test_any_url_change_after_captcha_counts_as_registration_complete(self):
+        frame = type("Frame", (), {"url": "https://example.com/post-signup"})()
+        page = type(
+            "Page",
+            (),
+            {
+                "url": "https://signup.live.com/signup?lic=1",
+                "get_all_frames": lambda self: [frame],
+            },
+        )()
+
+        self.assertTrue(mod._registration_completed(page, after_captcha=True))
+
+
 class WaitStateTimeoutTests(unittest.TestCase):
     def test_wait_state_times_out_at_deadline(self):
         self.assertTrue(mod._wait_state_timed_out(100.0, now=120.0, timeout=20.0))

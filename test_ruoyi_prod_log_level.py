@@ -44,6 +44,7 @@ class ProdLogLevelTests(unittest.TestCase):
                 ('proxy list ready: source=file+aimili-list size=87', 'INFO'),
                 ('========== 注册 #1/1 ==========', 'INFO'),
                 ('#1 代理 -> socks5://yigehui...@163.192.58.188:52025', 'INFO'),
+                ('  [#1][ruoyi] registering: foo@outlook.com / Passw0rd!', 'INFO'),
                 ('  [#1][ruoyi] signup entry DOM step=email', 'INFO'),
                 ('  [#1][ruoyi] captcha timeout', 'WARN'),
                 ('  [#1][ruoyi] OK: foo@outlook.com / Passw0rd!', 'OK'),
@@ -60,6 +61,7 @@ class ProdLogLevelTests(unittest.TestCase):
         self.assertIn('proxy list ready: source=file+aimili-list size=87', rendered)
         self.assertIn('========== 注册 #1/1 ==========', rendered)
         self.assertIn('#1 代理 -> socks5://yigehui...@163.192.58.188:52025', rendered)
+        self.assertIn('registering: foo@outlook.com / Passw0rd!', rendered)
         self.assertNotIn('signup entry DOM step=email', rendered)
         self.assertNotIn('captcha timeout', rendered)
         self.assertIn('OK: foo@outlook.com / Passw0rd!', rendered)

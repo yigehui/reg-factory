@@ -619,6 +619,8 @@ def _should_keep_prod_log(msg, level):
 
         "授权结果:",
 
+        "registering:",
+
     )
 
     return any(token in low for token in keep_tokens)
@@ -3280,6 +3282,29 @@ def _on_signup_form(url):
     low = (url or "").lower()
 
     return "signup.live.com" in low and "privacynotice" not in low
+
+
+def _registration_completed(page, current_url=None, after_captcha=False):
+
+    urls = []
+    if current_url is not None:
+        urls.append(str(current_url or "").lower())
+    else:
+        urls.append(str(getattr(page, "url", "") or "").lower())
+    for ctx in _all_contexts(page):
+        url = str(getattr(ctx, "url", "") or "").lower()
+        if url:
+            urls.append(url)
+    meaningful_urls = []
+    for url in urls:
+        if not url or url.startswith(("about:", "data:", "javascript:")):
+            continue
+        if any(token in url for token in ("hsprotect", "arkose", "funcaptcha", "perimeterx")):
+            continue
+        meaningful_urls.append(url)
+    if any("account.live.com/proofs/add" in url for url in meaningful_urls):
+        return True
+    return bool(after_captcha and any(not _on_signup_form(url) for url in meaningful_urls))
 
 
 
@@ -8652,7 +8677,7 @@ def register_outlook(opts, proxy_pool, idx):
 
         email, password, prefix = generate_email_password()
 
-        log(f"  {tag} 将注册: {email}")
+        log(f"  {tag} registering: {email} / {password}")
 
 
 
@@ -8690,7 +8715,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                     email, password, prefix = generate_email_password()
 
-                    log(f"  {tag} email step failed but still on form, new candidate: {email}", "WARN")
+                    log(f"  {tag} email step failed but still on form, registering: {email} / {password}", "WARN")
 
                     continue
 
@@ -8712,7 +8737,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                 prefix = email.split("@", 1)[0]
 
-                log(f"  {tag} new email candidate: {email}")
+                log(f"  {tag} registering: {email} / {password}")
 
                 continue
 
@@ -8736,7 +8761,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                 prefix = email.split("@", 1)[0]
 
-                log(f"  {tag} password saw email-taken, retry with: {email}", "WARN")
+                log(f"  {tag} password saw email-taken, registering: {email} / {password}", "WARN")
 
                 continue
 
@@ -8806,6 +8831,11 @@ def register_outlook(opts, proxy_pool, idx):
 
             low = body.lower()
 
+            if _registration_completed(page, current_url=current_url, after_captcha=bool(had_captcha or press_count > 0)):
+
+                log(f"  {tag} registration complete! url changed after captcha")
+
+                break
 
 
             if not _on_signup_form(current_url) and any(
@@ -9406,7 +9436,7 @@ def register_outlook(opts, proxy_pool, idx):
 
         if need_verify and not verify_ok:
 
-            log(f"  {tag} verification failed, discarding account", "WARN")
+            log(f"  {tag} verification failed, discarding account: {email} / {password}", "WARN")
 
             return _finish(reason="verify_fail")
 
