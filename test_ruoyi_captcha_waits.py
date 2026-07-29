@@ -21,6 +21,12 @@ class WaitStateTimeoutTests(unittest.TestCase):
     def test_wait_state_ignores_missing_start(self):
         self.assertFalse(mod._wait_state_timed_out(None, now=120.0, timeout=20.0))
 
+    def test_post_press_reappear_wait_still_runs_after_last_allowed_press(self):
+        self.assertTrue(mod._should_enter_post_press_reappear_wait(True, 3, 3))
+
+    def test_post_press_reappear_wait_skips_when_not_awaiting_result(self):
+        self.assertFalse(mod._should_enter_post_press_reappear_wait(False, 3, 3))
+
 
 class MicrosoftLoadingGuardTests(unittest.TestCase):
     def test_loading_pauses_max_press_deadline_and_starts_loading_timer(self):

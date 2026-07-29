@@ -656,6 +656,7 @@ def _one_attempt_ruoyi(
     account_format="",
     password_format="",
     px_press_screenshots=False,
+    concurrency=1,
     consumable_pool=None,
 ):
     # 进程级可消耗代理池：take 一条删一条；空则 reload
@@ -703,6 +704,7 @@ def _one_attempt_ruoyi(
         no_verify=False,
         timeout=timeout,
         max_press=max_press,
+        concurrency=max(1, int(concurrency or 1)),
         confirm_before_register=confirm_before_register,
         har=har,
         proxy_file=proxy_path,
@@ -716,19 +718,27 @@ def _one_attempt_ruoyi(
         px_press_screenshots=px_press_screenshots,
         log_level=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
     )
-    result = mod.register_outlook(opts, selected_pool, idx)
-    fail_reason = ""
-    if isinstance(result, tuple) and len(result) >= 3:
-        email, password, fail_reason = result[0], result[1], (result[2] or "")
-    elif isinstance(result, tuple) and len(result) >= 2:
-        email, password = result[0], result[1]
-        fail_reason = "" if email else "failure"
-    else:
-        email = password = None
-        fail_reason = "failure"
     selected_proxy = selected_pool[0] if selected_pool else None
-    # 纯消耗队列：不再 mark_success / mark_blocked
-    return email, password, [], selected_proxy
+    try:
+        result = mod.register_outlook(opts, selected_pool, idx)
+        fail_reason = ""
+        if isinstance(result, tuple) and len(result) >= 3:
+            email, password, fail_reason = result[0], result[1], (result[2] or "")
+        elif isinstance(result, tuple) and len(result) >= 2:
+            email, password = result[0], result[1]
+            fail_reason = "" if email else "failure"
+        else:
+            email = password = None
+            fail_reason = "failure"
+        # 纯消耗队列：不再 mark_success / mark_blocked
+        return email, password, [], selected_proxy
+    finally:
+        release_proxy = getattr(mod, "release_proxy_for_account", None)
+        if callable(release_proxy):
+            try:
+                release_proxy(selected_proxy, runtime=pool)
+            except Exception:
+                pass
 
 
 async def one_attempt(engine, mod, proxy_str, idx, args, consumable_pool=None):
@@ -751,6 +761,7 @@ async def one_attempt(engine, mod, proxy_str, idx, args, consumable_pool=None):
             getattr(args, "account_format", "") or "",
             getattr(args, "password_format", "") or "",
             getattr(args, "px_press_screenshots", False),
+            getattr(args, "concurrency", 1),
             consumable_pool,
         )
     return await one_attempt_standalone(mod, proxy_str, idx)
@@ -948,6 +959,12 @@ def main():
             if callable(set_pool):
                 set_pool(None)
             log("proxy list destroyed")
+        if args.engine == "ruoyi":
+            cleanup_profiles = getattr(mod, "_cleanup_ruoyi_profile_root", None)
+            if callable(cleanup_profiles):
+                cleaned = cleanup_profiles()
+                if cleaned:
+                    log(f"ruoyi profile 缓存已清理: {getattr(mod, 'RUOYI_PROFILE_ROOT', 'profiles_ruoyi')} ({cleaned} items)")
 
 
 if __name__ == "__main__":

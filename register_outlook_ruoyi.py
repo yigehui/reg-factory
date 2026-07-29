@@ -50,6 +50,8 @@ import re
 
 import requests
 
+import shutil
+
 import signal
 
 import sys
@@ -100,19 +102,54 @@ HAR_DIR = os.path.join(ROOT, "har_ruoyi")
 
 OUTPUT_DIR = os.path.join(ROOT, "outlook_accounts")
 
+RUOYI_PROFILE_ROOT = os.environ.get("OUTLOOK_RUOYI_PROFILE_ROOT", os.path.join(ROOT, "profiles_ruoyi"))
+
 EMAIL_NOGRAPH = os.path.join(OUTPUT_DIR, "email_nograph.txt")
 
 EMAILS_POOL = os.path.join(ROOT, "emails.txt")
 
 SIGNUP_URL = "https://signup.live.com/signup?lic=1"
 
+
+def _ruoyi_profile_dir(opts, idx):
+
+    explicit_slot = getattr(opts, "ruoyi_slot", None)
+    try:
+        slot = max(1, int(explicit_slot))
+    except Exception:
+        slot = 0
+    if slot:
+        profile_dir = os.path.join(RUOYI_PROFILE_ROOT, f"slot_{slot:02d}")
+        os.makedirs(profile_dir, exist_ok=True)
+        return profile_dir
+
+    raw_slots = getattr(opts, "concurrency", 1)
+    try:
+        slots = max(1, int(raw_slots or 1))
+    except Exception:
+        slots = 1
+
+    try:
+        slot = max(1, int(idx or 1))
+    except Exception:
+        slot = 1
+
+    slot = ((slot - 1) % slots) + 1
+    profile_dir = os.path.join(RUOYI_PROFILE_ROOT, f"slot_{slot:02d}")
+    os.makedirs(profile_dir, exist_ok=True)
+    return profile_dir
+
 IP_INFO_ENDPOINTS = [
 
     ("ipwhois", "https://ipwho.is/"),
 
+    ("ipify", "https://api.ipify.org?format=json"),
+
 ]
 
 _CURRENT_IP_INFO = {}
+
+_CURRENT_IP_INFO_LOCK = threading.Lock()
 
 LOG_LEVELS = {
 
@@ -144,9 +181,13 @@ SIGNUP_ENTRY_TIMEOUT = 20
 
 SUBMIT_RESULT_TIMEOUT = 15
 
-PROXY_PRECHECK_TIMEOUT = 10
+PROXY_PRECHECK_TIMEOUT = 30
 
-PROXY_PRECHECK_URL = SIGNUP_URL
+PROXY_IDENTITY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_TIMEOUT", "12") or "12")
+
+PROXY_IDENTITY_CACHE_TTL = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_CACHE_TTL", "1800") or "1800")
+
+PROXY_PRECHECK_URL = IP_INFO_ENDPOINTS[0][1]
 
 VERIFY_AFTER_REGISTER = True
 
@@ -342,6 +383,45 @@ def _close_tracked_browser_pages():
 
 
 
+def _cleanup_ruoyi_profile_root(profile_root=RUOYI_PROFILE_ROOT):
+
+    root = os.path.abspath(str(profile_root or "").strip())
+
+    if not root or root in {os.path.abspath(ROOT), os.path.abspath(os.sep), os.path.abspath(os.path.join(root, os.pardir))}:
+
+        return 0
+
+    if not os.path.isdir(root):
+
+        return 0
+
+    cleaned = 0
+
+    for name in os.listdir(root):
+
+        path = os.path.join(root, name)
+
+        try:
+
+            if os.path.isdir(path):
+
+                shutil.rmtree(path)
+
+            else:
+
+                os.remove(path)
+
+            cleaned += 1
+
+        except Exception as exc:
+
+            log(f"清理 ruoyi profile 缓存失败: {path}: {type(exc).__name__}: {exc}", "WARN")
+
+    return cleaned
+
+
+
+
 def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
 
     if browser_page is None:
@@ -426,6 +506,8 @@ def _install_shutdown_handlers():
 
         _close_tracked_browser_pages()
 
+        _cleanup_ruoyi_profile_root()
+
         raise SystemExit(0)
 
 
@@ -472,7 +554,29 @@ def _pick_user_agent(idx=None):
 
             n = 1
 
-        return pool[(max(1, n) - 1) % len(pool)]
+        n = max(1, n)
+
+        ua = pool[(n - 1) % len(pool)]
+
+        if n <= len(pool) or str(os.environ.get("OUTLOOK_RUOYI_UA_POOL", "") or "").strip():
+
+            return ua
+
+        cycle = (n - 1) // len(pool)
+
+        m = re.search(r"rv:(\d+)\.0\).*Firefox/(\d+)\.0", ua)
+
+        if not m:
+
+            return ua
+
+        ver = max(115, int(m.group(1)) - (cycle * len(pool)))
+
+        ua = re.sub(r"rv:\d+\.0", f"rv:{ver}.0", ua, count=1)
+
+        ua = re.sub(r"Firefox/\d+\.0", f"Firefox/{ver}.0", ua, count=1)
+
+        return ua
 
     global _UA_RR_IDX
 
@@ -1159,6 +1263,247 @@ def mask_ruoyi_proxy(proxy_str):
 
 
 
+def _proxy_host_port_key(proxy_str):
+
+    parsed = _parse_ruoyi_proxy(proxy_str)
+
+    if parsed and parsed.get("host") and parsed.get("port"):
+
+        return f"{parsed['host']}:{parsed['port']}"
+
+    return str(proxy_str or "").strip()
+
+
+def _proxy_identity_cache_get(proxy_str):
+
+    key = str(proxy_str or "").strip()
+
+    if not key:
+
+        return None
+
+    now = time.time()
+
+    with _CURRENT_IP_INFO_LOCK:
+
+        cached = _CURRENT_IP_INFO.get(key)
+
+        if not isinstance(cached, dict):
+
+            return None
+
+        expires_at = float(cached.get("expires_at") or 0.0)
+
+        if expires_at and expires_at < now:
+
+            _CURRENT_IP_INFO.pop(key, None)
+
+            return None
+
+        return dict(cached)
+
+
+def _proxy_identity_cache_put(proxy_str, identity):
+
+    key = str(proxy_str or "").strip()
+
+    if not key or not isinstance(identity, dict):
+
+        return identity
+
+    cached = dict(identity)
+
+    cached["expires_at"] = time.time() + max(1.0, float(PROXY_IDENTITY_CACHE_TTL or 1.0))
+
+    with _CURRENT_IP_INFO_LOCK:
+
+        _CURRENT_IP_INFO[key] = cached
+
+    return dict(cached)
+
+
+def _coerce_float_or_none(value):
+
+    try:
+
+        if value in (None, ""):
+
+            return None
+
+        return float(value)
+
+    except Exception:
+
+        return None
+
+
+def _geo_timezone_from_payload(payload):
+
+    timezone_value = payload.get("timezone")
+
+    if isinstance(timezone_value, dict):
+
+        timezone_value = (
+
+            timezone_value.get("id")
+
+            or timezone_value.get("name")
+
+            or timezone_value.get("timezone")
+
+            or ""
+
+        )
+
+    timezone_value = timezone_value or payload.get("time_zone") or ""
+
+    return str(timezone_value or "").strip()
+
+
+def _probe_proxy_identity(proxy_or_pool, timeout=PROXY_IDENTITY_TIMEOUT, use_cache=True):
+
+    if isinstance(proxy_or_pool, str):
+
+        proxy_str = str(proxy_or_pool or "").strip()
+
+        proxy_pool = [proxy_str] if proxy_str else []
+
+    else:
+
+        proxy_pool = list(proxy_or_pool or [])
+
+        proxy_str = str(proxy_pool[0] or "").strip() if proxy_pool else ""
+
+    if not proxy_str:
+
+        return None
+
+    if use_cache:
+
+        cached = _proxy_identity_cache_get(proxy_str)
+
+        if cached:
+
+            return cached
+
+    proxies = _proxy_for_ip_lookup(proxy_pool, "[proxy-id]")
+
+    session = requests.Session()
+
+    session.trust_env = False
+
+    request_timeout = max(0.1, float(timeout or PROXY_IDENTITY_TIMEOUT))
+
+    for source_name, ip_endpoint in IP_INFO_ENDPOINTS:
+
+        try:
+
+            resp = session.get(
+
+                ip_endpoint,
+
+                headers={"Accept": "application/json, text/plain;q=0.9, */*;q=0.8"},
+
+                proxies=proxies,
+
+                timeout=request_timeout,
+
+            )
+
+            resp.raise_for_status()
+
+            data = resp.json()
+
+            ip = str(data.get("ip") or data.get("query") or "").strip()
+
+            country = str(
+
+                data.get("country_name")
+
+                or data.get("country")
+
+                or data.get("countryCode")
+
+                or data.get("country_code")
+
+                or ""
+
+            ).strip()
+
+            if not ip:
+
+                continue
+
+            identity = {
+
+                "proxy": proxy_str,
+
+                "ip": ip,
+
+                "country": country,
+
+                "country_code": str(data.get("countryCode") or data.get("country_code") or data.get("country") or "").strip().upper(),
+
+                "timezone": _geo_timezone_from_payload(data),
+
+                "latitude": _coerce_float_or_none(data.get("latitude") or data.get("lat")),
+
+                "longitude": _coerce_float_or_none(data.get("longitude") or data.get("lon")),
+
+                "source": source_name,
+
+                "endpoint": ip_endpoint,
+
+                "exit_key": f"ip:{ip}",
+
+            }
+
+            return _proxy_identity_cache_put(proxy_str, identity) if use_cache else identity
+
+        except Exception:
+
+            continue
+
+    fallback = {
+
+        "proxy": proxy_str,
+
+        "ip": "",
+
+        "country": "",
+
+        "country_code": "",
+
+        "timezone": "",
+
+        "latitude": None,
+
+        "longitude": None,
+
+        "source": "fallback",
+
+        "endpoint": "",
+
+        "exit_key": f"proxy:{_proxy_host_port_key(proxy_str)}",
+
+    }
+
+    return _proxy_identity_cache_put(proxy_str, fallback) if use_cache else fallback
+
+
+def _proxy_exit_key(proxy_str, timeout=PROXY_IDENTITY_TIMEOUT, use_cache=True):
+
+    identity = _probe_proxy_identity(proxy_str, timeout=timeout, use_cache=use_cache)
+
+    if identity and identity.get("exit_key"):
+
+        return str(identity["exit_key"])
+
+    return f"proxy:{_proxy_host_port_key(proxy_str)}"
+
+
+
+
 def parse_proxy_pool(path):
 
     """读本地代理文件，支持 URL、user:pass@host:port、host:port。"""
@@ -1419,6 +1764,10 @@ class ConsumableProxyPool:
 
         self._list = []
 
+        self._active_exit_keys = set()
+
+        self._active_proxy_keys = {}
+
 
 
     @classmethod
@@ -1459,7 +1808,11 @@ class ConsumableProxyPool:
 
         with self._lock:
 
-            return {"remaining": len(self._list), "source": self.source}
+            return {
+                "remaining": len(self._list),
+                "source": self.source,
+                "active_exit_keys": len(self._active_exit_keys),
+            }
 
 
 
@@ -1477,11 +1830,13 @@ class ConsumableProxyPool:
 
             batch = []
 
-        # 同批 host:port 去重
+        # 启动只做 host:port 去重；出口 IP 延后到 take() 按需探测，避免启动前全量预检。
 
         seen = set()
 
         fresh = []
+
+        dup_host = 0
 
         for p in batch:
 
@@ -1497,6 +1852,8 @@ class ConsumableProxyPool:
 
             if key in seen:
 
+                dup_host += 1
+
                 continue
 
             seen.add(key)
@@ -1507,7 +1864,7 @@ class ConsumableProxyPool:
 
         log(
 
-            f"proxy load source={self.source} got={len(fresh)} list={len(self._list)}",
+            f"proxy load source={self.source} got={len(fresh)} list={len(self._list)} dup_host={dup_host}",
 
             "INFO" if fresh else "WARN",
 
@@ -1547,7 +1904,7 @@ class ConsumableProxyPool:
 
     def take(self):
 
-        """按当前 list size 随机下标取一条并删除；list 空则重新 load。"""
+        """随机取一条未与当前活动出口 IP 冲突的代理并删除。"""
 
         with self._lock:
 
@@ -1559,13 +1916,63 @@ class ConsumableProxyPool:
 
                 return []
 
-            idx = random.randrange(len(self._list))
+            deferred = []
 
-            proxy = self._list.pop(idx)
+            chosen = None
 
-            log(f"proxy take -> {mask_ruoyi_proxy(proxy)} remaining={len(self._list)}", "DEBUG")
+            while self._list:
 
-            return [proxy]
+                idx = random.randrange(len(self._list))
+
+                proxy = self._list.pop(idx)
+
+                exit_key = _proxy_exit_key(proxy)
+
+                if exit_key in self._active_exit_keys:
+
+                    deferred.append(proxy)
+
+                    continue
+
+                self._active_exit_keys.add(exit_key)
+
+                self._active_proxy_keys[proxy] = exit_key
+
+                chosen = proxy
+
+                break
+
+            if deferred:
+
+                self._list.extend(deferred)
+
+            if not chosen:
+
+                log("proxy take blocked: remaining proxies share active exit IPs", "WARN")
+
+                return []
+
+            log(f"proxy take -> {mask_ruoyi_proxy(chosen)} remaining={len(self._list)} active={len(self._active_exit_keys)}", "DEBUG")
+
+            return [chosen]
+
+    def release(self, proxy):
+
+        proxy = str(proxy or "").strip()
+
+        if not proxy:
+
+            return False
+
+        with self._lock:
+
+            exit_key = self._active_proxy_keys.pop(proxy, None) or _proxy_exit_key(proxy)
+
+            released = exit_key in self._active_exit_keys
+
+            self._active_exit_keys.discard(exit_key)
+
+            return released
 
 
 
@@ -1578,6 +1985,10 @@ class ConsumableProxyPool:
             n = len(self._list)
 
             self._list = []
+
+            self._active_exit_keys.clear()
+
+            self._active_proxy_keys.clear()
 
             log(f"proxy list destroyed (cleared {n})", "INFO")
 
@@ -1666,6 +2077,25 @@ def select_proxy_for_account(proxy_pool=None, runtime=None):
         return []
 
     return [items.pop(random.randrange(len(items)))]
+
+
+def release_proxy_for_account(proxy=None, proxy_pool=None, runtime=None):
+
+    pool = runtime if runtime is not None else None
+
+    if pool is None and isinstance(proxy_pool, ConsumableProxyPool):
+
+        pool = proxy_pool
+
+    if pool is None:
+
+        pool = _PROXY_LIST
+
+    if isinstance(pool, ConsumableProxyPool):
+
+        return pool.release(proxy)
+
+    return False
 
 
 
@@ -2552,6 +2982,17 @@ def _wait_state_timed_out(started_at, *, now=None, timeout=CAPTCHA_STATE_TIMEOUT
         now = time.time()
 
     return (now - started_at) >= timeout
+
+
+def _should_enter_post_press_reappear_wait(awaiting_reappear, press_count, max_press):
+
+    if not awaiting_reappear:
+
+        return False
+
+    # max_press 只限制“不能再按下一次”，不影响“当前这一次按完后等待校验结果”。
+
+    return True
 
 
 def _update_loading_wait_state(
@@ -7971,66 +8412,90 @@ def _proxy_for_ip_lookup(proxy_pool, tag):
 
 def _log_current_ip(proxy_pool, tag):
 
-    proxies = _proxy_for_ip_lookup(proxy_pool, tag)
+    identity = _probe_proxy_identity(proxy_pool, timeout=15)
 
-    session = requests.Session()
+    if identity and identity.get("ip"):
 
-    session.trust_env = False
+        country_text = str(identity.get("country") or "UNKNOWN").strip() or "UNKNOWN"
 
-    for source_name, ip_endpoint in IP_INFO_ENDPOINTS:
+        log(f"  {tag} current IP: {identity['ip']!r} country: {country_text!r} via {identity.get('source')}")
 
-        try:
-
-            resp = session.get(
-
-                ip_endpoint,
-
-                headers={"Accept": "application/json, text/plain;q=0.9, */*;q=0.8"},
-
-                proxies=proxies,
-
-                timeout=15,
-
-            )
-
-            resp.raise_for_status()
-
-            data = resp.json()
-
-            ip = str(data.get("ip") or data.get("query") or "").strip()
-
-            country = str(
-
-                data.get("country_name")
-
-                or data.get("country")
-
-                or data.get("countryCode")
-
-                or data.get("country_code")
-
-                or ""
-
-            ).strip()
-
-            if ip:
-
-                country_text = country or "UNKNOWN"
-
-                log(f"  {tag} current IP: {ip!r} country: {country_text!r} via {source_name}")
-
-                return
-
-            log(f"  {tag} IP parse failed({source_name}): {resp.text[:120]!r}", "WARN")
-
-        except Exception as e:
-
-            log(f"  {tag} IP probe failed({source_name}): {e}", "WARN")
+        return
 
     log(f"  {tag} current IP/country probe failed", "WARN")
 
 
 
+
+def _apply_ruoyi_proxy_geo_emulation(page, proxy_pool, tag):
+
+    emu = getattr(page, "emulation", None)
+
+    if emu is None:
+
+        log(f"  {tag} ruoyi geo emulation API not available", "WARN")
+
+        return False
+
+    identity = _probe_proxy_identity(proxy_pool, timeout=15)
+
+    if not identity or not identity.get("ip"):
+
+        log(f"  {tag} ruoyi geo emulation skipped: proxy geo lookup failed", "WARN")
+
+        return False
+
+    timezone_id = str(identity.get("timezone") or "").strip()
+
+    latitude = identity.get("latitude")
+
+    longitude = identity.get("longitude")
+
+    applied = []
+
+    if timezone_id:
+
+        try:
+
+            emu.set_timezone(timezone_id)
+
+            applied.append(f"timezone={timezone_id}")
+
+        except Exception as exc:
+
+            log(f"  {tag} set_timezone failed: {type(exc).__name__}: {exc}", "WARN")
+
+    if latitude is not None and longitude is not None:
+
+        try:
+
+            emu.set_geolocation(latitude, longitude, accuracy=100)
+
+            applied.append(f"geo=({latitude:.4f},{longitude:.4f})")
+
+        except Exception as exc:
+
+            log(f"  {tag} set_geolocation failed: {type(exc).__name__}: {exc}", "WARN")
+
+    if applied:
+
+        country_text = str(identity.get("country_code") or identity.get("country") or "UNKNOWN").strip() or "UNKNOWN"
+
+        log(
+
+            f"  {tag} ruoyi geo emulation applied: ip={identity.get('ip') or '-'} country={country_text} "
+
+            + " ".join(applied),
+
+            "INFO",
+
+        )
+
+        return True
+
+    log(f"  {tag} ruoyi geo emulation skipped: no usable timezone/geolocation from proxy exit", "WARN")
+
+    return False
 
 
 def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT):
@@ -8041,40 +8506,25 @@ def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT)
 
         return True
 
-    session = requests.Session()
+    identity = _probe_proxy_identity(proxy_pool, timeout=max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT)))
 
-    session.trust_env = False
+    if identity and identity.get("ip"):
 
-    try:
+        country_text = str(identity.get("country") or "UNKNOWN").strip() or "UNKNOWN"
 
-        resp = session.get(
+        log(
 
-            PROXY_PRECHECK_URL,
+            f"  {tag} proxy precheck ok: ip={identity['ip']!r} country={country_text!r} via {identity.get('source')} url={PROXY_PRECHECK_URL}",
 
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml"},
-
-            proxies=proxies,
-
-            timeout=max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT)),
-
-            allow_redirects=False,
-
-            stream=True,
+            "INFO",
 
         )
 
-        status = getattr(resp, "status_code", 0)
-
-        log(f"  {tag} proxy precheck ok: status={status} url={PROXY_PRECHECK_URL}", "INFO")
-
         return True
 
-    except Exception as exc:
+    log(f"  {tag} proxy precheck failed: unable to resolve exit IP via {PROXY_PRECHECK_URL}", "WARN")
 
-        log(f"  {tag} proxy precheck failed: {type(exc).__name__}: {exc}", "WARN")
-
-        return False
-
+    return False
 
 
 
@@ -8317,6 +8767,8 @@ def register_outlook(opts, proxy_pool, idx):
     tb = FirefoxOptions()
 
     tb.set_browser_path(RUOYI_FIREFOX_PATH)
+    profile_dir = _ruoyi_profile_dir(opts, idx)
+    tb.set_profile(profile_dir)
 
     if proxy_pool:
 
@@ -8344,7 +8796,7 @@ def register_outlook(opts, proxy_pool, idx):
 
         f"启动 ruyipage Firefox: model={_browser_model_name(RUOYI_FIREFOX_PATH)} "
 
-        f"headless={is_headless} path={RUOYI_FIREFOX_PATH} ua={_mask_ua(user_agent)}",
+        f"headless={is_headless} path={RUOYI_FIREFOX_PATH} profile={profile_dir} ua={_mask_ua(user_agent)}",
 
         "INFO",
 
@@ -8476,6 +8928,10 @@ def register_outlook(opts, proxy_pool, idx):
             log(f"  {tag} 关闭默认空白页失败: {type(close_exc).__name__}: {close_exc}", "WARN")
 
 
+
+        if proxy_pool:
+
+            _apply_ruoyi_proxy_geo_emulation(page, proxy_pool, tag)
 
         if is_headless and not signup_opened:
 
@@ -8903,7 +9359,7 @@ def register_outlook(opts, proxy_pool, idx):
 
 
 
-            if awaiting_reappear and press_count < max_press:
+            if _should_enter_post_press_reappear_wait(awaiting_reappear, press_count, max_press):
 
                 gap_waited = time.time() - (post_press_started_at or time.time())
 
@@ -9461,7 +9917,7 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
 
 
-async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, consumable_pool=None):
+async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, consumable_pool=None, ruoyi_slot=None):
 
     """单号执行。返回 'ok' | 'no_graph' | 'fail'。"""
 
@@ -9503,6 +9959,7 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
             total_elapsed = time.perf_counter() - started
             log(f"{tag} result: FAIL(proxy_precheck_failed) total={total_elapsed:.2f}s", "WARN")
             px_metrics["reg_elapsed"] = total_elapsed
+            release_proxy_for_account(selected_proxy, runtime=pool)
             return "fail", total_elapsed, px_metrics
 
     email = password = None
@@ -9516,6 +9973,8 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
             raise TimeoutError(f"account timeout before browser ({total_budget:g}s)")
         run_args = SimpleNamespace(**vars(args))
         run_args.timeout = remaining
+        if ruoyi_slot is not None:
+            run_args.ruoyi_slot = ruoyi_slot
         result = await asyncio.to_thread(register_outlook, run_args, selected_pool, idx)
 
         if isinstance(result, tuple) and len(result) >= 4:
@@ -9552,6 +10011,8 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
         log(f"{tag} 结果: FAIL({fail_reason or 'failure'}) total={total_elapsed:.2f}s", "WARN")
 
+        release_proxy_for_account(selected_proxy, runtime=pool)
+
         return "fail", total_elapsed, px_metrics
 
 
@@ -9578,6 +10039,8 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
         log(f"{tag} 结果: OK(no_graph) {email} total={total_elapsed:.2f}s", "OK")
 
+        release_proxy_for_account(selected_proxy, runtime=pool)
+
         return "no_graph", total_elapsed, px_metrics
 
 
@@ -9591,6 +10054,8 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
     log(f"{tag} 授权结果: OK", "OK")
 
     log(f"{tag} 结果: OK {email} total={total_elapsed:.2f}s", "OK")
+
+    release_proxy_for_account(selected_proxy, runtime=pool)
 
     return "ok", total_elapsed, px_metrics
 
@@ -9609,6 +10074,9 @@ async def _run_direct_batch(args, helpers, consumable_pool):
     sem = asyncio.Semaphore(concurrency)
 
     save_lock = asyncio.Lock()
+    slot_queue = asyncio.Queue()
+    for slot_id in range(1, concurrency + 1):
+        slot_queue.put_nowait(slot_id)
 
     batch_started = time.perf_counter()
 
@@ -9653,32 +10121,45 @@ async def _run_direct_batch(args, helpers, consumable_pool):
     async def runner(i):
 
         async with sem:
+            slot_id = await slot_queue.get()
+            try:
 
-            # 启动错峰：拿到并发 slot 后还要等全局 launch_gate
+                # 启动错峰：拿到并发 slot 后还要等全局 launch_gate
 
-            async with launch_gate:
+                async with launch_gate:
 
-                now = time.monotonic()
+                    now = time.monotonic()
 
-                wait = max(0.0, next_launch_at[0] - now)
+                    wait = max(0.0, next_launch_at[0] - now)
 
-                if wait > 0:
+                    if wait > 0:
 
-                    log(f"#{i + 1} launch stagger wait {wait:.1f}s")
+                        log(f"#{i + 1} launch stagger wait {wait:.1f}s")
 
-                    await asyncio.sleep(wait)
+                        await asyncio.sleep(wait)
 
-                # 轻微抖动，避免整秒对齐
+                    # 轻微抖动，避免整秒对齐
 
-                jitter = random.uniform(0.0, min(2.0, max(0.3, stagger * 0.15))) if stagger > 0 else random.uniform(0.2, 1.0)
+                    jitter = random.uniform(0.0, min(2.0, max(0.3, stagger * 0.15))) if stagger > 0 else random.uniform(0.2, 1.0)
 
-                if jitter > 0:
+                    if jitter > 0:
 
-                    await asyncio.sleep(jitter)
+                        await asyncio.sleep(jitter)
 
-                next_launch_at[0] = time.monotonic() + stagger
+                    next_launch_at[0] = time.monotonic() + stagger
 
-            return await _run_one_direct(args, helpers, consumable_pool, i + 1, count, save_lock, consumable_pool)
+                return await _run_one_direct(
+                    args,
+                    helpers,
+                    consumable_pool,
+                    i + 1,
+                    count,
+                    save_lock,
+                    consumable_pool,
+                    ruoyi_slot=slot_id,
+                )
+            finally:
+                slot_queue.put_nowait(slot_id)
 
 
 
@@ -9693,6 +10174,12 @@ async def _run_direct_batch(args, helpers, consumable_pool):
         consumable_pool.stop()
 
         set_consumable_proxy_pool(None)
+
+        cleaned = _cleanup_ruoyi_profile_root()
+
+        if cleaned:
+
+            log(f"ruoyi profile 缓存已清理: {RUOYI_PROFILE_ROOT} ({cleaned} items)", "INFO")
 
     statuses = [r[0] if isinstance(r, tuple) else r for r in results]
 

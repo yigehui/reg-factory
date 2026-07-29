@@ -2,24 +2,26 @@ import asyncio
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import register_outlook_ruoyi as mod
 
 
 class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
-    def test_proxy_precheck_uses_10_second_default_timeout(self):
-        session = Mock()
-        session.get.return_value = SimpleNamespace(status_code=200)
-
+    def test_proxy_precheck_uses_identity_timeout_without_touching_signup(self):
         with (
             patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
-            patch.object(mod.requests, "Session", return_value=session),
+            patch.object(
+                mod,
+                "_probe_proxy_identity",
+                return_value={"ip": "1.1.1.1", "country": "US", "source": "ipwhois"},
+            ) as probe_proxy_identity,
         ):
             ok = mod._probe_proxy_before_browser(["127.0.0.1:1080"], "[#1][ruoyi]")
 
         self.assertTrue(ok)
-        self.assertEqual(session.get.call_args.kwargs["timeout"], 10.0)
+        self.assertEqual(probe_proxy_identity.call_args.kwargs["timeout"], float(mod.PROXY_PRECHECK_TIMEOUT))
+        self.assertNotEqual(mod.PROXY_PRECHECK_URL, mod.SIGNUP_URL)
 
     async def test_run_one_direct_skips_browser_when_proxy_precheck_fails(self):
         args = SimpleNamespace(live_file="emails.txt", token_file="tokens.json")

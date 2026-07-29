@@ -1,5 +1,5 @@
 playwright
-camoufox[geoip]>=0.4.0
+ruyipage
 requests
 aiohttp
 curl_cffi
