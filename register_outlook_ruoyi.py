@@ -189,11 +189,12 @@ PROXY_IDENTITY_CACHE_TTL = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_CA
 
 PROXY_PRECHECK_URL = IP_INFO_ENDPOINTS[0][1]
 
+
 VERIFY_AFTER_REGISTER = True
 
 # Wait after captcha becomes actionable before the first/normal press.
 
-INITIAL_PRESS_DELAY = 5
+INITIAL_PRESS_DELAY = 3
 
 # Once the hold starts, begin checking the PX hold label after 5s and stop early
 
@@ -3291,8 +3292,6 @@ def _apply_ruoyi_browser_ua(tb, tag, user_agent):
 
 
 
-
-
 def _apply_ruoyi_headless_emulation(page, tag=None, log_once=False, user_agent=None):
 
     emu = getattr(page, "emulation", None)
@@ -3348,8 +3347,6 @@ def _apply_ruoyi_headless_emulation(page, tag=None, log_once=False, user_agent=N
         log(f"  {tag} ruoyi headless emulation applied: {applied} ua={_mask_ua(ua)}", level)
 
     return applied
-
-
 
 
 
@@ -3600,8 +3597,6 @@ try {{
 return true;
 
 """
-
-
 
 
 
@@ -8172,55 +8167,6 @@ def _post_signup_cleanup(page, tag, idx):
 
 
 
-def _focus_page_before_captcha_press(page, tag):
-
-    """Click the main page before each captcha hold so PX receives focus."""
-
-    try:
-
-        page.run_js_loaded(
-
-            """
-
-try { window.focus(); } catch (e) {}
-
-try { document.body && document.body.focus && document.body.focus(); } catch (e) {}
-
-return true;
-
-"""
-
-        )
-
-    except Exception:
-
-        pass
-
-    try:
-
-        # Real pointer click on a safe main-page point; avoid the captcha iframe itself.
-
-        page.actions.move_to({"x": 18, "y": 18}, duration=random.randint(120, 260)).hold().wait(
-
-            random.uniform(0.05, 0.12)
-
-        ).release().perform()
-
-        log(f"  {tag} focused page before captcha press")
-
-        time.sleep(0.25)
-
-        return True
-
-    except Exception as exc:
-
-        log(f"  {tag} focus click before captcha press failed: {type(exc).__name__}: {exc}", "WARN")
-
-        return False
-
-
-
-
 
 def _perform_hold(page, ctx, target, idx, press_count, tag):
 
@@ -9351,7 +9297,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                     log(f"  {tag} Microsoft Loading still active, waited {waited}s")
 
-                time.sleep(3)
+                time.sleep(1)
 
                 continue
 
@@ -9507,7 +9453,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                         log(f"  {tag} waiting for post-captcha redirect, {waited}s")
 
-                time.sleep(3)
+                time.sleep(1)
 
                 continue
 
@@ -9553,7 +9499,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                             post_press_started_at = post_press_started_at or time.time()
 
-                            time.sleep(3)
+                            time.sleep(1)
 
                             continue
 
@@ -9574,8 +9520,6 @@ def register_outlook(opts, proxy_pool, idx):
                         no_target_rounds = 0
 
                         press_count += 1
-
-                        _focus_page_before_captcha_press(page, tag)
 
                         hold_elapsed = _perform_hold_with_px_screenshots(
 
@@ -9699,7 +9643,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                         return _finish(reason="timeout")
 
-                    time.sleep(3)
+                    time.sleep(1)
 
                     continue
 
@@ -10174,12 +10118,7 @@ async def _run_direct_batch(args, helpers, consumable_pool):
         consumable_pool.stop()
 
         set_consumable_proxy_pool(None)
-
-        cleaned = _cleanup_ruoyi_profile_root()
-
-        if cleaned:
-
-            log(f"ruoyi profile 缓存已清理: {RUOYI_PROFILE_ROOT} ({cleaned} items)", "INFO")
+        log(f"ruoyi profile 缓存保留，需手动清理: {RUOYI_PROFILE_ROOT}", "INFO")
 
     statuses = [r[0] if isinstance(r, tuple) else r for r in results]
 
