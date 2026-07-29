@@ -2282,6 +2282,10 @@ def append_account_to_email_nograph(email, password):
 
 def _shot(page, name, idx):
 
+    if _skip_duplicate_failure_screenshot(name, idx):
+
+        return None
+
     failure_prefixes = (
 
         "blocked",
@@ -2456,7 +2460,30 @@ def _shot(page, name, idx):
 
 
 
+_PRESS_FAIL_SCREENSHOT_DEDUP_SEC = 8.0
+_RECENT_SCREENSHOT_KEYS = {}
+_RECENT_SCREENSHOT_LOCK = threading.Lock()
+
+
+def _skip_duplicate_failure_screenshot(name, idx):
+
+    if not str(name or "").startswith("press_fail"):
+        return False
+    key = (int(idx or 0), "press_fail")
+    now = time.time()
+    with _RECENT_SCREENSHOT_LOCK:
+        last = float(_RECENT_SCREENSHOT_KEYS.get(key) or 0.0)
+        if now - last < _PRESS_FAIL_SCREENSHOT_DEDUP_SEC:
+            return True
+        _RECENT_SCREENSHOT_KEYS[key] = now
+    return False
+
+
 def _save_screenshot(page, name, idx, tag=None):
+
+    if _skip_duplicate_failure_screenshot(name, idx):
+
+        return None
 
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
@@ -8298,15 +8325,11 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
 def _perform_hold_with_px_screenshots(page, ctx, target, idx, press_count, tag, enabled=False):
 
-    if enabled:
-
-        _save_screenshot(page, "before_press_last", idx, tag)
-
     ok = _perform_hold(page, ctx, target, idx, press_count, tag)
 
-    if enabled:
+    if enabled and not ok:
 
-        _save_screenshot(page, "after_press_last", idx, tag)
+        _save_screenshot(page, f"press_fail_last_{press_count}", idx, tag)
 
     return ok
 
@@ -8878,6 +8901,8 @@ def register_outlook(opts, proxy_pool, idx):
         if proxy_pool:
 
             _apply_ruoyi_proxy_geo_emulation(page, proxy_pool, tag)
+
+        _start_ruoyi_resource_blocking(page, tag)
 
         if is_headless and not signup_opened:
 
@@ -9752,6 +9777,8 @@ def register_outlook(opts, proxy_pool, idx):
         return _finish(reason=failure_reason)
 
     finally:
+
+        _stop_ruoyi_resource_blocking(page)
 
         if har_collector is not None:
 
