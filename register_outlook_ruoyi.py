@@ -8967,7 +8967,7 @@ def register_outlook(opts, proxy_pool, idx):
 
         email, password, prefix = generate_email_password()
 
-        log(f"  {tag} 将注册: {email}")
+        log(f"  {tag} 将注册: {email} / {password}")
 
 
 
@@ -9861,7 +9861,49 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
 
 
-async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, consumable_pool=None, ruoyi_slot=None):
+async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics):
+
+    tag = f"#{idx}"
+
+    log(f"{tag} Graph token extracting…", "INFO")
+
+    # Graph 授权强制直连：不挂注册代理，extract_graph_token_http 传 proxy_str=None。
+
+    log(f"{tag} graph proxy -> direct", "INFO")
+
+    graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, None)
+
+    if not graph or not graph.get("refresh_token"):
+
+        async with save_lock:
+
+            await asyncio.to_thread(append_account_to_email_nograph, email, password)
+
+        total_elapsed = time.perf_counter() - started
+
+        log(f"{tag} 授权结果: FAIL(no_graph)", "WARN")
+
+        log(f"{tag} registered but graph RT missing; saved to email_nograph: {email}", "WARN")
+
+        log(f"{tag} 结果: OK(no_graph) {email} total={total_elapsed:.2f}s", "OK")
+
+        return "no_graph", total_elapsed, px_metrics
+
+    async with save_lock:
+
+        await asyncio.to_thread(_save_direct_result, email, password, graph, args.live_file, args.token_file)
+
+    total_elapsed = time.perf_counter() - started
+
+    log(f"{tag} 授权结果: OK", "OK")
+
+    log(f"{tag} 结果: OK {email} total={total_elapsed:.2f}s", "OK")
+
+    return "ok", total_elapsed, px_metrics
+
+
+
+async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, consumable_pool=None, ruoyi_slot=None, defer_graph_auth=False):
 
     """单号执行。返回 'ok' | 'no_graph' | 'fail'。"""
 
@@ -9961,47 +10003,25 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
 
 
-    log(f"{tag} Graph token extracting…", "INFO")
-
-    # Graph 授权强制直连：不挂注册代理，extract_graph_token_http 传 proxy_str=None。
-
-    log(f"{tag} graph proxy -> direct", "INFO")
-
-    graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, None)
-
-    if not graph or not graph.get("refresh_token"):
-
-        async with save_lock:
-
-            await asyncio.to_thread(append_account_to_email_nograph, email, password)
-
-        total_elapsed = time.perf_counter() - started
-
-        log(f"{tag} 授权结果: FAIL(no_graph)", "WARN")
-
-        log(f"{tag} registered but graph RT missing; saved to email_nograph: {email}", "WARN")
-
-        log(f"{tag} 结果: OK(no_graph) {email} total={total_elapsed:.2f}s", "OK")
-
-        release_proxy_for_account(selected_proxy, runtime=pool)
-
-        return "no_graph", total_elapsed, px_metrics
-
-
-
-    async with save_lock:
-
-        await asyncio.to_thread(_save_direct_result, email, password, graph, args.live_file, args.token_file)
-
-    total_elapsed = time.perf_counter() - started
-
-    log(f"{tag} 授权结果: OK", "OK")
-
-    log(f"{tag} 结果: OK {email} total={total_elapsed:.2f}s", "OK")
-
     release_proxy_for_account(selected_proxy, runtime=pool)
 
-    return "ok", total_elapsed, px_metrics
+    if defer_graph_auth:
+
+        return {
+
+            "status": "registered",
+
+            "email": email,
+
+            "password": password,
+
+            "started": started,
+
+            "px_metrics": px_metrics,
+
+        }
+
+    return await _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics)
 
 
 
@@ -10092,7 +10112,7 @@ async def _run_direct_batch(args, helpers, consumable_pool):
 
                     next_launch_at[0] = time.monotonic() + stagger
 
-                return await _run_one_direct(
+                reg_result = await _run_one_direct(
                     args,
                     helpers,
                     consumable_pool,
@@ -10101,9 +10121,25 @@ async def _run_direct_batch(args, helpers, consumable_pool):
                     save_lock,
                     consumable_pool,
                     ruoyi_slot=slot_id,
+                    defer_graph_auth=True,
                 )
             finally:
                 slot_queue.put_nowait(slot_id)
+
+        if isinstance(reg_result, dict) and reg_result.get("status") == "registered":
+
+            return await _finish_direct_graph_auth(
+                args,
+                helpers,
+                reg_result["email"],
+                reg_result["password"],
+                i + 1,
+                save_lock,
+                reg_result["started"],
+                reg_result["px_metrics"],
+            )
+
+        return reg_result
 
 
 
