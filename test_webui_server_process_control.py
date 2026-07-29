@@ -72,11 +72,12 @@ class WebuiServerProcessControlTests(unittest.IsolatedAsyncioTestCase):
         proc = _FakeAsyncProcess()
         mod.RUNS["r1"] = {"proc": proc, "done": False, "lines": []}
 
-        with patch.object(mod, "stop_process_gracefully", AsyncMock()) as stopper:
+        with patch.object(mod, "_stop_asyncio_process_tree", AsyncMock()) as stopper:
             result = await mod.api_stop("r1")
 
         self.assertEqual({"ok": True}, result)
         stopper.assert_awaited_once_with(proc)
+        self.assertIn("收到停止请求", mod.RUNS["r1"]["lines"][-1])
 
 
 if __name__ == "__main__":

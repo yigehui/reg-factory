@@ -97,6 +97,30 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
             self.assertTrue(root.exists())
             self.assertEqual(list(root.iterdir()), [])
 
+    def test_ruoyi_should_block_resource_request_uses_sec_fetch_dest(self):
+        req = SimpleNamespace(
+            url="https://example.com/assets/logo",
+            headers={"Sec-Fetch-Dest": "image"},
+        )
+
+        self.assertTrue(mod._ruoyi_should_block_resource_request(req))
+
+    def test_ruoyi_should_block_resource_request_uses_accept_and_suffix(self):
+        req = SimpleNamespace(
+            url="https://example.com/static/font.woff2?v=1",
+            headers={"Accept": "*/*"},
+        )
+
+        self.assertTrue(mod._ruoyi_should_block_resource_request(req))
+
+    def test_ruoyi_should_block_resource_request_skips_allow_hosts(self):
+        req = SimpleNamespace(
+            url="https://client.px-cloud.net/assets/hold.png",
+            headers={"Sec-Fetch-Dest": "image"},
+        )
+
+        self.assertFalse(mod._ruoyi_should_block_resource_request(req))
+
 
 if __name__ == "__main__":
     unittest.main()

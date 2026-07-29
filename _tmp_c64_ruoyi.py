@@ -194,7 +194,7 @@ VERIFY_AFTER_REGISTER = True
 
 # Wait after captcha becomes actionable before the first/normal press.
 
-INITIAL_PRESS_DELAY = 5
+INITIAL_PRESS_DELAY = 3
 
 # Once the hold starts, begin checking the PX hold label after 5s and stop early
 
@@ -3205,6 +3205,44 @@ def _apply_ruoyi_headless_options(tb, tag, user_agent=None):
 
         "dom.webdriver.enabled": False,
 
+        "useAutomationExtension": False,
+
+        "media.navigator.enabled": True,
+
+        "webgl.disabled": False,
+
+        "webgl.force-enabled": True,
+
+        "webgl.enable-webgl2": True,
+
+        "webgl.msaa-force": True,
+
+        "webgl.disable-fail-if-major-performance-caveat": True,
+
+        "webgl.min_capability_mode": False,
+
+        "webgl.out-of-process": True,
+
+        "webgl.angle.force-d3d11": True,
+
+        "webgl.dxgl.enabled": True,
+
+        "layers.acceleration.force-enabled": True,
+
+        "layers.acceleration.disabled": False,
+
+        "gfx.webrender.all": True,
+
+        "gfx.webrender.enabled": True,
+
+        "gfx.webrender.software": True,
+
+        "gfx.webrender.force-disabled": False,
+
+        "gfx.canvas.accelerated": True,
+
+        "media.hardware-video-decoding.enabled": True,
+
         "privacy.resistFingerprinting": False,
 
     }
@@ -3234,6 +3272,8 @@ def _apply_ruoyi_headless_options(tb, tag, user_agent=None):
     else:
 
         log(f"  {tag} ruoyi headless options: no compatible option API found", "WARN")
+
+
 
 
 
@@ -3383,6 +3423,18 @@ try {{
 
 try {{
 
+  if (!navigator.deviceMemory) Object.defineProperty(navigator, 'deviceMemory', {{get: () => 8, configurable: true}});
+
+  if (!navigator.hardwareConcurrency || navigator.hardwareConcurrency < 2) {{
+
+    Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 8, configurable: true}});
+
+  }}
+
+}} catch(e) {{}}
+
+try {{
+
   Object.defineProperty(screen, 'width', {{get: () => 1920, configurable: true}});
 
   Object.defineProperty(screen, 'height', {{get: () => 1080, configurable: true}});
@@ -3415,6 +3467,144 @@ try {{
 
 try {{
 
+  if (!navigator.plugins || navigator.plugins.length === 0) {{
+
+    Object.defineProperty(navigator, 'plugins', {{get: () => [1, 2, 3], configurable: true}});
+
+  }}
+
+}} catch(e) {{}}
+
+try {{
+
+  const proto = HTMLCanvasElement && HTMLCanvasElement.prototype;
+
+  const origGetContext = proto && proto.getContext;
+
+  if (origGetContext && !proto.__ruoyiWebglShim) {{
+
+    Object.defineProperty(proto, '__ruoyiWebglShim', {{value: true}});
+
+    const fakeWebgl = (canvas) => {{
+
+      const dbg = {{UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446}};
+
+      const values = {{
+
+        7936: 'WebKit',
+
+        7937: 'WebKit WebGL',
+
+        7938: 'WebGL 1.0',
+
+        35724: 'WebGL GLSL ES 1.0',
+
+        37445: 'Google Inc. (NVIDIA)',
+
+        37446: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+
+        3379: 16384,
+
+        3386: new Int32Array([16384, 16384]),
+
+        3410: 8,
+
+        3411: 8,
+
+        3412: 8,
+
+        3413: 8,
+
+        3414: 24,
+
+        3415: 8,
+
+      }};
+
+      const base = {{
+
+        canvas,
+
+        VENDOR: 7936,
+
+        RENDERER: 7937,
+
+        VERSION: 7938,
+
+        SHADING_LANGUAGE_VERSION: 35724,
+
+        drawingBufferWidth: canvas.width || 300,
+
+        drawingBufferHeight: canvas.height || 150,
+
+        getExtension: (name) => String(name || '').toUpperCase() === 'WEBGL_DEBUG_RENDERER_INFO' ? dbg : null,
+
+        getSupportedExtensions: () => ['WEBGL_debug_renderer_info', 'OES_texture_float', 'OES_standard_derivatives'],
+
+        getParameter: (p) => Object.prototype.hasOwnProperty.call(values, p) ? values[p] : 0,
+
+        isContextLost: () => false,
+
+      }};
+
+      return new Proxy(base, {{
+
+        get(target, prop) {{
+
+          if (prop in target) return target[prop];
+
+          if (typeof prop === 'string' && /^[A-Z0-9_]+$/.test(prop)) return 0;
+
+          return function () {{ return 0; }};
+
+        }}
+
+      }});
+
+    }};
+
+    proto.getContext = function(type, attrs) {{
+
+      const t = String(type || '').toLowerCase();
+
+      const ctx = origGetContext.call(this, type, attrs);
+
+      if (ctx) return ctx;
+
+      if (t === 'webgl' || t === 'experimental-webgl' || t === 'webgl2') return fakeWebgl(this);
+
+      return ctx;
+
+    }};
+
+  }}
+
+}} catch(e) {{}}
+
+try {{
+
+  const gp = WebGLRenderingContext && WebGLRenderingContext.prototype.getParameter;
+
+  if (gp && !WebGLRenderingContext.prototype.__ruoyiHeadlessPatched) {{
+
+    Object.defineProperty(WebGLRenderingContext.prototype, '__ruoyiHeadlessPatched', {{value: true}});
+
+    WebGLRenderingContext.prototype.getParameter = function(p) {{
+
+      if (p === 37445) return 'NVIDIA Corporation';
+
+      if (p === 37446) return 'NVIDIA GeForce GTX 750 Ti/PCIe/SSE2';
+
+      return gp.call(this, p);
+
+    }};
+
+  }}
+
+}} catch(e) {{}}
+
+try {{
+
   delete window.__playwright;
 
   delete window.__pwInitScripts;
@@ -3436,54 +3626,10 @@ return true;
 """
 
 
+
 # 兼容旧引用（无 UA 参数时的默认 patch）
 
 RUOYI_HEADLESS_PATCH_JS = _build_headless_patch_js(HEADLESS_USER_AGENT)
-
-
-
-def _ensure_ruoyi_headless_preload(page, tag=None, log_once=False, user_agent=None):
-
-    add_script = getattr(page, "add_preload_script", None)
-
-    if not callable(add_script):
-
-        if log_once:
-
-            log(f"  {tag} ruoyi headless preload API not available", "WARN")
-
-        return False
-
-    ua = str(user_agent or HEADLESS_USER_AGENT or "").strip() or HEADLESS_USER_AGENT
-
-    if getattr(page, "_ruoyi_headless_preload_ready", False) and getattr(page, "_ruoyi_headless_preload_ua", "") == ua:
-
-        return True
-
-    preload_js = f"() => {{{_build_headless_patch_js(ua)}}}"
-
-    try:
-
-        add_script(preload_js)
-
-        setattr(page, "_ruoyi_headless_preload_ready", True)
-
-        setattr(page, "_ruoyi_headless_preload_ua", ua)
-
-        if log_once:
-
-            log(f"  {tag} ruoyi headless preload ready ua={_mask_ua(ua)}")
-
-        return True
-
-    except Exception as exc:
-
-        if log_once:
-
-            log(f"  {tag} ruoyi headless preload failed: {type(exc).__name__}: {exc}", "WARN")
-
-        return False
-
 
 
 
@@ -3494,8 +3640,6 @@ def _apply_ruoyi_headless_page_patches(page, tag=None, log_once=False, user_agen
     ua = str(user_agent or HEADLESS_USER_AGENT or "").strip() or HEADLESS_USER_AGENT
 
     _apply_ruoyi_headless_emulation(page, tag, log_once=False, user_agent=ua)
-
-    _ensure_ruoyi_headless_preload(page, tag, log_once=log_once, user_agent=ua)
 
     patch_js = _build_headless_patch_js(ua)
 
@@ -3520,6 +3664,8 @@ def _apply_ruoyi_headless_page_patches(page, tag=None, log_once=False, user_agen
         log(f"  {tag} ruoyi headless page patches applied to {ok_count} context(s) ua={_mask_ua(ua)}", level)
 
     return ok_count
+
+
 
 
 
@@ -4970,135 +5116,6 @@ def _all_contexts(page):
     return contexts
 
 
-
-
-
-_RUOYI_RESOURCE_BLOCK_KINDS = ("image", "font", "media")
-
-_RUOYI_RESOURCE_ALLOW_HOST_HINTS = (
-    "fpt.live.com",
-    "hsprotect.net",
-    "px-cloud.net",
-    "px-cdn.net",
-    "client.px-cloud.net",
-)
-
-_RUOYI_RESOURCE_BLOCK_EXTS = (
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".m4a",
-)
-
-
-def _ruoyi_should_block_resource_request(req):
-
-    url = str(getattr(req, "url", "") or "")
-
-    low = url.lower()
-
-    if any(host in low for host in _RUOYI_RESOURCE_ALLOW_HOST_HINTS):
-
-        return False
-
-    headers = getattr(req, "headers", None) or {}
-
-    dest = str(headers.get("Sec-Fetch-Dest") or headers.get("sec-fetch-dest") or "").strip().lower()
-
-    if dest in _RUOYI_RESOURCE_BLOCK_KINDS:
-
-        return True
-
-    accept = str(headers.get("Accept") or headers.get("accept") or "").strip().lower()
-
-    if "image/" in accept or "font/" in accept or "audio/" in accept or "video/" in accept:
-
-        return True
-
-    path = urllib.parse.urlsplit(low).path or ""
-
-    return any(path.endswith(ext) for ext in _RUOYI_RESOURCE_BLOCK_EXTS)
-
-
-def _start_ruoyi_resource_blocking(page, tag=None):
-
-    if page is None:
-
-        return False
-
-    interceptor = getattr(page, "intercept", None)
-
-    if interceptor is None or not callable(getattr(interceptor, "start_requests", None)):
-
-        return False
-
-    if getattr(page, "_ruoyi_resource_blocking_active", False):
-
-        return True
-
-    def _handler(req):
-
-        try:
-
-            if _ruoyi_should_block_resource_request(req):
-
-                req.fail()
-
-                return
-
-        except Exception:
-
-            pass
-
-        req.continue_request()
-
-    try:
-
-        interceptor.start_requests(_handler)
-
-        setattr(page, "_ruoyi_resource_blocking_active", True)
-
-        if tag:
-
-            log(f"  {tag} ruoyi resource blocking active: image/font/media")
-
-        return True
-
-    except Exception as exc:
-
-        if tag:
-
-            log(f"  {tag} ruoyi resource blocking start failed: {type(exc).__name__}: {exc}", "WARN")
-
-        return False
-
-
-def _stop_ruoyi_resource_blocking(page):
-
-    if page is None:
-
-        return False
-
-    interceptor = getattr(page, "intercept", None)
-
-    if interceptor is None or not callable(getattr(interceptor, "stop", None)):
-
-        return False
-
-    if not getattr(page, "_ruoyi_resource_blocking_active", False):
-
-        return False
-
-    try:
-
-        interceptor.stop()
-
-    except Exception:
-
-        return False
-
-    setattr(page, "_ruoyi_resource_blocking_active", False)
-
-    return True
 
 
 
@@ -8178,105 +8195,15 @@ def _post_signup_cleanup(page, tag, idx):
 
 
 
-def _ruoyi_point_inside_target(target, ratio_x=0.5, ratio_y=0.55, jitter_x=0.0, jitter_y=0.0):
-
-    base_x = float((target or {}).get("x", 0) or 0)
-
-    base_y = float((target or {}).get("y", 0) or 0)
-
-    left = float((target or {}).get("left", base_x) or base_x)
-
-    top = float((target or {}).get("top", base_y) or base_y)
-
-    width = float((target or {}).get("width", 0) or 0)
-
-    height = float((target or {}).get("height", 0) or 0)
-
-    if width <= 1.0 and height <= 1.0 and (base_x or base_y):
-
-        return (
-
-            int(round(base_x + random.uniform(-jitter_x, jitter_x))),
-
-            int(round(base_y + random.uniform(-jitter_y, jitter_y))),
-
-        )
-
-    width = max(1.0, width)
-
-    height = max(1.0, height)
-
-    ratio_x = min(0.9, max(0.1, float(ratio_x)))
-
-    ratio_y = min(0.9, max(0.1, float(ratio_y)))
-
-    return (
-
-        int(round(left + (width * ratio_x) + random.uniform(-jitter_x, jitter_x))),
-
-        int(round(top + (height * ratio_y) + random.uniform(-jitter_y, jitter_y))),
-
-    )
-
-
-
 def _perform_hold(page, ctx, target, idx, press_count, tag):
 
     """Press-and-hold with early release when the linked Press and hold p hides itself."""
 
+    cx = int(target.get("x", 0) + random.uniform(-3, 3))
+
+    cy = int(target.get("y", 0) + random.uniform(-2, 2))
+
     hold_sec = random.uniform(PX_HOLD_SECONDS_MIN, PX_HOLD_SECONDS_MAX)
-
-    motion_profile = getattr(page, "_ruoyi_px_motion_profile", None) or {}
-
-    jitter_x = float(motion_profile.get("jitter_x", 1.8))
-
-    jitter_y = float(motion_profile.get("jitter_y", 1.2))
-
-    cx, cy = _ruoyi_point_inside_target(
-        target,
-        ratio_x=motion_profile.get("press_ratio_x", 0.5),
-        ratio_y=motion_profile.get("press_ratio_y", 0.55),
-        jitter_x=jitter_x,
-        jitter_y=jitter_y,
-    )
-
-    settle_x, settle_y = _ruoyi_point_inside_target(
-        target,
-        ratio_x=motion_profile.get("settle_ratio_x", 0.48),
-        ratio_y=motion_profile.get("settle_ratio_y", 0.57),
-        jitter_x=float(motion_profile.get("settle_jitter_x", 0.8)),
-        jitter_y=float(motion_profile.get("settle_jitter_y", 0.8)),
-    )
-
-    micro_x, micro_y = _ruoyi_point_inside_target(
-        target,
-        ratio_x=motion_profile.get("micro_ratio_x", motion_profile.get("press_ratio_x", 0.5)),
-        ratio_y=motion_profile.get("micro_ratio_y", motion_profile.get("press_ratio_y", 0.55)),
-        jitter_x=float(motion_profile.get("micro_jitter_x", 0.45)),
-        jitter_y=float(motion_profile.get("micro_jitter_y", 0.45)),
-    )
-
-    lead_x = int(round(settle_x + float(motion_profile.get("lead_dx", -10.0)) + random.uniform(-1.2, 1.2)))
-
-    lead_y = int(round(settle_y + float(motion_profile.get("lead_dy", -4.0)) + random.uniform(-1.0, 1.0)))
-
-    move_ms = int(min(420, max(200, hold_sec * float(motion_profile.get("move_ratio", 0.03)) * 1000.0)))
-
-    lead_ms = int(move_ms * float(motion_profile.get("lead_ratio", 0.48)))
-
-    lead_ms = min(max(60, lead_ms), move_ms - 120)
-
-    settle_ms = int(move_ms * float(motion_profile.get("settle_ratio", 0.24)))
-
-    settle_ms = min(max(45, settle_ms), move_ms - lead_ms - 70)
-
-    micro_ms = int(move_ms * float(motion_profile.get("micro_ratio", 0.14)))
-
-    micro_ms = min(max(25, micro_ms), move_ms - lead_ms - settle_ms - 35)
-
-    final_ms = move_ms - lead_ms - settle_ms - micro_ms
-
-    pre_hover_sec = min(0.22, max(0.04, hold_sec * float(motion_profile.get("hover_ratio", 0.01))))
 
     state_ctx = ctx
 
@@ -8286,7 +8213,7 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
     log(
 
-        f"  {tag} press #{press_count}: ({cx},{cy}) hold={hold_sec:.1f}s path={move_ms}ms"
+        f"  {tag} press #{press_count}: ({cx},{cy}) hold={hold_sec:.1f}s"
 
         + (f" text={target.get('text', '')[:30]!r}" if target.get("text") else "")
 
@@ -8302,19 +8229,7 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
     try:
 
-        actions.move_to({"x": lead_x, "y": lead_y}, duration=lead_ms)
-
-        actions.move_to({"x": settle_x, "y": settle_y}, duration=settle_ms)
-
-        actions.move_to({"x": micro_x, "y": micro_y}, duration=micro_ms)
-
-        actions.move_to({"x": cx, "y": cy}, duration=final_ms)
-
-        if pre_hover_sec > 0:
-
-            actions.wait(pre_hover_sec)
-
-        actions.hold().perform()
+        actions.move_to({"x": cx, "y": cy}, duration=random.randint(250, 550)).hold().perform()
 
         hold_started = time.time()
 
@@ -8392,13 +8307,15 @@ def _perform_hold(page, ctx, target, idx, press_count, tag):
 
     except Exception as exc:
 
-        try:
+        if hold_started is not None:
 
-            actions.release_all()
+            try:
 
-        except Exception:
+                actions.release_all()
 
-            pass
+            except Exception:
+
+                pass
 
         log(f"  {tag} hold failed: {type(exc).__name__}: {exc}", "WARN")
 
@@ -8417,31 +8334,6 @@ def _perform_hold_with_px_screenshots(page, ctx, target, idx, press_count, tag, 
     return ok
 
 
-
-
-
-def _new_ruoyi_px_motion_profile():
-    return {
-        "press_ratio_x": random.uniform(0.42, 0.58),
-        "press_ratio_y": random.uniform(0.48, 0.64),
-        "settle_ratio_x": random.uniform(0.44, 0.56),
-        "settle_ratio_y": random.uniform(0.50, 0.62),
-        "micro_ratio_x": random.uniform(0.45, 0.57),
-        "micro_ratio_y": random.uniform(0.49, 0.63),
-        "jitter_x": random.uniform(1.0, 2.8),
-        "jitter_y": random.uniform(0.8, 2.0),
-        "settle_jitter_x": random.uniform(0.4, 1.0),
-        "settle_jitter_y": random.uniform(0.3, 0.9),
-        "micro_jitter_x": random.uniform(0.2, 0.6),
-        "micro_jitter_y": random.uniform(0.2, 0.6),
-        "lead_dx": random.choice((-1, 1)) * random.uniform(8.0, 16.0),
-        "lead_dy": random.uniform(-6.0, 6.0),
-        "move_ratio": random.uniform(0.024, 0.036),
-        "lead_ratio": random.uniform(0.42, 0.56),
-        "settle_ratio": random.uniform(0.20, 0.28),
-        "micro_ratio": random.uniform(0.10, 0.18),
-        "hover_ratio": random.uniform(0.008, 0.016),
-    }
 
 
 
@@ -8987,7 +8879,6 @@ def register_outlook(opts, proxy_pool, idx):
         _track_browser_page(browser_page)
 
         page = browser_page
-        setattr(page, "_ruoyi_px_motion_profile", _new_ruoyi_px_motion_profile())
 
 
 
@@ -9011,9 +8902,7 @@ def register_outlook(opts, proxy_pool, idx):
 
             _apply_ruoyi_proxy_geo_emulation(page, proxy_pool, tag)
 
-        if bool(getattr(opts, "block_resources", False)):
-
-            _start_ruoyi_resource_blocking(page, tag)
+        _start_ruoyi_resource_blocking(page, tag)
 
         if is_headless and not signup_opened:
 
@@ -9759,7 +9648,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                             return _finish(reason="timeout")
 
-                        time.sleep(1)
+                        time.sleep(2)
 
                         continue
 
@@ -9825,7 +9714,7 @@ def register_outlook(opts, proxy_pool, idx):
 
             if not submitted:
 
-                time.sleep(2)
+                time.sleep(3)
 
         else:
 
@@ -10367,12 +10256,6 @@ def main():
     )
 
     ap.add_argument("--headless", action="store_true", help="无头模式")
-
-    ap.add_argument("--block-resources", action="store_true",
-
-                    default=_env_bool("OUTLOOK_RUOYI_BLOCK_RESOURCES", False),
-
-                    help="屏蔽 image/font/media 资源请求")
 
     ap.add_argument("--timeout", "-t", type=int, default=REGISTER_TIMEOUT, help="单号超时(秒)")
 

@@ -10,11 +10,9 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 启动：  python -m uvicorn webui.server:app --port 8799   (或用 start.bat)
 """
 import asyncio
-import inspect
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -34,7 +32,7 @@ SCRIPT_CONFIG_PATH = os.path.join(ROOT, "webui_script_configs.json")
 sys.path.insert(0, WEBUI)
 sys.path.insert(0, ROOT)
 import scripts as schema  # noqa: E402
-from process_utils import child_creationflags, stop_process_gracefully  # noqa: E402
+from process_utils import child_creationflags  # noqa: E402
 
 
 def _ensure_proxy_env():
@@ -70,16 +68,10 @@ def _append_run_line(rec, line):
         rec["line_offset"] = int(rec.get("line_offset") or 0) + dropped
 
 
-async def _stop_asyncio_process_gracefully(proc, timeout=15):
+async def _stop_asyncio_process_tree(proc, timeout=5):
     if proc is None or getattr(proc, "returncode", None) is not None:
         return
-    if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
-        try:
-            proc.send_signal(signal.CTRL_BREAK_EVENT)
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
-            return
-        except Exception:
-            pass
+    if sys.platform == "win32":
         pid = getattr(proc, "pid", None)
         if pid:
             try:
@@ -95,14 +87,9 @@ async def _stop_asyncio_process_gracefully(proc, timeout=15):
             except Exception:
                 pass
     try:
-        proc.terminate()
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
-        return
-    except Exception:
-        pass
-    try:
         proc.kill()
         await asyncio.wait_for(proc.wait(), timeout=timeout)
+        return
     except Exception:
         pass
 
@@ -924,11 +911,8 @@ async def api_stop(run_id: str):
         return JSONResponse({"error": "任务不存在"}, status_code=404)
     if not rec["done"]:
         try:
-            stopped = stop_process_gracefully(rec["proc"])
-            if inspect.isawaitable(stopped):
-                await stopped
-            elif hasattr(rec["proc"], "wait") and not hasattr(rec["proc"], "poll"):
-                await _stop_asyncio_process_gracefully(rec["proc"])
+            _append_run_line(rec, "[webui] 收到停止请求，正在强制结束任务")
+            await _stop_asyncio_process_tree(rec["proc"])
         except Exception:
             pass
     return {"ok": True}
