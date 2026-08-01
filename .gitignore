@@ -59,3 +59,7 @@ gmail_android/offline/bluestacks/*
 gmail_android/dist/
 screenshots_vision/
 profiles_ruoyi/
+profiles_ruoyi_tmp/
+log/
+email_nograph.txt
+emails.txt.lock

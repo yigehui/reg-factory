@@ -185,10 +185,8 @@ def stage_email(args, env):
         cmd += ["--proxy-file", args.outlook_proxy_file]
     if args.outlook_proxy_source:
         cmd += ["--proxy-source", args.outlook_proxy_source]
-    if args.outlook_aimili_url:
-        cmd += ["--aimili-url", args.outlook_aimili_url]
-    if args.outlook_aimili_token:
-        cmd += ["--aimili-token", args.outlook_aimili_token]
+    if args.outlook_proxy_url:
+        cmd += ["--proxy-url", args.outlook_proxy_url]
     if args.outlook_headless:
         cmd.append("--headless")
     if args.outlook_har:
@@ -321,12 +319,10 @@ def main():
     ap.add_argument("--outlook-proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
                     help="ruoyi 后端代理池文件")
     ap.add_argument("--outlook-proxy-source", default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
-                    choices=["file", "aimili-random", "aimili-list"],
-                    help="Outlook ruoyi 代理来源：本地文件 / Aimili 随机 / Aimili 列表")
-    ap.add_argument("--outlook-aimili-url", default=(os.environ.get("OUTLOOK_AIMILI_POOL_URL") or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")),
-                    help="AimiliVPN URL：管理端根地址或 /api/pool/proxies(/random) 完整地址")
-    ap.add_argument("--outlook-aimili-token", default=os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", ""),
-                    help="AimiliVPN 代理池 API Token")
+                    choices=["file", "http"],
+                    help="Outlook ruoyi 代理来源：本地文件 / HTTP txt 列表")
+    ap.add_argument("--outlook-proxy-url", default=os.environ.get("OUTLOOK_PROXY_URL", ""),
+                    help="Outlook ruoyi HTTP GET 代理列表地址，返回 txt")
     ap.add_argument("--outlook-headless", action="store_true",
                     help="仅 ruoyi 后端：Outlook 注册阶段使用无头模式")
     ap.add_argument("--outlook-har", action="store_true",

@@ -84,7 +84,7 @@ class BatchMetricsTests(unittest.TestCase):
 
     def test_run_direct_batch_returns_six_values_with_px_stats(self):
         responses = [
-            ("ok", 12.0, {"idx": 1, "max_presses": 2, "px_elapsed": 33.0}),
+            ("ok", 12.0, {"idx": 1, "max_presses": 2, "px_elapsed": 33.0, "reg_elapsed": 0.0}),
             ("fail", 99.0, {"idx": 2, "max_presses": 9, "px_elapsed": 88.0}),
         ]
 
@@ -93,7 +93,7 @@ class BatchMetricsTests(unittest.TestCase):
 
         class FakePool:
             def stats(self):
-                return {"source": "file+aimili-list", "remaining": 1}
+                return {"source": "http", "remaining": 1}
 
             def remaining(self):
                 return 0
@@ -114,7 +114,7 @@ class BatchMetricsTests(unittest.TestCase):
         self.assertEqual(result[:3], (1, 0, 1))
         self.assertGreaterEqual(result[3], 0.0)
         self.assertEqual(result[4], 12.0)
-        self.assertEqual(result[5], [{"idx": 1, "max_presses": 2, "px_elapsed": 33.0}])
+        self.assertEqual(result[5], [{"idx": 1, "max_presses": 2, "px_elapsed": 33.0, "reg_elapsed": 0.0}])
 
 
 if __name__ == "__main__":

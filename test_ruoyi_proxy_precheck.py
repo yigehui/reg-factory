@@ -8,19 +8,19 @@ import register_outlook_ruoyi as mod
 
 
 class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
-    def test_proxy_precheck_uses_identity_timeout_without_touching_signup(self):
+    def test_proxy_precheck_uses_target_timeout_without_touching_signup(self):
         with (
             patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
             patch.object(
                 mod,
-                "_probe_proxy_identity",
-                return_value={"ip": "1.1.1.1", "country": "US", "source": "ipwhois"},
-            ) as probe_proxy_identity,
+                "_probe_proxy_targets",
+                return_value={"url": "https://signup.live.com/", "status_code": 302},
+            ) as probe_proxy_targets,
         ):
             ok = mod._probe_proxy_before_browser(["127.0.0.1:1080"], "[#1][ruoyi]")
 
         self.assertTrue(ok)
-        self.assertEqual(probe_proxy_identity.call_args.kwargs["timeout"], float(mod.PROXY_PRECHECK_TIMEOUT))
+        self.assertEqual(probe_proxy_targets.call_args.kwargs["timeout"], float(mod.PROXY_PRECHECK_TIMEOUT))
         self.assertNotEqual(mod.PROXY_PRECHECK_URL, mod.SIGNUP_URL)
 
     async def test_run_one_direct_skips_browser_when_proxy_precheck_fails(self):
@@ -48,6 +48,38 @@ class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(px_metrics["max_presses"], 0)
         self.assertAlmostEqual(px_metrics["px_elapsed"], 0.0)
         register_outlook.assert_not_called()
+
+    def test_proxy_precheck_fails_when_microsoft_targets_unreachable(self):
+        with (
+            patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
+            patch.object(mod, "_probe_proxy_targets", return_value=None),
+        ):
+            ok = mod._probe_proxy_before_browser(["127.0.0.1:1080"], "[#1][ruoyi]")
+
+        self.assertFalse(ok)
+
+    def test_probe_proxy_targets_accepts_http_response_below_500(self):
+        class FakeResponse:
+            def __init__(self, status_code):
+                self.status_code = status_code
+
+            def close(self):
+                return None
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+
+            def get(self, *args, **kwargs):
+                return FakeResponse(403)
+
+        with (
+            patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
+            patch.object(mod.requests, "Session", return_value=FakeSession()),
+        ):
+            result = mod._probe_proxy_targets(["127.0.0.1:1080"], timeout=9)
+
+        self.assertEqual(result, {"url": mod.PROXY_PRECHECK_TARGETS[0], "status_code": 403})
 
     async def test_run_one_direct_passes_remaining_budget_to_register(self):
         args = SimpleNamespace(timeout=150, live_file="emails.txt", token_file="tokens.json")

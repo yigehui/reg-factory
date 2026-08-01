@@ -643,8 +643,7 @@ def _one_attempt_ruoyi(
     mod,
     proxy_file,
     proxy_source,
-    aimili_url,
-    aimili_token,
+    proxy_url,
     idx,
     timeout,
     max_press,
@@ -670,8 +669,7 @@ def _one_attempt_ruoyi(
         source_args = SimpleNamespace(
             proxy_file=proxy_file or getattr(mod, "PROXY_FILE", ""),
             proxy_source=proxy_source,
-            aimili_url=aimili_url,
-            aimili_token=aimili_token,
+            proxy_url=proxy_url,
         )
         if hasattr(PoolCls, "from_args"):
             pool = PoolCls.from_args(source_args).start()
@@ -709,8 +707,7 @@ def _one_attempt_ruoyi(
         har=har,
         proxy_file=proxy_path,
         proxy_source=proxy_source,
-        aimili_url=aimili_url,
-        aimili_token=aimili_token,
+        proxy_url=proxy_url,
         email_suffixes=email_suffixes,
         account_format_mode=account_format_mode,
         account_format=account_format,
@@ -748,8 +745,7 @@ async def one_attempt(engine, mod, proxy_str, idx, args, consumable_pool=None):
             mod,
             args.proxy_file,
             getattr(args, "proxy_source", "file"),
-            getattr(args, "aimili_url", ""),
-            getattr(args, "aimili_token", ""),
+            getattr(args, "proxy_url", ""),
             idx,
             args.timeout,
             args.max_press,
@@ -793,12 +789,10 @@ def main():
     ap.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
                     help="代理池文件(每行 user:pass@host:port)；standalone/BitBrowser 每次随机取一个")
     ap.add_argument("--proxy-source", default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
-                    choices=["file", "aimili-random", "aimili-list"],
-                    help="仅 ruoyi：file/aimili-list/aimili-random 启动时装 list，注册取删，空则重载，任务停销毁")
-    ap.add_argument("--aimili-url", default=(os.environ.get("OUTLOOK_AIMILI_POOL_URL") or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")),
-                    help="AimiliVPN URL：管理端根地址或 /api/pool/proxies(/random) 完整地址")
-    ap.add_argument("--aimili-token", default=os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", ""),
-                    help="AimiliVPN 代理池 API Token")
+                    choices=["file", "http"],
+                    help="仅 ruoyi：file=本地代理文件；http=HTTP GET 拉取 txt 代理列表；启动装 list，注册随机取删，空则重载，任务停销毁")
+    ap.add_argument("--proxy-url", default=os.environ.get("OUTLOOK_PROXY_URL", ""),
+                    help="HTTP GET 代理列表地址，返回 txt；每行一个代理")
     ap.add_argument("--email-suffixes",
                     default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES") or os.environ.get("OUTLOOK_EMAIL_SUFFIXES") or "outlook.com",
                     help="邮箱后缀池，逗号/空格分隔，如 outlook.com,hotmail.com")
@@ -828,10 +822,8 @@ def main():
     if args.proxy_file:
         os.environ["OUTLOOK_PROXY_FILE"] = args.proxy_file
     os.environ["OUTLOOK_RUOYI_PROXY_SOURCE"] = args.proxy_source
-    if args.aimili_url:
-        os.environ["OUTLOOK_AIMILI_POOL_URL"] = args.aimili_url
-    if args.aimili_token:
-        os.environ["OUTLOOK_AIMILI_POOL_TOKEN"] = args.aimili_token
+    if args.proxy_url:
+        os.environ["OUTLOOK_PROXY_URL"] = args.proxy_url
     if args.email_suffixes:
         os.environ["OUTLOOK_ACCOUNT_SUFFIXES"] = args.email_suffixes
     os.environ["OUTLOOK_ACCOUNT_FORMAT_MODE"] = args.account_format_mode
@@ -862,8 +854,7 @@ def main():
             source_args = SimpleNamespace(
                 proxy_file=args.proxy_file,
                 proxy_source=args.proxy_source,
-                aimili_url=args.aimili_url,
-                aimili_token=args.aimili_token,
+                proxy_url=args.proxy_url,
             )
             if hasattr(PoolCls, "from_args"):
                 consumable_pool = PoolCls.from_args(source_args).start()
@@ -876,12 +867,12 @@ def main():
             st = consumable_pool.stats() if hasattr(consumable_pool, "stats") else {}
             log(
                 f"ruoyi proxy list: source={st.get('source', args.proxy_source)} "
-                f"size={st.get('remaining', '?')} url={args.aimili_url or 'N/A'}"
+                f"size={st.get('remaining', '?')} url={args.proxy_url or 'N/A'}"
             )
         elif args.proxy_source == "file" and args.proxy_file:
             log(f"ruoyi proxy file: {args.proxy_file}")
         else:
-            log(f"{args.engine} proxy source: {args.proxy_source} url={args.aimili_url or 'EMPTY'}")
+            log(f"{args.engine} proxy source: {args.proxy_source} url={args.proxy_url or 'EMPTY'}")
 
     log(f"pool dir: {POOL_DIR}")
     os.makedirs(POOL_DIR, exist_ok=True)
@@ -959,13 +950,5 @@ def main():
             if callable(set_pool):
                 set_pool(None)
             log("proxy list destroyed")
-        if args.engine == "ruoyi":
-            cleanup_profiles = getattr(mod, "_cleanup_ruoyi_profile_root", None)
-            if callable(cleanup_profiles):
-                cleaned = cleanup_profiles()
-                if cleaned:
-                    log(f"ruoyi profile 缓存已清理: {getattr(mod, 'RUOYI_PROFILE_ROOT', 'profiles_ruoyi')} ({cleaned} items)")
-
-
 if __name__ == "__main__":
     main()

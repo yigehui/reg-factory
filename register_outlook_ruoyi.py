@@ -56,6 +56,8 @@ import signal
 
 import sys
 
+import tempfile
+
 import threading
 
 import time
@@ -69,6 +71,11 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from urllib.parse import quote
+
+from config import _load_dotenv
+
+
+_load_dotenv()
 
 
 
@@ -92,9 +99,7 @@ PROXY_FILE = os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt")
 
 RUOYI_PROXY_SOURCE = os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file")
 
-AIMILI_POOL_URL = os.environ.get("OUTLOOK_AIMILI_POOL_URL") or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")
-
-AIMILI_POOL_TOKEN = os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", "")
+PROXY_URL = os.environ.get("OUTLOOK_PROXY_URL", "")
 
 SCREENSHOT_DIR = os.path.join(ROOT, "screenshots_ruoyi")
 
@@ -102,7 +107,9 @@ HAR_DIR = os.path.join(ROOT, "har_ruoyi")
 
 OUTPUT_DIR = os.path.join(ROOT, "outlook_accounts")
 
-RUOYI_PROFILE_ROOT = os.environ.get("OUTLOOK_RUOYI_PROFILE_ROOT", os.path.join(ROOT, "profiles_ruoyi"))
+RUOYI_PROFILE_ROOT = os.environ.get("OUTLOOK_RUOYI_PROFILE_ROOT", os.path.join(ROOT, "profiles_ruoyi_tmp"))
+
+RUOYI_PROFILE_STALE_SEC = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_STALE_SEC", "600") or "600")
 
 EMAIL_NOGRAPH = os.path.join(OUTPUT_DIR, "email_nograph.txt")
 
@@ -113,30 +120,40 @@ SIGNUP_URL = "https://signup.live.com/signup?lic=1"
 
 def _ruoyi_profile_dir(opts, idx):
 
-    explicit_slot = getattr(opts, "ruoyi_slot", None)
+    root = os.path.abspath(str(RUOYI_PROFILE_ROOT or "").strip())
+
+    os.makedirs(root, exist_ok=True)
+
+    _cleanup_stale_ruoyi_profile_root(root)
+
     try:
-        slot = max(1, int(explicit_slot))
+        slot = max(1, int(getattr(opts, "ruoyi_slot", None) or 0))
     except Exception:
         slot = 0
-    if slot:
-        profile_dir = os.path.join(RUOYI_PROFILE_ROOT, f"slot_{slot:02d}")
-        os.makedirs(profile_dir, exist_ok=True)
-        return profile_dir
+    if not slot:
+        try:
+            slots = max(1, int(getattr(opts, "concurrency", 1) or 1))
+        except Exception:
+            slots = 1
+        try:
+            slot = ((max(1, int(idx or 1)) - 1) % slots) + 1
+        except Exception:
+            slot = 1
 
-    raw_slots = getattr(opts, "concurrency", 1)
+    slot_root = os.path.join(root, f"slot_{slot:02d}")
+    os.makedirs(slot_root, exist_ok=True)
+
     try:
-        slots = max(1, int(raw_slots or 1))
-    except Exception:
-        slots = 1
 
-    try:
-        slot = max(1, int(idx or 1))
-    except Exception:
-        slot = 1
+        run_idx = max(1, int(idx or 1))
 
-    slot = ((slot - 1) % slots) + 1
-    profile_dir = os.path.join(RUOYI_PROFILE_ROOT, f"slot_{slot:02d}")
-    os.makedirs(profile_dir, exist_ok=True)
+    except Exception:
+
+        run_idx = 1
+
+    profile_dir = tempfile.mkdtemp(prefix=f"run_{run_idx:04d}_", dir=slot_root)
+    with _ACTIVE_RUOYI_PROFILE_DIRS_LOCK:
+        _ACTIVE_RUOYI_PROFILE_DIRS.add(os.path.abspath(profile_dir))
     return profile_dir
 
 IP_INFO_ENDPOINTS = [
@@ -187,7 +204,12 @@ PROXY_IDENTITY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_TIME
 
 PROXY_IDENTITY_CACHE_TTL = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_CACHE_TTL", "1800") or "1800")
 
-PROXY_PRECHECK_URL = IP_INFO_ENDPOINTS[0][1]
+PROXY_PRECHECK_TARGETS = (
+    "https://signup.live.com/",
+    "https://login.live.com/",
+)
+
+PROXY_PRECHECK_URL = PROXY_PRECHECK_TARGETS[0]
 
 
 VERIFY_AFTER_REGISTER = True
@@ -225,6 +247,10 @@ BIRTHDAY_ENTRY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_ENTRY_TIMEOUT"
 BIRTHDAY_SUBMIT_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_SUBMIT_TIMEOUT", "2.0") or "2.0")
 
 BROWSER_QUIT_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BROWSER_QUIT_TIMEOUT", "5") or "5")
+
+RUOYI_PROFILE_CLEANUP_RETRIES = int(os.environ.get("OUTLOOK_RUOYI_PROFILE_CLEANUP_RETRIES", "5") or "5")
+
+RUOYI_PROFILE_CLEANUP_RETRY_DELAY = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_CLEANUP_RETRY_DELAY", "0.5") or "0.5")
 
 # Retry gap after a failed challenge before the next press.
 
@@ -264,6 +290,14 @@ _DEFAULT_UA_POOL = (
 
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
 
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0",
+
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
+
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0",
+
 )
 
 HEADLESS_USER_AGENT = os.environ.get("OUTLOOK_RUOYI_HEADLESS_UA", _DEFAULT_UA_POOL[0])
@@ -280,13 +314,17 @@ _ACTIVE_BROWSER_LOCK = threading.Lock()
 
 _SHUTDOWN_HANDLERS_INSTALLED = False
 
+_ACTIVE_RUOYI_PROFILE_DIRS = set()
+
+_ACTIVE_RUOYI_PROFILE_DIRS_LOCK = threading.Lock()
+
 
 
 
 
 def _load_ua_pool():
 
-    """UA 池：环境变量 OUTLOOK_RUOYI_UA_POOL 优先，否则内置 6 条 Firefox。"""
+    """UA 池：环境变量 OUTLOOK_RUOYI_UA_POOL 优先，否则内置 10 条 Firefox。"""
 
     raw = str(os.environ.get("OUTLOOK_RUOYI_UA_POOL", "") or "").strip()
 
@@ -364,7 +402,7 @@ def _close_tracked_browser_pages():
 
         try:
 
-            browser_page.quit()
+            browser_page.quit(timeout=max(2.0, BROWSER_QUIT_TIMEOUT), force=True)
 
             continue
 
@@ -384,9 +422,9 @@ def _close_tracked_browser_pages():
 
 
 
-def _cleanup_ruoyi_profile_root(profile_root=RUOYI_PROFILE_ROOT):
+def _cleanup_ruoyi_profile_root(profile_root=None):
 
-    root = os.path.abspath(str(profile_root or "").strip())
+    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
 
     if not root or root in {os.path.abspath(ROOT), os.path.abspath(os.sep), os.path.abspath(os.path.join(root, os.pardir))}:
 
@@ -421,6 +459,143 @@ def _cleanup_ruoyi_profile_root(profile_root=RUOYI_PROFILE_ROOT):
     return cleaned
 
 
+def _cleanup_stale_ruoyi_profile_root(profile_root=None, max_age_sec=None):
+
+    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
+
+    if not root or not os.path.isdir(root):
+
+        return 0
+
+    now = time.time()
+
+    stale_sec = float(max_age_sec or RUOYI_PROFILE_STALE_SEC or 0.0)
+
+    cleaned = 0
+
+    paths = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and name.startswith("run_"):
+            paths.append(path)
+        elif os.path.isdir(path) and name.startswith("slot_"):
+            for child in os.listdir(path):
+                child_path = os.path.join(path, child)
+                if os.path.isdir(child_path) and child.startswith("run_"):
+                    paths.append(child_path)
+
+    for path in paths:
+
+        try:
+
+            with _ACTIVE_RUOYI_PROFILE_DIRS_LOCK:
+                if os.path.abspath(path) in _ACTIVE_RUOYI_PROFILE_DIRS:
+                    continue
+
+            age_sec = max(0.0, now - os.path.getmtime(path))
+
+            if stale_sec > 0 and age_sec < stale_sec:
+
+                continue
+
+            shutil.rmtree(path)
+
+            cleaned += 1
+
+        except Exception as exc:
+
+            log(f"清理过期 ruoyi tmp 失败: {path}: {type(exc).__name__}: {exc}", "WARN")
+
+    return cleaned
+
+
+def _cleanup_ruoyi_slot_root(slot_root, profile_root=None):
+
+    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
+    path = os.path.abspath(str(slot_root or "").strip())
+    if not root or not path or not os.path.isdir(path):
+        return 0
+    try:
+        if os.path.commonpath([root, path]) != root:
+            return 0
+    except Exception:
+        return 0
+    if not os.path.basename(path).startswith("slot_"):
+        return 0
+    cleaned = 0
+    for name in os.listdir(path):
+        child = os.path.join(path, name)
+        try:
+            if os.path.isdir(child):
+                shutil.rmtree(child)
+            else:
+                os.remove(child)
+            cleaned += 1
+        except Exception:
+            pass
+    return cleaned
+
+
+def _cleanup_ruoyi_run_profile_dir(profile_dir, profile_root=None):
+
+    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
+
+    path = os.path.abspath(str(profile_dir or "").strip())
+
+    if not root or not path or not os.path.isdir(path):
+
+        return False
+
+    try:
+
+        if os.path.commonpath([root, path]) != root:
+
+            return False
+
+    except Exception:
+
+        return False
+
+    if not os.path.basename(path).startswith("run_"):
+
+        return False
+
+    with _ACTIVE_RUOYI_PROFILE_DIRS_LOCK:
+        _ACTIVE_RUOYI_PROFILE_DIRS.discard(path)
+
+    retries = max(1, int(RUOYI_PROFILE_CLEANUP_RETRIES or 1))
+
+    delay = max(0.0, float(RUOYI_PROFILE_CLEANUP_RETRY_DELAY or 0.0))
+
+    last_exc = None
+
+    for attempt in range(retries):
+
+        try:
+
+            shutil.rmtree(path)
+
+            return True
+
+        except Exception as exc:
+
+            last_exc = exc
+
+            if attempt + 1 >= retries:
+
+                break
+
+            if delay > 0:
+
+                time.sleep(delay)
+
+    if last_exc is not None:
+
+        log(f"清理 ruoyi tmp profile 失败: {path}: {type(last_exc).__name__}: {last_exc}", "WARN")
+
+    return False
+
+
 
 
 def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
@@ -437,7 +612,9 @@ def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
 
         try:
 
-            browser_page.quit()
+            wait_timeout = max(2.0, float(timeout or 0.0))
+
+            browser_page.quit(timeout=wait_timeout, force=True)
 
         except Exception:
 
@@ -453,7 +630,9 @@ def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
 
     thread.start()
 
-    if done.wait(max(0.01, float(timeout or 0.0))):
+    wait_timeout = max(2.0, float(timeout or 0.0))
+
+    if done.wait(wait_timeout + 0.5):
 
         return True
 
@@ -467,7 +646,7 @@ def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
 
     if tag:
 
-        log(f"  {tag} browser quit timed out after {float(timeout):.1f}s; continue closing", "WARN")
+        log(f"  {tag} browser quit timed out after {wait_timeout:.1f}s; continue closing", "WARN")
 
     return False
 
@@ -506,8 +685,6 @@ def _install_shutdown_handlers():
             pass
 
         _close_tracked_browser_pages()
-
-        _cleanup_ruoyi_profile_root()
 
         raise SystemExit(0)
 
@@ -1165,6 +1342,7 @@ def _proxy_url_to_ruoyi(value):
         try:
 
             parsed = urllib.parse.urlsplit(raw)
+            scheme = str(parsed.scheme or "").strip().lower()
 
             host = parsed.hostname or ""
 
@@ -1174,9 +1352,11 @@ def _proxy_url_to_ruoyi(value):
 
             pwd = urllib.parse.unquote(parsed.password or "")
 
-            if host and port:
+            if scheme and host and port:
 
-                return f"{host}:{port}:{user}:{pwd}" if (user or pwd) else f"{host}:{port}"
+                auth = f"{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pwd, safe='')}@" if (user or pwd) else ""
+
+                return f"{scheme}://{auth}{host}:{port}"
 
         except Exception:
 
@@ -1194,17 +1374,20 @@ def _proxy_url_to_ruoyi(value):
 
             host, port = hostport.rsplit(":", 1)
 
-            return f"{host}:{port}:{user}:{pwd}"
+            return f"socks5://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pwd, safe='')}@{host}:{port}"
 
     parts = s.split(":")
 
     if len(parts) == 4:
 
-        return s
+        host, port = parts[0], parts[1]
+        user = parts[2]
+        pwd = ":".join(parts[3:])
+        return f"socks5://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pwd, safe='')}@{host}:{port}"
 
     if len(parts) == 2 and parts[1].isdigit():
 
-        return s
+        return f"socks5://{s}"
 
     return ""
 
@@ -1220,6 +1403,23 @@ def _parse_ruoyi_proxy(proxy_str):
 
         return None
 
+    if "://" in s:
+
+        try:
+
+            parsed = urllib.parse.urlsplit(s)
+            scheme = str(parsed.scheme or "").strip().lower() or "socks5"
+            host = parsed.hostname or ""
+            port = parsed.port or 0
+            user = urllib.parse.unquote(parsed.username or "")
+            pwd = urllib.parse.unquote(parsed.password or "")
+            if host and port:
+                return {"scheme": scheme, "host": host, "port": str(port), "username": user, "password": pwd}
+
+        except Exception:
+
+            pass
+
     parts = s.split(":")
 
     if len(parts) >= 4:
@@ -1230,11 +1430,11 @@ def _parse_ruoyi_proxy(proxy_str):
 
         pwd = ":".join(parts[3:])
 
-        return {"host": host, "port": port, "username": user, "password": pwd}
+        return {"scheme": "socks5", "host": host, "port": port, "username": user, "password": pwd}
 
     if len(parts) == 2 and parts[1].isdigit():
 
-        return {"host": parts[0], "port": parts[1], "username": "", "password": ""}
+        return {"scheme": "socks5", "host": parts[0], "port": parts[1], "username": "", "password": ""}
 
     normalized = _proxy_url_to_ruoyi(s)
 
@@ -1258,7 +1458,7 @@ def mask_ruoyi_proxy(proxy_str):
 
     auth = f"{p['username'][:8]}...@" if p.get("username") else ""
 
-    return f"socks5://{auth}{p['host']}:{p['port']}"
+    return f"{p.get('scheme') or 'http'}://{auth}{p['host']}:{p['port']}"
 
 
 
@@ -1505,6 +1705,34 @@ def _proxy_exit_key(proxy_str, timeout=PROXY_IDENTITY_TIMEOUT, use_cache=True):
 
 
 
+def _parse_proxy_lines(lines, source_label):
+
+    out = []
+
+    for raw in lines or []:
+
+        ln = str(raw or "").strip().lstrip("\ufeff")
+
+        if not ln or ln.startswith("#"):
+
+            continue
+
+        normalized = _proxy_url_to_ruoyi(ln)
+
+        if not normalized:
+
+            log(f"跳过非法代理行({source_label}): {ln[:80]}", "WARN")
+
+            continue
+
+        out.append(normalized)
+
+    return out
+
+
+
+
+
 def parse_proxy_pool(path):
 
     """读本地代理文件，支持 URL、user:pass@host:port、host:port。"""
@@ -1519,161 +1747,42 @@ def parse_proxy_pool(path):
 
         return []
 
-    out = []
-
     with open(path, "r", encoding="utf-8") as f:
 
-        for ln in f:
-
-            ln = ln.strip()
-
-            if not ln or ln.startswith("#"):
-
-                continue
-
-            normalized = _proxy_url_to_ruoyi(ln)
-
-            if not normalized:
-
-                log(f"跳过非法代理行: {ln[:80]}", "WARN")
-
-                continue
-
-            out.append(normalized)
-
-    return out
+        return _parse_proxy_lines(f, path)
 
 
 
 
 
-def _aimili_endpoint(pool_url, source):
+def fetch_proxy_list_http(proxy_url, timeout=12):
 
-    raw = str(pool_url or "").strip().rstrip("/")
+    proxy_url = str(proxy_url or "").strip()
 
-    if not raw:
+    if not proxy_url:
 
-        raise RuntimeError("OUTLOOK_AIMILI_POOL_URL/--aimili-url 为空")
+        raise RuntimeError("OUTLOOK_PROXY_URL/--proxy-url 为空")
 
-    source = str(source or "aimili-list").replace("-", "_")
+    parsed = urllib.parse.urlsplit(proxy_url)
 
-    parsed = urllib.parse.urlsplit(raw)
+    if str(parsed.scheme or "").lower() not in {"http", "https"} or not parsed.netloc:
 
-    path = parsed.path.rstrip("/")
+        raise RuntimeError(f"代理列表地址仅支持 http/https: {proxy_url}")
 
-    if path.startswith("/api/pool"):
-
-        if source == "aimili_random" and path.endswith("/proxies"):
-
-            path = path + "/random"
-
-        elif source == "aimili_list" and path.endswith("/proxies/random"):
-
-            path = path[: -len("/random")]
-
-        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
-
-    suffix = "/api/pool/proxies/random" if source == "aimili_random" else "/api/pool/proxies"
-
-    return raw + suffix
-
-
-
-
-
-def _aimili_api_json(pool_url, token, source, timeout=12):
-
-    url = _aimili_endpoint(pool_url, source)
-
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-
-    if token:
-
-        req.add_header("Authorization", f"Bearer {token}")
+    req = urllib.request.Request(proxy_url, headers={
+        "Accept": "text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/138.0.0.0 Safari/537.36"
+        ),
+    })
 
     with urllib.request.urlopen(req, timeout=timeout) as resp:
 
         data = resp.read().decode("utf-8", errors="replace")
 
-    return json.loads(data)
-
-
-
-
-
-def _aimili_proxy_entry_to_ruoyi(item):
-
-    if not isinstance(item, dict):
-
-        return ""
-
-    for key in ("socks5", "http"):
-
-        value = item.get(key)
-
-        if value:
-
-            normalized = _proxy_url_to_ruoyi(value)
-
-            if normalized:
-
-                return normalized
-
-    host = item.get("host") or item.get("public_host")
-
-    port = item.get("port")
-
-    if host and port:
-
-        user = item.get("username") or ""
-
-        pwd = item.get("password") or ""
-
-        return f"{host}:{port}:{user}:{pwd}" if (user or pwd) else f"{host}:{port}"
-
-    return ""
-
-
-
-
-
-def fetch_aimili_proxy_list(pool_url, token=""):
-
-    data = _aimili_api_json(pool_url, token, "aimili_list")
-
-    proxies = data.get("proxies") if isinstance(data, dict) else None
-
-    out = []
-
-    for item in proxies or []:
-
-        proxy = _aimili_proxy_entry_to_ruoyi(item)
-
-        if proxy:
-
-            out.append(proxy)
-
-    return out
-
-
-
-
-
-def fetch_aimili_proxy_random(pool_url, token=""):
-
-    """Aimili random 接口：返回 0~1 条。"""
-
-    data = _aimili_api_json(pool_url, token, "aimili_random")
-
-    item = data.get("proxy") if isinstance(data, dict) else None
-
-    proxy = _aimili_proxy_entry_to_ruoyi(item)
-
-    if not proxy:
-
-        raise RuntimeError(f"Aimili random API 未返回可用代理: {data}")
-
-    return [proxy]
+    return _parse_proxy_lines(data.splitlines(), proxy_url)
 
 
 
@@ -1681,23 +1790,13 @@ def fetch_aimili_proxy_random(pool_url, token=""):
 
 def _proxy_source_label(args):
 
-    has_file = bool(str(getattr(args, "proxy_file", "") or PROXY_FILE).strip())
+    source = str(getattr(args, "proxy_source", "") or RUOYI_PROXY_SOURCE or "file").strip().lower()
 
-    has_aimili = bool(str(getattr(args, "aimili_url", "") or getattr(args, "aimili_base_url", "") or AIMILI_POOL_URL).strip())
+    if source in {"file", "http"}:
 
-    if has_file and has_aimili:
+        return source
 
-        return "file+aimili-list"
-
-    if has_aimili:
-
-        return "aimili-list"
-
-    if has_file:
-
-        return "file"
-
-    return "empty"
+    return "file"
 
 
 
@@ -1705,19 +1804,24 @@ def _proxy_source_label(args):
 
 def load_proxy_list(args):
 
-    """统一代理 list：本地文件 + Aimili 列表接口一起加载。"""
+    """按当前来源加载代理 list。"""
 
-    out = parse_proxy_pool(getattr(args, "proxy_file", "") or PROXY_FILE)
+    source = _proxy_source_label(args)
+    proxy_url = str(getattr(args, "proxy_url", "") or PROXY_URL).strip()
 
-    pool_url = getattr(args, "aimili_url", "") or getattr(args, "aimili_base_url", "") or AIMILI_POOL_URL
+    if source == "http":
 
-    token = getattr(args, "aimili_token", "") or AIMILI_POOL_TOKEN
+        return fetch_proxy_list_http(proxy_url)
 
-    if str(pool_url or "").strip():
+    batch = parse_proxy_pool(getattr(args, "proxy_file", "") or PROXY_FILE)
 
-        out.extend(fetch_aimili_proxy_list(pool_url, token))
+    if batch or not proxy_url:
 
-    return out
+        return batch
+
+    log("proxy source=file 但本地代理文件为空，回退到 proxy-url HTTP 列表", "WARN")
+
+    return fetch_proxy_list_http(proxy_url)
 
 
 
@@ -1779,9 +1883,9 @@ class ConsumableProxyPool:
 
             proxy_file=getattr(args, "proxy_file", "") or PROXY_FILE,
 
-            aimili_url=getattr(args, "aimili_url", "") or getattr(args, "aimili_base_url", "") or AIMILI_POOL_URL,
+            proxy_source=getattr(args, "proxy_source", "") or RUOYI_PROXY_SOURCE,
 
-            aimili_token=getattr(args, "aimili_token", "") or AIMILI_POOL_TOKEN,
+            proxy_url=getattr(args, "proxy_url", "") or PROXY_URL,
 
         )
 
@@ -3528,6 +3632,19 @@ def _on_signup_form(url):
     low = (url or "").lower()
 
     return "signup.live.com" in low and "privacynotice" not in low
+
+
+def _captcha_signup_url_changed(signup_url, current_url):
+
+    before = str(signup_url or "").strip().lower()
+
+    now = str(current_url or "").strip().lower()
+
+    if not before or not now or before == now:
+
+        return False
+
+    return _on_signup_form(before) and any(host in now for host in ("live.com", "microsoft.com", "outlook"))
 
 
 
@@ -8481,7 +8598,10 @@ def _proxy_for_ip_lookup(proxy_pool, tag):
 
     auth = f"{user}:{pwd}@" if (user or pwd) else ""
 
-    proxy_url = f"socks5h://{auth}{p['host']}:{p['port']}"
+    scheme = str(p.get("scheme") or "socks5").strip().lower() or "socks5"
+    if scheme in {"socks", "socks5"}:
+        scheme = "socks5h"
+    proxy_url = f"{scheme}://{auth}{p['host']}:{p['port']}"
 
     return {"http": proxy_url, "https": proxy_url}
 
@@ -8583,15 +8703,13 @@ def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT)
 
         return True
 
-    identity = _probe_proxy_identity(proxy_pool, timeout=max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT)))
+    result = _probe_proxy_targets(proxy_pool, timeout=max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT)))
 
-    if identity and identity.get("ip"):
-
-        country_text = str(identity.get("country") or "UNKNOWN").strip() or "UNKNOWN"
+    if result:
 
         log(
 
-            f"  {tag} proxy precheck ok: ip={identity['ip']!r} country={country_text!r} via {identity.get('source')} url={PROXY_PRECHECK_URL}",
+            f"  {tag} proxy precheck ok: target={result['url']} status={result['status_code']}",
 
             "INFO",
 
@@ -8599,9 +8717,111 @@ def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT)
 
         return True
 
-    log(f"  {tag} proxy precheck failed: unable to resolve exit IP via {PROXY_PRECHECK_URL}", "WARN")
+    log(f"  {tag} proxy precheck failed: target unreachable via proxy targets={','.join(PROXY_PRECHECK_TARGETS)}", "WARN")
 
     return False
+
+
+def _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag):
+
+    if not email or not password:
+
+        return False
+
+    extract_graph = getattr(helpers, "extract_graph_token_http", None)
+
+    if not callable(extract_graph):
+
+        log(f"  {tag} loading timeout fallback skipped: extract_graph_token_http unavailable", "WARN")
+
+        return False
+
+    log(f"  {tag} Microsoft Loading timeout fallback -> Graph token extracting…", "WARN")
+
+    try:
+
+        graph = extract_graph(email, password, idx, 3, None)
+
+    except Exception as exc:
+
+        log(f"  {tag} loading timeout graph fallback failed: {type(exc).__name__}: {exc}", "WARN")
+
+        return False
+
+    if not graph or not graph.get("refresh_token"):
+
+        log(f"  {tag} loading timeout graph fallback missing refresh_token", "WARN")
+
+        return False
+
+    setattr(opts, "_ruoyi_graph_fallback", graph)
+
+    log(f"  {tag} loading timeout fallback confirmed account via Graph token", "OK")
+
+    return True
+
+
+
+
+def _probe_proxy_targets(proxy_pool, timeout=PROXY_PRECHECK_TIMEOUT):
+
+    proxies = _proxy_for_ip_lookup(proxy_pool, "[proxy-precheck]")
+
+    if not proxies:
+
+        return None
+
+    session = requests.Session()
+
+    session.trust_env = False
+
+    request_timeout = max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT))
+
+    for target_url in PROXY_PRECHECK_TARGETS:
+
+        try:
+
+            resp = session.get(
+
+                target_url,
+
+                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+
+                proxies=proxies,
+
+                timeout=request_timeout,
+
+                allow_redirects=False,
+
+                stream=True,
+
+            )
+
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+
+            try:
+
+                resp.close()
+
+            except Exception:
+
+                pass
+
+            if 100 <= status_code < 500:
+
+                return {
+
+                    "url": target_url,
+
+                    "status_code": status_code,
+
+                }
+
+        except Exception:
+
+            continue
+
+    return None
 
 
 
@@ -8847,11 +9067,13 @@ def register_outlook(opts, proxy_pool, idx):
     profile_dir = _ruoyi_profile_dir(opts, idx)
     tb.set_profile(profile_dir)
 
-    if proxy_pool:
+    selected_browser_proxy = str(proxy_pool[0] or "").strip() if proxy_pool else ""
 
-        tb.set_per_tab_proxies(proxy_pool, exhausted="wrap")
+    if selected_browser_proxy:
 
-        log(f"挂载 {len(proxy_pool)} 条 SOCKS5 代理到 per-tab 池(wrap 轮换)")
+        tb.set_proxy(selected_browser_proxy)
+
+        # log(f"挂载浏览器代理: {mask_ruoyi_proxy(selected_browser_proxy)}")
 
     else:
 
@@ -8954,6 +9176,8 @@ def register_outlook(opts, proxy_pool, idx):
     press_count = 0
 
     captcha_started = None
+
+    captcha_signup_url = ""
 
     no_target_rounds = 0
 
@@ -9343,6 +9567,12 @@ def register_outlook(opts, proxy_pool, idx):
 
                 return _finish(reason="blocked")
 
+            if had_captcha and _captcha_signup_url_changed(captcha_signup_url, current_url):
+
+                log(f"  {tag} captcha passed, signup url changed -> {current_url[:70]}")
+
+                break
+
 
 
             if _maybe_skip_passkey(page, tag):
@@ -9414,6 +9644,10 @@ def register_outlook(opts, proxy_pool, idx):
                 if loading_timed_out:
 
                     waited = int(loop_now - (microsoft_loading_wait_started or loop_now))
+
+                    if _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag):
+
+                        break
 
                     log(f"  {tag} Microsoft Loading stuck for {waited}s, give up", "WARN")
 
@@ -9598,6 +9832,10 @@ def register_outlook(opts, proxy_pool, idx):
             if visible and actionable:
 
                 validation_wait_started = None
+
+                if not captcha_signup_url:
+
+                    captcha_signup_url = current_url
 
                 had_captcha = True
 
@@ -9929,6 +10167,8 @@ def register_outlook(opts, proxy_pool, idx):
 
         _untrack_browser_page(browser_page)
 
+        _cleanup_ruoyi_run_profile_dir(profile_dir)
+
         clear_fn = getattr(helpers, "clear_account_generation_options", None)
 
         if callable(clear_fn):
@@ -9999,17 +10239,25 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
 
 
-async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics):
+async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=None):
 
     tag = f"#{idx}"
 
-    log(f"{tag} Graph token extracting…", "INFO")
+    if graph and graph.get("refresh_token"):
 
-    # Graph 授权强制直连：不挂注册代理，extract_graph_token_http 传 proxy_str=None。
+        log(f"{tag} Graph token extracting…", "INFO")
 
-    log(f"{tag} graph proxy -> direct", "INFO")
+        log(f"{tag} graph fallback -> reuse", "INFO")
 
-    graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, None)
+    else:
+
+        log(f"{tag} Graph token extracting…", "INFO")
+
+        # Graph 授权强制直连：不挂注册代理，extract_graph_token_http 传 proxy_str=None。
+
+        log(f"{tag} graph proxy -> direct", "INFO")
+
+        graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, None)
 
     if not graph or not graph.get("refresh_token"):
 
@@ -10090,6 +10338,8 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
     fail_reason = "failure"
 
+    fallback_graph = None
+
     try:
 
         remaining = max(0.0, overall_deadline - time.perf_counter())
@@ -10100,6 +10350,7 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
         if ruoyi_slot is not None:
             run_args.ruoyi_slot = ruoyi_slot
         result = await asyncio.to_thread(register_outlook, run_args, selected_pool, idx)
+        fallback_graph = getattr(run_args, "_ruoyi_graph_fallback", None)
 
         if isinstance(result, tuple) and len(result) >= 4:
 
@@ -10157,9 +10408,11 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
             "px_metrics": px_metrics,
 
+            "graph": fallback_graph,
+
         }
 
-    return await _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics)
+    return await _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=fallback_graph)
 
 
 
@@ -10275,6 +10528,7 @@ async def _run_direct_batch(args, helpers, consumable_pool):
                 save_lock,
                 reg_result["started"],
                 reg_result["px_metrics"],
+                graph=reg_result.get("graph"),
             )
 
         return reg_result
@@ -10292,7 +10546,6 @@ async def _run_direct_batch(args, helpers, consumable_pool):
         consumable_pool.stop()
 
         set_consumable_proxy_pool(None)
-        log(f"ruoyi profile 缓存保留，需手动清理: {RUOYI_PROFILE_ROOT}", "INFO")
 
     statuses = [r[0] if isinstance(r, tuple) else r for r in results]
 
@@ -10328,17 +10581,13 @@ def main():
 
     ap.add_argument("--proxy-source", default=RUOYI_PROXY_SOURCE,
 
-                    choices=["file", "aimili-random", "aimili-list"],
+                    choices=["file", "http"],
 
-                    help="ruoyi 代理来源：file=本地文件；aimili-random=Aimili 随机接口；aimili-list=Aimili 列表。启动装 list，注册取删，空则重载")
+                    help="ruoyi 代理来源：file=本地代理文件；http=HTTP GET 拉取 txt 代理列表。启动装 list，注册随机取删，空则重载")
 
-    ap.add_argument("--aimili-url", default=AIMILI_POOL_URL,
+    ap.add_argument("--proxy-url", default=PROXY_URL,
 
-                    help="AimiliVPN URL：可填管理端根地址 http://host:8787，也可直接填 /api/pool/proxies 或 /api/pool/proxies/random 完整地址")
-
-    ap.add_argument("--aimili-token", default=AIMILI_POOL_TOKEN,
-
-                    help="AimiliVPN 代理池 API Token")
+                    help="HTTP GET 代理列表地址，返回 txt；每行一个代理")
 
     ap.add_argument("--count", "-n", type=int, default=1, help="注册次数(默认 1)")
 

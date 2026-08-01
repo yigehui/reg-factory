@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import register_outlook_ruoyi as mod
@@ -26,6 +27,73 @@ class WaitStateTimeoutTests(unittest.TestCase):
 
     def test_post_press_reappear_wait_skips_when_not_awaiting_result(self):
         self.assertFalse(mod._should_enter_post_press_reappear_wait(False, 3, 3))
+
+
+class CaptchaSuccessUrlTests(unittest.TestCase):
+    def test_captcha_url_change_treats_signup_transition_as_success(self):
+        self.assertTrue(
+            mod._captcha_signup_url_changed(
+                "https://signup.live.com/signup?lic=1",
+                "https://signup.live.com/?lic=1&uaid=next-step",
+            )
+        )
+
+    def test_captcha_url_change_ignores_same_signup_url(self):
+        self.assertFalse(
+            mod._captcha_signup_url_changed(
+                "https://signup.live.com/signup?lic=1",
+                "https://signup.live.com/signup?lic=1",
+            )
+        )
+
+
+class UserAgentPoolTests(unittest.TestCase):
+    def test_default_ua_pool_has_ten_entries(self):
+        with patch.dict(mod.os.environ, {"OUTLOOK_RUOYI_UA_POOL": ""}, clear=False):
+            self.assertEqual(10, len(mod._load_ua_pool()))
+
+
+class LoadingTimeoutFallbackTests(unittest.TestCase):
+    def test_loading_timeout_graph_fallback_saves_graph_on_success(self):
+        opts = SimpleNamespace()
+        helpers = SimpleNamespace(
+            extract_graph_token_http=lambda email, password, idx, retries, proxy: {
+                "refresh_token": "rt",
+                "client_id": "cid",
+            }
+        )
+
+        self.assertTrue(
+            mod._loading_timeout_graph_fallback(
+                helpers,
+                opts,
+                "foo@outlook.com",
+                "Pass1!",
+                9,
+                "[#9][ruoyi]",
+            )
+        )
+        self.assertEqual("rt", opts._ruoyi_graph_fallback["refresh_token"])
+
+    def test_loading_timeout_graph_fallback_fails_without_refresh_token(self):
+        opts = SimpleNamespace()
+        helpers = SimpleNamespace(
+            extract_graph_token_http=lambda email, password, idx, retries, proxy: {
+                "refresh_token": "",
+            }
+        )
+
+        self.assertFalse(
+            mod._loading_timeout_graph_fallback(
+                helpers,
+                opts,
+                "foo@outlook.com",
+                "Pass1!",
+                9,
+                "[#9][ruoyi]",
+            )
+        )
+        self.assertFalse(hasattr(opts, "_ruoyi_graph_fallback"))
 
 
 class MicrosoftLoadingGuardTests(unittest.TestCase):

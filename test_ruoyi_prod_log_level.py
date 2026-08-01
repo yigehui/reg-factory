@@ -41,7 +41,7 @@ class ProdLogLevelTests(unittest.TestCase):
             'PROD',
             [
                 ('开始: count=1 concurrency=1 launch_stagger=10s ua_pool=6 timeout=150s', 'INFO'),
-                ('proxy list ready: source=file+aimili-list size=87', 'INFO'),
+                ('proxy list ready: source=http size=87', 'INFO'),
                 ('========== 注册 #1/1 ==========', 'INFO'),
                 ('#1 代理 -> socks5://yigehui...@163.192.58.188:52025', 'INFO'),
                 ('  [#1][ruoyi] signup entry DOM step=email', 'INFO'),
@@ -57,7 +57,7 @@ class ProdLogLevelTests(unittest.TestCase):
         )
         rendered = '\n'.join(lines)
         self.assertIn('开始: count=1 concurrency=1 launch_stagger=10s ua_pool=6 timeout=150s', rendered)
-        self.assertIn('proxy list ready: source=file+aimili-list size=87', rendered)
+        self.assertIn('proxy list ready: source=http size=87', rendered)
         self.assertIn('========== 注册 #1/1 ==========', rendered)
         self.assertIn('#1 代理 -> socks5://yigehui...@163.192.58.188:52025', rendered)
         self.assertNotIn('signup entry DOM step=email', rendered)
