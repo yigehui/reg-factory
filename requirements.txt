@@ -1,6 +1,7 @@
 playwright
 ruyipage
 requests
+pysocks
 aiohttp
 curl_cffi
 Appium-Python-Client>=4.0.0

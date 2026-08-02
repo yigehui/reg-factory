@@ -378,11 +378,21 @@ def _test_firefox():
         return False, f"firefox.fun 请求失败：{str(e)[:80]}"
 
 
+def _test_tg():
+    """测 Telegram：getMe 验证 bot token + 代理可达性(不发消息，不校验 chat_id)。
+    复用 common.notify.test_tg_connection，支持 http/socks5(h) 代理与代理认证。"""
+    from common.notify import test_tg_connection
+    token = _read_config_val("TG_BOT_TOKEN", "")
+    proxy = _read_config_val("TG_PROXY", "")
+    return test_tg_connection(token, proxy)
+
+
 _TESTERS = {
     "clash": _test_clash,
     "bitbrowser": _test_bitbrowser,
     "smsman": _test_smsman,
     "firefox": _test_firefox,
+    "tg": _test_tg,
 }
 
 

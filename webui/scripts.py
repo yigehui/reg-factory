@@ -235,6 +235,10 @@ SCRIPTS = [
             {"flag": "--no-verify", "type": "bool", "default": False, "help": "注册后不校验 Outlook 登录"},
             {"flag": "--confirm-before-register", "type": "bool", "default": False,
              "help": "注册页打开后自动点确认，再开始填写"},
+            {"flag": "--loop", "type": "bool", "default": False,
+             "help": "循环养号：跑完一批等待间隔后继续下一批，直到停止(Ctrl-C 或停止按钮)"},
+            {"flag": "--loop-interval", "type": "int", "default": 300,
+             "help": "循环养号两批间隔秒数(默认 300=5 分钟)"},
         ],
     },
     {
@@ -463,6 +467,12 @@ ENV_SCHEMA = [
         {"key": "VOTE_GPT_KEY", "secret": True, "help": "投票网关 gpt key"},
         {"key": "VOTE_OPUS_BASE", "help": "claude opus 专用网关"},
         {"key": "VOTE_OPUS_KEY", "secret": True, "help": "opus 网关 key"},
+    ]},
+    {"group": "Telegram 通知", "tests": [{"target": "tg", "label": "测试 Telegram"}], "items": [
+        {"key": "TG_BOT_TOKEN", "secret": True,
+         "help": "bot token；配置后各流程(如 ruoyi 循环养号)把汇总发到该 chat"},
+        {"key": "TG_CHAT_ID", "help": "目标 chat id，与 bot token 配合使用"},
+        {"key": "TG_PROXY", "help": "TG 走的 HTTP 代理(国内网络必填)，如 http://127.0.0.1:7897"},
     ]},
 ]
 

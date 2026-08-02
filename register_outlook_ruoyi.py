@@ -36,6 +36,8 @@ import argparse
 
 import asyncio
 
+import atexit
+
 from contextlib import contextmanager
 
 import importlib.util
@@ -51,6 +53,8 @@ import re
 import requests
 
 import shutil
+
+import subprocess
 
 import signal
 
@@ -73,6 +77,8 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 from config import _load_dotenv
+
+from common.notify import send_tg_message
 
 
 _load_dotenv()
@@ -111,7 +117,9 @@ RUOYI_PROFILE_ROOT = os.environ.get("OUTLOOK_RUOYI_PROFILE_ROOT", os.path.join(R
 
 RUOYI_PROFILE_STALE_SEC = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_STALE_SEC", "600") or "600")
 
-EMAIL_NOGRAPH = os.path.join(OUTPUT_DIR, "email_nograph.txt")
+# no_graph 账号累计文件，与 EMAILS_POOL 同级(ROOT 外层)，保持与成功号桥接 emails.txt 对称
+
+EMAIL_NOGRAPH = os.path.join(ROOT, "email_nograph.txt")
 
 EMAILS_POOL = os.path.join(ROOT, "emails.txt")
 
@@ -598,6 +606,34 @@ def _cleanup_ruoyi_run_profile_dir(profile_dir, profile_root=None):
 
 
 
+def _force_kill_ruoyi_firefox(log_fn=None):
+    """强杀所有以 RUOYI_FIREFOX_PATH 启动的 firefox.exe 进程(quit 超时残留兜底)。
+    按 ExecutablePath 过滤,不影响用户自己的 Firefox。仅在批次间隙(所有 slot 空闲)调用,
+    避免误杀同批正在运行的实例。返回杀掉的进程数。"""
+    if not RUOYI_FIREFOX_PATH or not os.path.isfile(RUOYI_FIREFOX_PATH):
+        return 0
+    lf = log_fn or log
+    norm = os.path.normpath(RUOYI_FIREFOX_PATH)
+    target = norm.replace("'", "''")
+    ps = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$t='%s'.ToLower();"
+        "$p=Get-Process firefox -ErrorAction SilentlyContinue;"
+        "if($p){$k=$p|Where-Object{$_.Path -and $_.Path.ToLower() -eq $t};"
+        "if($k){$n=@($k).Count; $k|Stop-Process -Force; Write-Output $n}}"
+    ) % target
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, text=True, timeout=15)
+        n = (out.stdout or "").strip()
+        if n and n.isdigit():
+            lf(f"ruoyi 残留 Firefox 强杀: {n} 个进程(按路径 {norm})", "OK")
+            return int(n)
+    except Exception as exc:
+        lf(f"ruoyi 残留 Firefox 强杀失败: {type(exc).__name__}: {exc}", "WARN")
+    return 0
+
+
 def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
 
     if browser_page is None:
@@ -899,6 +935,14 @@ def _should_keep_prod_log(msg, level):
         "result:",
 
         "授权结果:",
+
+        # TG 通知成败日志：PROD 下也保留，避免发送失败被静默吞掉无法诊断
+
+        "tg 通知",
+
+        "send_tg_message",
+
+        "tg 文本",
 
     )
 
@@ -1239,6 +1283,57 @@ def _format_batch_summary_lines(ok, no_graph, failed, total, total_elapsed, avg_
             )
 
     return lines
+
+
+# send_tg_message / Telegram 通知已抽到 common/notify.py，供多流程复用。
+
+
+def _count_account_lines(path):
+    """统计账号文件非空非注释行数(emails.txt / email_nograph.txt)。"""
+    if not path or not os.path.isfile(path):
+        return 0
+    try:
+        n = 0
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _notify_tg(args, summary_lines, batch_no=None):
+
+    """把批次汇总按日志同款前缀渲染后发 TG；未配置 token/chat_id 则跳过。"""
+
+    bot_token = getattr(args, "tg_bot_token", "") or os.environ.get("TG_BOT_TOKEN", "")
+
+    chat_id = getattr(args, "tg_chat_id", "") or os.environ.get("TG_CHAT_ID", "")
+
+    proxy = getattr(args, "tg_proxy", "") or os.environ.get("TG_PROXY", "")
+
+    if not bot_token or not chat_id or not summary_lines:
+
+        return
+
+    # TG 通知只发标题 + 摘要纯内容(去掉 SUMMARY:/SUMMARY_TIME: 前缀和日志前缀)，
+    # 过滤 DONE/PX_SUMMARY/PX_DETAIL(明细在日志里)，末尾追加 email/no_graph 累计总数。
+
+    head_lines = [ln for ln in summary_lines if str(ln).startswith("SUMMARY")]
+    lines = [ln.split(":", 1)[1].strip() if ":" in ln else ln for ln in head_lines]
+
+    if batch_no is not None:
+        lines.insert(0, f"🔁 ruoyi 养号 第 {batch_no} 批完成")
+    else:
+        lines.insert(0, "🔁 ruoyi 养号 注册完成")
+
+    lines.append(f"email 总数: {_count_account_lines(EMAILS_POOL)}")
+    lines.append(f"no_graph 总数: {_count_account_lines(EMAIL_NOGRAPH)}")
+
+    send_tg_message("\n".join(lines), bot_token, chat_id,
+                    proxy=proxy or None, log_fn=log)
 
 
 
@@ -2381,6 +2476,32 @@ def append_account_to_email_nograph(email, password):
         return False
 
 
+
+def _append_nograph_account(email, password, nograph_file):
+
+    """no_graph 账号写入 per-run accounts_ruoyi_nograph_{ts}.txt，与成功号 live_file 对称。"""
+
+    if not email or not password or not nograph_file:
+
+        return False
+
+    try:
+
+        os.makedirs(os.path.dirname(nograph_file) or OUTPUT_DIR, exist_ok=True)
+
+        with _interprocess_lock(nograph_file):
+
+            with open(nograph_file, "a", encoding="utf-8") as f:
+
+                f.write(f"{email}----{password}\n")
+
+        return True
+
+    except Exception as exc:
+
+        log(f"_append_nograph_account failed: {type(exc).__name__}: {exc}", "WARN")
+
+        return False
 
 
 
@@ -10159,7 +10280,7 @@ def register_outlook(opts, proxy_pool, idx):
 
             if browser_page is not None:
 
-                _quit_browser_page(browser_page, tag, timeout=min(BROWSER_QUIT_TIMEOUT, max(0.01, deadline - time.time())))
+                _quit_browser_page(browser_page, tag, timeout=BROWSER_QUIT_TIMEOUT)
 
         except Exception:
 
@@ -10264,6 +10385,12 @@ async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lo
         async with save_lock:
 
             await asyncio.to_thread(append_account_to_email_nograph, email, password)
+
+            nograph_file = getattr(args, "nograph_file", None)
+
+            if nograph_file:
+
+                await asyncio.to_thread(_append_nograph_account, email, password, nograph_file)
 
         total_elapsed = time.perf_counter() - started
 
@@ -10573,7 +10700,84 @@ async def _run_direct_batch(args, helpers, consumable_pool):
 
 
 
+class _TeeStdout:
+    """把 stdout 同时写到原 stdout 和日志文件；控制台/前端(SSE 读子进程 stdout)行为不变。"""
+
+    def __init__(self, original, file_handle):
+        self._orig = original
+        self._file = file_handle
+        self._lock = threading.Lock()
+        self.encoding = getattr(original, "encoding", "utf-8") or "utf-8"
+        self.errors = getattr(original, "errors", "replace")
+
+    def write(self, s):
+        try:
+            self._orig.write(s)
+        except Exception:
+            pass
+        if s:
+            with self._lock:
+                try:
+                    self._file.write(s)
+                    self._file.flush()
+                except Exception:
+                    pass
+        return len(s) if s else 0
+
+    def flush(self):
+        try:
+            self._orig.flush()
+        except Exception:
+            pass
+        with self._lock:
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return self._orig.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._orig.fileno()
+
+    def reconfigure(self, **kwargs):
+        try:
+            self._orig.reconfigure(**kwargs)
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+def _install_run_log_tee():
+    """脚本启动时把本次运行日志 tee 到 log/<YYYYMMDD_HHMMSS>.log。
+    控制台与前端 UI 输出不变；失败仅告警，不阻断主流程。返回日志文件路径或 None。"""
+    try:
+        log_dir = os.path.join(ROOT, "log")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(log_dir, f"{ts}.log")
+        fh = open(path, "w", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStdout(sys.stdout, fh)
+        atexit.register(lambda: fh.close() if not fh.closed else None)
+        sys.stdout.write(f"===== 本次运行日志 {ts} =====\n")
+        return path
+    except Exception as exc:
+        try:
+            print(f"_install_run_log_tee failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+        return None
+
+
 def main():
+
+    _install_run_log_tee()
 
     ap = argparse.ArgumentParser(description="Outlook 自注册养号(ruoyi) — 完整链路版")
 
@@ -10695,6 +10899,28 @@ def main():
 
     )
 
+    ap.add_argument("--loop", action="store_true",
+
+                    help="循环养号：跑完一批后等待 --loop-interval 秒继续下一批，直到被停止(Ctrl-C 或 webui 停止)")
+
+    ap.add_argument("--loop-interval", type=int,
+
+                    default=int(os.environ.get("OUTLOOK_LOOP_INTERVAL", "300") or "300"),
+
+                    help="循环养号两批之间的等待秒数(默认 300=5 分钟)")
+
+    ap.add_argument("--tg-bot-token", default=os.environ.get("TG_BOT_TOKEN", ""),
+
+                    help="Telegram bot token，配置后每批完成把汇总发到 TG；留空不发")
+
+    ap.add_argument("--tg-chat-id", default=os.environ.get("TG_CHAT_ID", ""),
+
+                    help="Telegram chat id，与 --tg-bot-token 配合使用")
+
+    ap.add_argument("--tg-proxy", default=os.environ.get("TG_PROXY", ""),
+
+                    help="Telegram 走的 HTTP 代理，如 http://127.0.0.1:7897；国内网络必填，否则 api.telegram.org 直连不通")
+
     args = ap.parse_args()
 
     set_log_level(args.log_level)
@@ -10747,7 +10973,53 @@ def main():
 
 
 
+    loop_mode = bool(getattr(args, "loop", False))
+
+    loop_interval = max(0, int(getattr(args, "loop_interval", 300) or 0))
+
+    if loop_mode:
+
+        log(f"循环养号模式: count={args.count} 间隔 {loop_interval}s，Ctrl-C 或 webui 停止可中断", "OK")
+
+        batch_no = 0
+
+        try:
+
+            while True:
+
+                batch_no += 1
+
+                log(f"===== 循环第 {batch_no} 批开始 =====", "OK")
+
+                summary_lines = _run_one_batch(args, helpers, consumable_pool, stagger_val)
+
+                _notify_tg(args, summary_lines, batch_no=batch_no)
+
+                log(f"第 {batch_no} 批完成，等待 {loop_interval}s 后继续下一批…", "OK")
+
+                if loop_interval > 0:
+
+                    time.sleep(loop_interval)
+
+        except KeyboardInterrupt:
+
+            log(f"循环养号已停止(共 {batch_no} 批)", "OK")
+
+    else:
+
+        summary_lines = _run_one_batch(args, helpers, consumable_pool, stagger_val)
+
+        _notify_tg(args, summary_lines)
+
+
+
+def _run_one_batch(args, helpers, consumable_pool, stagger_val):
+
+    """跑一批注册并打印汇总；返回汇总行列表(供 TG 通知复用)。"""
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    _force_kill_ruoyi_firefox()  # 批次开始前强杀上批残留 Firefox(防 XPCOM 加载失败)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -10755,11 +11027,13 @@ def main():
 
     token_file = os.path.join(OUTPUT_DIR, f"graph_tokens_ruoyi_{ts}.json")
 
+    nograph_file = os.path.join(OUTPUT_DIR, f"accounts_ruoyi_nograph_{ts}.txt")
+
     args.live_file = live_file
 
     args.token_file = token_file
 
-
+    args.nograph_file = nograph_file
 
     log(
 
@@ -10775,7 +11049,9 @@ def main():
 
     # 多行汇总：WebUI 正则 + 人眼可读中文都覆盖
 
-    for line in _format_batch_summary_lines(ok, no_graph, failed, total, batch_total_elapsed, avg_success_elapsed, px_stats):
+    summary_lines = _format_batch_summary_lines(ok, no_graph, failed, total, batch_total_elapsed, avg_success_elapsed, px_stats)
+
+    for line in summary_lines:
 
         log(line, "OK")
 
@@ -10787,13 +11063,19 @@ def main():
 
         log(f"Token 输出: {token_file}")
 
+    if os.path.isfile(nograph_file):
+
+        log(f"未授权账号输出: {nograph_file}")
+
     if no_graph and os.path.isfile(EMAIL_NOGRAPH):
 
         log(f"未授权输出: {EMAIL_NOGRAPH}")
 
-
-
     log(f"email_nograph: {EMAIL_NOGRAPH}")
+
+    _force_kill_ruoyi_firefox()  # 批次结束强杀本批残留 Firefox(防累积导致 XPCOM)
+
+    return summary_lines
 
 
 
