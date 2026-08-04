@@ -33,10 +33,10 @@ class GraphDirectFallbackTests(unittest.TestCase):
         with p1, p2, p3:
             result = standalone.extract_graph_token_http("a@b.com", "p", 1, attempts=3, proxy_str=PROXY)
 
-        # 3 次代理 + 2 次直连回退
-        self.assertEqual(len(calls), 5)
+        # 3 次代理 + 3 次直连回退
+        self.assertEqual(len(calls), 6)
         self.assertEqual(calls[:3], [_proxies_for(PROXY)] * 3)
-        self.assertEqual(calls[3:], [None, None])
+        self.assertEqual(calls[3:], [None, None, None])
         self.assertIsNone(result)
 
     def test_proxy_mode_succeeds_no_fallback(self):

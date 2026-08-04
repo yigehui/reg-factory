@@ -742,7 +742,7 @@ GRAPH_CLIENT_ID = "27922004-5251-4030-b22d-91ecd9a37ea4"
 GRAPH_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read"
 # 代理授权全失败后，回退直连的重试次数（短退避）；直连模式不触发，仍按 attempts 重试。
-GRAPH_DIRECT_FALLBACK_ATTEMPTS = 2
+GRAPH_DIRECT_FALLBACK_ATTEMPTS = 3
 
 
 def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None):
