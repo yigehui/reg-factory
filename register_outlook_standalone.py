@@ -736,13 +736,16 @@ async def inject_arkose_token(page, token):
 GRAPH_CLIENT_ID = "27922004-5251-4030-b22d-91ecd9a37ea4"
 GRAPH_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read"
+# 代理授权全失败后，回退直连的重试次数（短退避）；直连模式不触发，仍按 attempts 重试。
+GRAPH_DIRECT_FALLBACK_ATTEMPTS = 2
 
 
 def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None):
     """Extract Graph refresh_token through the shared pure-HTTP OAuth flow.
 
-    Graph 授权一律直连（proxies=None + trust_env=False）。
-    proxy_str 仅保留兼容签名，注册代理不带到授权链路。
+    proxy_str 为空 -> 直连（proxies=None + trust_env=False），重试 attempts 次。
+    proxy_str 非空 -> 走该代理重试 attempts 次；全部失败后回退直连再重试
+    GRAPH_DIRECT_FALLBACK_ATTEMPTS 次（短退避），避免代理故障导致拿不到 token。
     """
     try:
         from extract_graph_tokens import get_graph_token
@@ -750,25 +753,44 @@ def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None)
         print(f"  [#{idx}] [graph] import error: {exc}")
         return None
 
-    if proxy_str:
-        print(f"  [#{idx}] [graph] ignore reg proxy; force direct")
-    for attempt in range(attempts):
-        try:
-            print(f"  [#{idx}] [graph] attempt {attempt + 1}/{attempts} proxy=direct")
-            # 强制直连：不传 proxies，session.trust_env=False 已在 get_graph_token 内保证。
-            res = get_graph_token(email, password, idx, proxies=None)
-        except Exception as exc:
-            print(f"  [#{idx}] [graph] attempt {attempt + 1}/{attempts} error: {exc}")
-            res = None
-        if res and res.get("refresh_token"):
-            return {
-                "refresh_token": res["refresh_token"],
-                "client_id": res.get("client_id") or "",
-            }
-        if attempt < attempts - 1:
-            print(f"  [#{idx}] [graph] no refresh_token on attempt {attempt + 1}/{attempts}; direct retry...")
-            time.sleep(3 * (attempt + 1))
-    return None
+    proxies = _proxy_for_requests(proxy_str) if proxy_str else None
+    if proxies:
+        print(f"  [#{idx}] [graph] use reg proxy for auth")
+    else:
+        print(f"  [#{idx}] [graph] direct (no proxy)")
+
+    def _run_attempts(count, label, current_proxies, backoff_base):
+        for attempt in range(count):
+            try:
+                print(f"  [#{idx}] [graph] attempt {attempt + 1}/{count} proxy={label}")
+                # trust_env=False 已在 get_graph_token 内保证；proxies=None 即直连。
+                res = get_graph_token(email, password, idx, proxies=current_proxies)
+            except Exception as exc:
+                print(f"  [#{idx}] [graph] attempt {attempt + 1}/{count} error: {exc}")
+                res = None
+            if res and res.get("refresh_token"):
+                return {
+                    "refresh_token": res["refresh_token"],
+                    "client_id": res.get("client_id") or "",
+                }
+            if attempt < count - 1:
+                print(f"  [#{idx}] [graph] no refresh_token on attempt {attempt + 1}/{count}; retry...")
+                time.sleep(backoff_base * (attempt + 1))
+        return None
+
+    # 直连模式：只走直连 attempts 次，行为与原先一致（不触发回退）。
+    if not proxies:
+        return _run_attempts(attempts, "direct", None, 3)
+
+    # 代理模式：先走代理 attempts 次，全失败再回退直连 GRAPH_DIRECT_FALLBACK_ATTEMPTS 次（短退避）。
+    result = _run_attempts(attempts, "reg", proxies, 3)
+    if result:
+        return result
+    print(
+        f"  [#{idx}] [graph] reg proxy exhausted after {attempts} attempts, "
+        f"fallback to direct {GRAPH_DIRECT_FALLBACK_ATTEMPTS}x"
+    )
+    return _run_attempts(GRAPH_DIRECT_FALLBACK_ATTEMPTS, "direct", None, 2)
 
 
 async def extract_graph_token(page, context, email, password, idx=0):

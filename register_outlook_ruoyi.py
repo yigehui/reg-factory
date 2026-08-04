@@ -8843,7 +8843,7 @@ def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT)
     return False
 
 
-def _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag):
+def _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag, reg_proxy=None):
 
     if not email or not password:
 
@@ -8859,9 +8859,11 @@ def _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag):
 
     log(f"  {tag} Microsoft Loading timeout fallback -> Graph token extracting…", "WARN")
 
+    auth_proxy_str = _resolve_graph_auth_proxy(opts, reg_proxy, tag)
+
     try:
 
-        graph = extract_graph(email, password, idx, 3, None)
+        graph = extract_graph(email, password, idx, 3, auth_proxy_str)
 
     except Exception as exc:
 
@@ -9766,7 +9768,7 @@ def register_outlook(opts, proxy_pool, idx):
 
                     waited = int(loop_now - (microsoft_loading_wait_started or loop_now))
 
-                    if _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag):
+                    if _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag, reg_proxy=selected_browser_proxy):
 
                         break
 
@@ -10360,7 +10362,35 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
 
 
-async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=None):
+def _resolve_graph_auth_proxy(args_or_opts, reg_proxy, tag):
+
+    """授权是否复用注册代理。
+
+    返回传给 extract_graph_token_http 的 proxy_str（已归一化为 scheme://user:pass@host:port）。
+
+    未开启选项或无代理时返回 None（直连，保持原行为）。
+    """
+
+    if not getattr(args_or_opts, "graph_auth_use_reg_proxy", False):
+
+        return None
+
+    if not reg_proxy:
+
+        return None
+
+    proxies = _proxy_for_ip_lookup([reg_proxy], tag)
+
+    if not proxies:
+
+        return None
+
+    return proxies.get("https") or proxies.get("http")
+
+
+
+
+async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=None, reg_proxy=None):
 
     tag = f"#{idx}"
 
@@ -10374,11 +10404,17 @@ async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lo
 
         log(f"{tag} Graph token extracting…", "INFO")
 
-        # Graph 授权强制直连：不挂注册代理，extract_graph_token_http 传 proxy_str=None。
+        auth_proxy_str = _resolve_graph_auth_proxy(args, reg_proxy, f"[{tag}]")
 
-        log(f"{tag} graph proxy -> direct", "INFO")
+        if auth_proxy_str:
 
-        graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, None)
+            log(f"{tag} graph proxy -> reg {mask_ruoyi_proxy(reg_proxy)}", "INFO")
+
+        else:
+
+            log(f"{tag} graph proxy -> direct", "INFO")
+
+        graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, auth_proxy_str)
 
     if not graph or not graph.get("refresh_token"):
 
@@ -10537,9 +10573,11 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
 
             "graph": fallback_graph,
 
+            "reg_proxy": selected_proxy,
+
         }
 
-    return await _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=fallback_graph)
+    return await _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=fallback_graph, reg_proxy=selected_proxy)
 
 
 
@@ -10656,6 +10694,7 @@ async def _run_direct_batch(args, helpers, consumable_pool):
                 reg_result["started"],
                 reg_result["px_metrics"],
                 graph=reg_result.get("graph"),
+                reg_proxy=reg_result.get("reg_proxy"),
             )
 
         return reg_result
@@ -10832,6 +10871,12 @@ def main():
     ap.add_argument("--max-press", default=os.environ.get("OUTLOOK_REG_MAX_PRESS", "5"), help="按住次数上限")
 
     ap.add_argument("--no-verify", action="store_true", help="跳过 Outlook 登录校验")
+
+    ap.add_argument("--graph-auth-use-reg-proxy", action="store_true",
+
+                    default=_env_bool("OUTLOOK_RUOYI_GRAPH_AUTH_REG_PROXY", False),
+
+                    help="Graph 授权复用注册代理；默认关闭(直连授权)，开启后按当前账号注册代理走授权")
 
     ap.add_argument("--confirm-before-register", action="store_true", help="页面打开后先尝试点确认")
 

@@ -63,3 +63,4 @@ profiles_ruoyi_tmp/
 log/
 email_nograph.txt
 emails.txt.lock
+email_nograph.txt.lock

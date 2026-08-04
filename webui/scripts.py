@@ -233,6 +233,8 @@ SCRIPTS = [
             {"flag": "--password-format", "type": "str", "default": "",
              "help": "随机密码模板，如 Aa1!{rand:12}；留空用默认随机"},
             {"flag": "--no-verify", "type": "bool", "default": False, "help": "注册后不校验 Outlook 登录"},
+            {"flag": "--graph-auth-use-reg-proxy", "type": "bool", "default": False,
+             "help": "Graph 授权复用注册代理；默认直连授权，开启后按当前账号注册代理授权"},
             {"flag": "--confirm-before-register", "type": "bool", "default": False,
              "help": "注册页打开后自动点确认，再开始填写"},
             {"flag": "--loop", "type": "bool", "default": False,
