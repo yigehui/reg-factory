@@ -221,6 +221,8 @@ class BitBrowserClient:
     def _parse_proxy(proxy_str):
         """Parse proxy string into dict.
         Supported formats:
+          socks5h://user:pass@host:port
+          socks5h://host:port
           socks5://user:pass@host:port
           socks5://host:port
           user:pass@host:port          (defaults to http)
@@ -229,7 +231,10 @@ class BitBrowserClient:
         # Strip protocol prefix
         proxy_type = "http"
         lower = proxy_str.lower()
-        if lower.startswith("socks5://"):
+        if lower.startswith("socks5h://"):
+            proxy_type = "socks5"
+            proxy_str = proxy_str[len("socks5h://"):]
+        elif lower.startswith("socks5://"):
             proxy_type = "socks5"
             proxy_str = proxy_str[len("socks5://"):]
         elif lower.startswith("http://"):
