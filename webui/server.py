@@ -813,6 +813,7 @@ _OUTLOOK_WEBUI_SCRIPTS = {
     "outlook_reg_loop",
     "register_outlook_ruoyi",
     "register_outlook_standalone",
+    "launch_ruoyi_browser",
 }
 
 

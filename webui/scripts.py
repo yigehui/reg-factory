@@ -366,6 +366,50 @@ SCRIPTS = [
         "desc": "导出已注册账号 cookie 供直登扩展使用(无参=全部平台)。",
         "args": [],
     },
+    # ---------------------------------------------------------------- 工具
+    {
+        "id": "launch_ruoyi_browser",
+        "file": "launch_ruoyi_browser.py",
+        "category": "工具",
+        "title": "唤起 ruoyi 浏览器",
+        "desc": "手动唤起 ruyipage 定制 Firefox（调试/挂机/人工登录）。支持单代理启动或代理列表 per-tab 轮询。",
+        "args": [
+            {"flag": "--url", "type": "str", "default": "",
+             "help": "打开的页面 URL(留空=about:blank，便于人工输入)"},
+            {"flag": "--proxy", "type": "str", "default": "",
+             "help": "上游代理(整浏览器走它)：socks5://user:pass@host:port 或 http://user:pass@host:port；留空走列表轮询"},
+            {"flag": "--front-proxy", "type": "str", "default": "",
+             "help": "前置代理(本机可达，如 socks5://127.0.0.1:10808)。上游代理需外网 IP 才能连时用它链一跳；仅对 --proxy/列表代理生效"},
+            {"flag": "--proxy-source", "type": "choice", "default": "file",
+             "choices": [
+                 {"label": "本地文件", "value": "file"},
+                 {"label": "HTTP 列表", "value": "http"},
+             ],
+             "help": "代理列表来源(--proxy 留空时生效)：file=本地文件；http=HTTP GET 拉 txt 列表"},
+            {"flag": "--proxy-url", "type": "str", "default": "",
+             "help": "HTTP GET 代理列表地址(配合 HTTP 列表)"},
+            {"flag": "--proxy-file", "type": "str", "default": "proxies_outlook.txt",
+             "help": "代理池文件(每行一条；配合 本地文件)"},
+            {"flag": "--proxy-exhausted", "type": "choice", "default": "wrap",
+             "choices": [
+                 {"label": "轮回复用", "value": "wrap"},
+                 {"label": "回退直连", "value": "direct"},
+                 {"label": "不回退", "value": "none"},
+                 {"label": "停止开新 tab", "value": "stop"},
+             ],
+             "help": "per-tab 代理耗尽策略(代理数 < --tabs 时)"},
+            {"flag": "--tabs", "type": "int", "default": 1,
+             "help": "per-tab 模式要开的 container tab 数(单代理/直连忽略)"},
+            {"flag": "--probe", "type": "bool", "default": False,
+             "help": "每个 tab 打开后探测出口 IP(ipinfo.io)并打印，核对代理是否生效"},
+            {"flag": "--headless", "type": "bool", "default": False, "help": "无头模式(调试一般不用)"},
+            {"flag": "--no-keep", "type": "bool", "default": False,
+             "help": "脚本退出时自动关浏览器(默认 keep：退出后浏览器仍开着，便于人工接管)"},
+            {"flag": "--log-level", "type": "choice", "default": "INFO",
+             "choices": ["DEBUG", "INFO", "WARN", "PROD", "ERR"],
+             "help": "日志等级"},
+        ],
+    },
 ]
 
 
@@ -475,6 +519,12 @@ ENV_SCHEMA = [
          "help": "bot token；配置后各流程(如 ruoyi 循环养号)把汇总发到该 chat"},
         {"key": "TG_CHAT_ID", "help": "目标 chat id，与 bot token 配合使用"},
         {"key": "TG_PROXY", "help": "TG 走的 HTTP 代理(国内网络必填)，如 http://127.0.0.1:7897"},
+    ]},
+    {"group": "ruoyi 浏览器启动(launch_ruoyi_browser)", "items": [
+        {"key": "LAUNCH_UPSTREAM_PROXY",
+         "help": "上游代理(整浏览器走它)：http://user:pass@host:port 或 socks5://user:pass@host:port。WebUI「唤起 ruoyi 浏览器」/ CLI 不带 --proxy 时读这里"},
+        {"key": "LAUNCH_FRONT_PROXY",
+         "help": "前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。上游代理需外网 IP 才能连时用它链一跳"},
     ]},
 ]
 
