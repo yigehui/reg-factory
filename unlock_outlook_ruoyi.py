@@ -81,6 +81,147 @@ def snap(page, tag, name):
     return state, text
 
 
+# ── FIDO 跳过(复用 ruoyi _maybe_skip_passkey,基于 url 子串 + 点 Skip)──────
+# 同步实现:被 unlock_account_sync 在 to_thread 里调用,不能 asyncio.run(会报已有事件循环)。
+def skip_fido(page):
+    if rr._maybe_skip_passkey(page, "[unlock]"):
+        time.sleep(4)
+        return True
+    try:
+        page.get("https://account.microsoft.com/", timeout=20000)
+        return True
+    except Exception:
+        return False
+
+
+# ── 填邮箱/密码的同步小工具(用 ruoyi _ele/_safe_input/_click_any)────────
+def _fill_email_sync(page, email):
+    el = rr._ele(page, 'input[type="email"],input[name="loginfmt"]', timeout=8)
+    if el is None:
+        return False
+    rr._safe_input(el, email)
+    try:
+        page.actions.press("").perform()  # Enter(Selenium Keys.ENTER)
+    except Exception:
+        rr._click_any(page, ['#idSIButton9', 'text:Next', 'input[type="submit"]', 'button[type="submit"]'], timeout=3)
+    return True
+
+def _fill_password_sync(page, password):
+    el = rr._ele(page, 'input[type="password"]', timeout=8)
+    if el is None:
+        return False
+    cur = rr._read_input_value(el)  # ruyipage 元素无 .attrs.value,用 ruoyi 读取器
+    if not cur:
+        rr._safe_input(el, password)
+    try:
+        page.actions.press("").perform()
+    except Exception:
+        rr._click_any(page, ['#idSIButton9', 'text:Next', 'input[type="submit"]', 'button[type="submit"]'], timeout=3)
+    return True
+
+
+# ── 核心解锁逻辑(同步,跑在 to_thread 里)──────────────────────────────
+def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5):
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+    # ── Step 1: 登录 ──────────────────────────────────────────────
+    page.get("https://login.live.com/login.srf", timeout=60000)
+    time.sleep(2)
+
+    net_err_count = 0
+    for i in range(20):
+        state, _ = snap(page, tag, f"L{i:02d}")
+        if state == "logged_in":  return "already_ok"
+        if state == "sms_verify": return "needs_phone"
+        if state == "fido_setup":
+            skip_fido(page); return "unlocked"
+        if state in ("locked", "px_challenge"): break
+        if state == "net_error":
+            net_err_count += 1
+            if net_err_count >= 3: return "failed_net_error"
+            page.get("https://login.live.com/login.srf", timeout=60000)
+            time.sleep(3); continue
+        if state == "email_form":
+            _fill_email_sync(page, email); time.sleep(3); continue
+        if state == "login_form":
+            _fill_password_sync(page, password); time.sleep(3); continue
+        # 通用 Next/submit
+        if rr._click_any(page, ['#idSIButton9', 'text:Next', 'input[type="submit"]', 'button[type="submit"]'], timeout=3):
+            time.sleep(2); continue
+        time.sleep(2)
+
+    state, _ = snap(page, tag, "L_final")
+    if state == "logged_in":  return "already_ok"
+    if state == "sms_verify": return "needs_phone"
+    if state == "fido_setup":
+        skip_fido(page); return "unlocked"
+
+    # ── Step 2: PX 按住 + 解锁流(纯浏览器,无 EZCaptcha)─────────────
+    press_count   = 0
+    no_btn_rounds = 0
+    net_err_count = 0
+
+    for i in range(60):
+        state, _ = snap(page, tag, f"U{i:02d}")
+
+        if state == "logged_in":  return "unlocked"
+        if state == "sms_verify": return "needs_phone"
+        if state == "fido_setup":
+            skip_fido(page); return "unlocked"
+        if state == "error_page":
+            if not rr._click_any(page, ['text:Try again', 'text:重试', 'text:再试一次'], timeout=3):
+                try: page.run_js_loaded("history.back(); return true;")
+                except Exception: pass
+                time.sleep(3)
+            else:
+                time.sleep(5)
+            continue
+        if state == "net_error":
+            net_err_count += 1
+            if net_err_count >= 5: return "failed_net_error"
+            page.get("https://login.live.com/login.srf", timeout=60000)
+            time.sleep(3); continue
+
+        if state == "locked":
+            rr._click_any(page, ['button[type="submit"]', 'text:Next', 'text:下一步', 'input[type="submit"]'], timeout=3)
+            time.sleep(6); continue
+
+        if state == "px_challenge":
+            if press_count < max_press:
+                hold_ctx, target = rr._find_hold_context(page)
+                if target:
+                    press_count += 1
+                    try:
+                        rr._perform_hold(page, hold_ctx, target, 0, press_count, "[unlock]")
+                    except Exception as e:
+                        print(f"    [unlock] press #{press_count} error: {e}")
+                    print(f"    held (#{press_count}/{max_press})")
+                    rr._wait_before_next_captcha_press("[unlock]", "challenge failed")
+                    no_btn_rounds = 0
+                else:
+                    no_btn_rounds += 1
+                    print(f"    no hold target (round {no_btn_rounds})")
+                    if no_btn_rounds >= 5:
+                        print("    no target 5 rounds — give up"); break
+                    time.sleep(3)
+            else:
+                print(f"    all {max_press} PX presses exhausted"); break
+            continue
+
+        # 通用 next/submit
+        if rr._click_any(page, ['button[type="submit"]', 'text:Next', 'text:下一步', '#idSIButton9', 'input[type="submit"]'], timeout=3):
+            time.sleep(4)
+        else:
+            time.sleep(3)
+
+    state, _ = snap(page, tag, "U_final")
+    if state == "logged_in":  return "unlocked"
+    if state == "sms_verify": return "needs_phone"
+    if state == "fido_setup":
+        skip_fido(page); return "unlocked"
+    return f"failed_{state}"
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="批量解锁被锁 Outlook(ruyipage Firefox + ruoyi 按住)",
