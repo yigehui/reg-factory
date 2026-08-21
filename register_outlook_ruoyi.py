@@ -93,7 +93,52 @@ DEFAULT_RUOYI_FIREFOX = (
 
 )
 
-RUOYI_FIREFOX_PATH = os.environ.get("RUOYI_FIREFOX_PATH", DEFAULT_RUOYI_FIREFOX)
+
+def _resolve_ruoyi_firefox_path(env_value):
+    """动态解析 ruyipage Firefox 内核路径,不锁定具体版本。
+
+    优先级:
+      1. 环境变量 RUOYI_FIREFOX_PATH(显式指定,优先尊重)
+      2. `ruyipage path` 命令输出(官方管理,装哪个版本指哪个)
+      3. browsers 目录下 glob 到的 firefox-*/firefox/firefox.exe(取最新一个)
+      4. DEFAULT_RUOYI_FIREFOX 硬编码默认(151 回退,兼容旧安装)
+    """
+    candidate = str(env_value or "").strip()
+    if candidate and os.path.isfile(candidate):
+        return candidate
+
+    try:
+        out = subprocess.check_output(
+            [sys.executable, "-m", "ruyipage", "path"],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        line = out.decode("utf-8", "ignore").strip().splitlines()
+        if line:
+            p = line[-1].strip()
+            if p and os.path.isfile(p):
+                return p
+    except Exception:
+        pass
+
+    try:
+        root = r"C:\Users\Administrator\AppData\Local\ruyipage\browsers"
+        if os.path.isdir(root):
+            found = []
+            for name in os.listdir(root):
+                exe = os.path.join(root, name, "firefox", "firefox.exe")
+                if os.path.isfile(exe):
+                    found.append(exe)
+            if found:
+                found.sort(reverse=True)
+                return found[0]
+    except Exception:
+        pass
+
+    return DEFAULT_RUOYI_FIREFOX
+
+
+RUOYI_FIREFOX_PATH = _resolve_ruoyi_firefox_path(os.environ.get("RUOYI_FIREFOX_PATH"))
 
 
 
@@ -286,6 +331,14 @@ LAUNCH_STAGGER_SECONDS = float(os.environ.get("OUTLOOK_RUOYI_LAUNCH_STAGGER", "1
 
 _DEFAULT_UA_POOL = (
 
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0",
+
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0",
+
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
+
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:151.0) Gecko/20100101 Firefox/151.0",
 
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0",
@@ -297,14 +350,6 @@ _DEFAULT_UA_POOL = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
 
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
-
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0",
-
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
-
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
-
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0",
 
 )
 
@@ -7625,6 +7670,42 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
             _safe_click(cb)
 
             log(f"  {tag} checked required checkbox")
+
+    # Add your name 页面默认勾上的营销订阅,提交前取消掉
+
+    mkt = _ele(
+
+        page,
+
+        'css:#marketingOptIn, input[name="marketingOptIn"], '
+
+        'input[id*="marketingOptIn" i], [role="checkbox"][aria-label*="marketing" i]',
+
+        timeout=0.4,
+
+    )
+
+    if mkt is not None:
+
+        try:
+
+            already = bool(mkt.run_js(
+
+                "function(){ return !!(this.checked || "
+
+                "this.getAttribute('aria-checked') === 'true'); }"
+
+            ))
+
+        except Exception:
+
+            already = bool(getattr(mkt, "is_checked", False))
+
+        if already:
+
+            _safe_click(mkt)
+
+            log(f"  {tag} unchecked marketingOptIn")
 
     _click_next(page, tag, wait_before=False, wait_after=False)
 

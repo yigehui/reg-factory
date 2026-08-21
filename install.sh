@@ -50,10 +50,10 @@ if "$VENV_PY" -m ruyipage install; then
 else
   echo "[警告] ruyipage 直连安装失败，尝试经代理镜像下载 ..."
   RUOYI_ZIP="${TMPDIR:-/tmp}/firefox-ruyi.zip"
-  RUOYI_URL="https://github.com/LoseNine/ruyipage/releases/download/151-ruyi/firefox-151.0a1.en-US.win64.zip"
+  RUOYI_URL="https://github.com/LoseNine/ruyipage/releases/download/v1.2.58/firefox-155.0a1.en-US.win64-20260803.zip"
   case "$(uname -s)" in
-    Darwin) RUOYI_URL="https://github.com/LoseNine/ruyipage/releases/download/151-ruyi/firefox-151.0a1.en-US.mac.zip" ;;
-    Linux)  RUOYI_URL="https://github.com/LoseNine/ruyipage/releases/download/151-ruyi/firefox-151.0a1.en-US.linux-x86_64.zip" ;;
+    Darwin) RUOYI_URL="https://github.com/LoseNine/ruyipage/releases/download/v1.2.58/firefox-155.0a1.en-US.mac.zip" ;;
+    Linux)  RUOYI_URL="https://github.com/LoseNine/ruyipage/releases/download/v1.2.58/firefox-155.0a1.en-US.linux-x86_64.tar.xz" ;;
   esac
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$REG_FACTORY_PROXY" ] && [ "$REG_FACTORY_PROXY" != "off" ] && [ "$REG_FACTORY_PROXY" != "0" ]; then

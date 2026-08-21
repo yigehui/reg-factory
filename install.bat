@@ -66,7 +66,7 @@ echo [5/6] installing ruyipage Firefox runtime (for Outlook ruoyi backend) ...
 if errorlevel 1 (
   echo [WARN] ruyipage direct install failed, try mirror download via proxy ...
   set "RUOYI_ZIP=%TEMP%\firefox-ruyi-win64.zip"
-  set "RUOYI_URL=https://github.com/LoseNine/ruyipage/releases/download/151-ruyi/firefox-151.0a1.en-US.win64.zip"
+  set "RUOYI_URL=https://github.com/LoseNine/ruyipage/releases/download/v1.2.58/firefox-155.0a1.en-US.win64-20260803.zip"
   curl -L --retry 3 --connect-timeout 20 -x "%REG_FACTORY_PROXY%" -o "!RUOYI_ZIP!" "!RUOYI_URL!"
   if exist "!RUOYI_ZIP!" (
     "%VENV_PY%" -m ruyipage install --from-file "!RUOYI_ZIP!"
