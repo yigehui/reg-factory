@@ -814,6 +814,9 @@ _OUTLOOK_WEBUI_SCRIPTS = {
     "register_outlook_ruoyi",
     "register_outlook_standalone",
     "launch_ruoyi_browser",
+    "bind_secondary_email_http",
+    "auth_bound_accounts",
+    "unlock_outlook_ruoyi",
 }
 
 
