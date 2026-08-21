@@ -16,8 +16,10 @@ import argparse, asyncio, os, sys, time
 from types import SimpleNamespace
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stdin.reconfigure(encoding="utf-8")
+    # hasattr 守卫:pytest 默认捕获 stdin 时 sys.stdin 是 DontReadFromInput,
+    # 无 reconfigure 属性,不守卫会让所有 import 本模块的测试在收集期崩溃(需 -s 才能跑)。
+    if hasattr(sys.stdout, "reconfigure"): sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdin, "reconfigure"):  sys.stdin.reconfigure(encoding="utf-8")
 
 # 吃项目根 .env(不覆盖已有环境变量),同 launch_ruoyi_browser
 ROOT = os.path.dirname(os.path.abspath(__file__))
