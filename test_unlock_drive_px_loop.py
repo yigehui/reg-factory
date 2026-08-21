@@ -132,8 +132,8 @@ def test_returns_needs_phone(monkeypatch):
     assert rc == "needs_phone"
 
 
-# ── 3. 首次按压跨过 INITIAL_PRESS_DELAY ───────────────────────────────
-def test_first_press_after_initial_delay(monkeypatch):
+# ── 3. 按压递增序号 + 按满 max_press 后 failed_px_challenge ──────────────
+def test_press_progression_until_max_press(monkeypatch):
     # 初始延迟设 0 让第1轮就能进按压路径
     monkeypatch.setattr(rr, "INITIAL_PRESS_DELAY", 0)
     monkeypatch.setattr(rr, "POST_MAX_PRESS_WAIT", 0)
@@ -156,6 +156,53 @@ def test_first_press_after_initial_delay(monkeypatch):
     # 这里验证:按压确实发生、press_count 递增、终态正确。
     assert len(calls["perform_hold"]) == 5, "应按压满 max_press=5 次"
     assert [c[0] for c in calls["perform_hold"]] == [1, 2, 3, 4, 5]
+    assert rc == "failed_px_challenge"
+
+
+# ── 3b. 首次延迟真的挡住首次按压 ────────────────────────────────────────
+def test_initial_press_delay_blocks_first_press(monkeypatch):
+    # 真实 INITIAL_PRESS_DELAY=5,验证第1轮记录延迟后 sleep(5) 不按压,
+    # 第2轮时间跨过 5s 才首次调 _perform_hold。
+    monkeypatch.setattr(rr, "INITIAL_PRESS_DELAY", 5)
+    monkeypatch.setattr(rr, "POST_MAX_PRESS_WAIT", 0)
+    monkeypatch.setattr(rr, "CAPTCHA_STATE_TIMEOUT", 1000)
+    clock = FakeClock(start=1000.0, step=1.0)
+    _install_clock(monkeypatch, clock)
+
+    # 记录每次 _perform_hold 被调用时的 time.time()
+    press_at = []
+    _stub_calls = _stub_rr(monkeypatch, visible=True, validating=False,
+                           hold_ctx="ctx", hold_target={"quality": 3},
+                           target_quality=3, perform_hold_ret=0.5)
+
+    # 包一层 _perform_hold 以记录调用时钟
+    orig_perform = rr._perform_hold
+
+    def _wrap(page, ctx, target, idx, press_count, tag):
+        press_at.append(uo.time.time())
+        return orig_perform(page, ctx, target, idx, press_count, tag)
+
+    monkeypatch.setattr(rr, "_perform_hold", _wrap)
+    # re-stub perform_hold recording inside _wrap; _stub_calls["perform_hold"] still grows
+    page = FakePage()
+
+    def snap_cb(p, t, name):
+        return ("px_challenge", "press and hold")
+
+    # max_press=1:第1轮延迟,��2轮按压(press_count=1==max_press),之后 failed_px_challenge
+    rc = uo._drive_px_loop(page, "[t]", max_press=1,
+                           deadline=clock.time() + 300,
+                           headless=False, user_agent="UA", snap_cb=snap_cb)
+
+    # 恰好按压 1 次
+    assert len(press_at) == 1, f"应恰好按压 1 次,实际 {len(press_at)}"
+    # 首次按压时的 time.time() 必须比第1轮记录的延迟起点晚 >= INITIAL_PRESS_DELAY
+    # 第1轮:time()=1001 设 initial_press_wait_started,sleep(5)→t=1006,continue
+    # 第2轮:time()=1007(1006+step1),waited=1007-1001=6>=5 → 按压时 time() 再读一次
+    # 验证 press_at[0] 与首轮 initial_press_wait_started(1001) 之差 >= 5
+    assert press_at[0] - 1001 >= 5, (
+        f"首次按压应跨过 INITIAL_PRESS_DELAY=5,实际发生在 t={press_at[0]},"
+        f"与首轮起点(1001)差 {press_at[0] - 1001}")
     assert rc == "failed_px_challenge"
 
 

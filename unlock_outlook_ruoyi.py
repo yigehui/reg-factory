@@ -162,7 +162,7 @@ def _drive_px_loop(page, tag, *, max_press, deadline, headless, user_agent, snap
 
         # ── snap + 分类(snap_cb 内部已截图+分类,不重复 _body_text)──────
         if snap_cb is not None:
-            state, low = snap_cb(page, tag, f"U{i:02d}")
+            state, _ = snap_cb(page, tag, f"U{i:02d}")
         else:
             current_url = (page.url or "").lower()
             low = (rr._body_text(page) or "").lower()
