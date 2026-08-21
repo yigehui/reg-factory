@@ -66,6 +66,21 @@ def classify(text, url):
     return "unknown"
 
 
+# ── 快照:截图 + 取正文 + 分类 ──────────────────────────────────────────
+def snap(page, tag, name):
+    """同步:截图到 SCREENSHOT_DIR,取 body 文案,分类状态。返回 (state, text)。"""
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    try:
+        rr._shot(page, f"{tag}_{name}", 0)
+    except Exception:
+        pass
+    url = page.url or ""
+    text = rr._body_text(page) or ""
+    state = classify(text, url)
+    print(f"    [{name}] {state}  {url[:60]}")
+    return state, text
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="批量解锁被锁 Outlook(ruyipage Firefox + ruoyi 按住)",
