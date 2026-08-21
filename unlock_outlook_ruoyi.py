@@ -68,10 +68,16 @@ def classify(text, url):
 
 # ── 快照:截图 + 取正文 + 分类 ──────────────────────────────────────────
 def snap(page, tag, name):
-    """同步:截图到 SCREENSHOT_DIR,取 body 文案,分类状态。返回 (state, text)。"""
+    """同步:截图到 SCREENSHOT_DIR,取 body 文案,分类状态。返回 (state, text)。
+
+    注意:不直接复用 rr._shot——它内部走库的 SCREENSHOT_DIR(screenshots_ruoyi/)
+    且按 failure 前缀名+OUTLOOK_PX_PRESS_SCREENSHOTS 过滤,本模块的 tag_name
+    (如 w0_L00)不匹配前缀,会被静默跳过→截图目录空。这里用 page.screenshot
+    直写 SCREENSHOT_DIR,每帧都留现场图(spec §7 验收#3:px_challenge/locked 现场佐证)。
+    """
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     try:
-        rr._shot(page, f"{tag}_{name}", 0)
+        page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"{tag}_{name}.png"), full_page=True)
     except Exception:
         pass
     url = page.url or ""
@@ -160,6 +166,7 @@ def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5):
     press_count   = 0
     no_btn_rounds = 0
     net_err_count = 0
+    err_page_count = 0
 
     for i in range(60):
         state, _ = snap(page, tag, f"U{i:02d}")
@@ -169,10 +176,16 @@ def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5):
         if state == "fido_setup":
             skip_fido(page); return "unlocked"
         if state == "error_page":
+            err_page_count += 1
+            if err_page_count >= 3:
+                return "failed_error_page"
             if not rr._click_any(page, ['text:Try again', 'text:重试', 'text:再试一次'], timeout=3):
-                try: page.run_js_loaded("history.back(); return true;")
+                # 不用 history.back()——它会把半登录态的 login.srf 当成 login_form,
+                # 之后通用循环不停重填密码却再也回不到 Abuse(死循环→占满 20 轮)。
+                # 改为重新导航到 Abuse 解锁入口,重建流程。
+                try: page.get("https://account.live.com/Abuse", timeout=60000)
                 except Exception: pass
-                time.sleep(3)
+                time.sleep(4)
             else:
                 time.sleep(5)
             continue
