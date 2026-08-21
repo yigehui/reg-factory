@@ -126,8 +126,322 @@ def _fill_password_sync(page, password):
     return True
 
 
+# ── PX 滑块状态机驱动(忠实移植 register_outlook_ruoyi.py 的 captcha-driving loop)──
+# 与 ruoyi 注册的差异:成功判定用本模块 classify==logged_in(非 _on_signup_form/离开 signup);
+# 去掉注册专用的 _on_signup_form/_captcha_signup_url_changed/blocked 文案/_click_post_signup/
+# _post_signup_cleanup/_loading_timeout_graph_fallback/_try_submit 提交超时;error_page/net_error
+# 恢复沿用 unlock_account_sync 已验证有效的 page.get 重建(绝不用 history.back())。
+def _drive_px_loop(page, tag, *, max_press, deadline, headless, user_agent, snap_cb=None):
+    """驱动 PX 按住+解锁循环。return 终态字符串:
+    unlocked / needs_phone / failed_px_challenge / failed_timeout /
+    failed_error_page / failed_net_error / failed_unknown
+    """
+    # ── 状态变量初始化(对齐 ruoyi)──────────────────────────────────
+    press_count = 0
+    no_target_rounds = 0
+    had_captcha = False
+    awaiting_reappear = False
+    post_press_saw_gap = False
+    post_press_started_at = None
+    initial_press_wait_started = None
+    validation_wait_started = None
+    press_wait_started = None
+    microsoft_loading_wait_started = None
+    gone_rounds = 0
+    net_err_count = 0
+    err_page_count = 0
+    headless_patch_logged = False
+
+    i = 0
+    while time.time() < deadline:
+        # ── headless 补丁(每轮,最关键——修复 headless 下 PX 检测缺失)──────
+        if headless:
+            rr._apply_ruoyi_headless_page_patches(
+                page, tag, log_once=(not headless_patch_logged), user_agent=user_agent)
+            headless_patch_logged = True
+
+        # ── snap + 分类(snap_cb 内部已截图+分类,不重复 _body_text)──────
+        if snap_cb is not None:
+            state, low = snap_cb(page, tag, f"U{i:02d}")
+        else:
+            current_url = (page.url or "").lower()
+            low = (rr._body_text(page) or "").lower()
+            state = classify(low, current_url)
+        i += 1
+
+        # ── 成功/退出检测(解锁场景适配:用 classify)──────────────────────
+        if state == "logged_in":
+            return "unlocked"
+        if state == "sms_verify":
+            return "needs_phone"
+        if state == "fido_setup":
+            if skip_fido(page):
+                return "unlocked"
+            # skip 失败则继续循环
+            continue
+
+        # ── error_page 恢复(沿用 unlock_account_sync 已验证逻辑)──────────
+        if state == "error_page":
+            err_page_count += 1
+            if err_page_count >= 3:
+                return "failed_error_page"
+            if not rr._click_any(page, ['text:Try again', 'text:重试', 'text:再试一次'], timeout=3):
+                # 不用 history.back()——半登录态 login.srf 会被当 login_form 死循环。
+                try:
+                    page.get("https://account.live.com/Abuse", timeout=60000)
+                except Exception:
+                    pass
+                time.sleep(4)
+            else:
+                time.sleep(5)
+            continue
+
+        # ── net_error 恢复(沿用 unlock_account_sync 已验证逻辑)──────────
+        if state == "net_error":
+            net_err_count += 1
+            if net_err_count >= 5:
+                return "failed_net_error"
+            try:
+                page.get("https://login.live.com/login.srf", timeout=60000)
+            except Exception:
+                pass
+            time.sleep(3)
+            continue
+
+        # ── locked 状态:点 Next/submit 推进 ──────────────────────────
+        if state == "locked":
+            rr._click_any(page, ['button[type="submit"]', 'text:Next', 'text:下一步',
+                                 'input[type="submit"]'], timeout=3)
+            time.sleep(6)
+            continue
+
+        # ── PX 三重门控(核心)──────────────────────────────────────────
+        visible = rr._captcha_visible(page)
+        validating = rr._captcha_is_validating(page)
+        hold_ctx, hold_target = rr._find_hold_context(page, min_quality=5)
+        actionable = bool(
+            visible
+            and (not validating)
+            and hold_target is not None
+            and rr._target_quality(hold_target) <= 5
+        )
+        loading_page = rr._microsoft_loading_page(page)
+
+        # ── Microsoft loading 等待(去掉了注册的 Graph 兜底)────────────
+        loop_now = time.time()
+        press_wait_started, microsoft_loading_wait_started, loading_timed_out = \
+            rr._update_loading_wait_state(
+                press_wait_started, microsoft_loading_wait_started,
+                loading=loading_page, now=loop_now,
+                timeout=rr.CAPTCHA_STATE_TIMEOUT)
+        if loading_page:
+            if loading_timed_out:
+                return "failed_timeout"
+            if microsoft_loading_wait_started is None:
+                microsoft_loading_wait_started = loop_now
+                print(f"    {tag} Microsoft Loading page, keep waiting for redirect")
+            elif int(loop_now - microsoft_loading_wait_started) % 15 < 3:
+                waited = int(loop_now - microsoft_loading_wait_started)
+                print(f"    {tag} Microsoft Loading still active, waited {waited}s")
+            time.sleep(1)
+            continue
+        microsoft_loading_wait_started = None
+
+        # ── post-press reappear 等待(完整照搬 ruoyi 状态变量)────────────
+        if rr._should_enter_post_press_reappear_wait(awaiting_reappear, press_count, max_press):
+            gap_waited = time.time() - (post_press_started_at or time.time())
+            if not actionable:
+                if rr._wait_state_timed_out(post_press_started_at, timeout=rr.CAPTCHA_STATE_TIMEOUT):
+                    print(f"    {tag} captcha did not reappear/change after press for "
+                          f"{int(gap_waited)}s, give up", file=sys.stderr)
+                    return "failed_timeout"
+                if not post_press_saw_gap:
+                    post_press_saw_gap = True
+                    if validating:
+                        print(f"    {tag} press entered loading/validation, wait for captcha to reappear")
+                    else:
+                        print(f"    {tag} captcha not actionable after press, waiting for reappear")
+                elif gone_rounds % 10 == 0 and gone_rounds > 0:
+                    waited = int(gap_waited)
+                    print(f"    {tag} waiting for captcha reappear, {waited}s")
+                gone_rounds += 1
+                time.sleep(1.5)
+                continue
+
+            if post_press_saw_gap:
+                awaiting_reappear = False
+                post_press_saw_gap = False
+                post_press_started_at = None
+                initial_press_wait_started = time.time() - rr.INITIAL_PRESS_DELAY
+                gone_rounds = 0
+                rr._wait_before_next_captcha_press(tag, "challenge failed and captcha reappeared")
+                continue
+
+            if gap_waited < rr.POST_PRESS_LOADING_CHECK:
+                time.sleep(0.5)
+                continue
+
+            awaiting_reappear = False
+            post_press_saw_gap = False
+            post_press_started_at = None
+            initial_press_wait_started = time.time() - rr.INITIAL_PRESS_DELAY
+            gone_rounds = 0
+            rr._wait_before_next_captcha_press(
+                tag, f"challenge failed with no loading after {rr.POST_PRESS_LOADING_CHECK}s")
+            continue
+
+        # ── had_captcha 且 not visible/validating/not actionable 的等待 ──
+        if had_captcha and (not visible or validating or not actionable):
+            if press_count >= max_press:
+                if press_wait_started is None:
+                    press_wait_started = time.time()
+                waited = time.time() - press_wait_started
+                if waited >= rr.POST_MAX_PRESS_WAIT:
+                    print(f"    {tag} no redirect after {max_press} presses and "
+                          f"{rr.POST_MAX_PRESS_WAIT}s, give up", file=sys.stderr)
+                    return "failed_px_challenge"
+                time.sleep(1)
+                continue
+
+            gone_rounds += 1
+            if validation_wait_started is None:
+                validation_wait_started = time.time()
+            waited = time.time() - validation_wait_started
+            if rr._wait_state_timed_out(validation_wait_started, timeout=rr.CAPTCHA_STATE_TIMEOUT):
+                print(f"    {tag} captcha post-press state stuck for {int(waited)}s, give up",
+                      file=sys.stderr)
+                return "failed_timeout"
+            if gone_rounds == 1:
+                if validating and visible:
+                    print(f"    {tag} still validating after press, keep waiting")
+                else:
+                    print(f"    {tag} captcha disappeared/loading, wait for redirect")
+            elif gone_rounds % 10 == 0:
+                waited = int(time.time() - validation_wait_started)
+                if validating and visible:
+                    print(f"    {tag} captcha still validating, waited {waited}s")
+                else:
+                    print(f"    {tag} waiting for post-captcha redirect, {waited}s")
+            time.sleep(1)
+            continue
+
+        # ── visible and actionable 时按压 ──────────────────────────────
+        if visible and actionable:
+            validation_wait_started = None
+            had_captcha = True
+            gone_rounds = 0
+
+            if press_count < max_press:
+                # 首次按压前的初始延迟
+                if initial_press_wait_started is None:
+                    initial_press_wait_started = time.time()
+                    print(f"    {tag} captcha visible, wait {rr.INITIAL_PRESS_DELAY}s before press")
+                    time.sleep(rr.INITIAL_PRESS_DELAY)
+                    continue
+                if time.time() - initial_press_wait_started < rr.INITIAL_PRESS_DELAY:
+                    time.sleep(1)
+                    continue
+
+                ctx, target = hold_ctx, hold_target
+                if ctx is None or target is None or rr._target_quality(target) > 5:
+                    if had_captcha and press_count > 0:
+                        print(f"    {tag} captcha target not actionable, keep waiting")
+                        awaiting_reappear = True
+                        post_press_saw_gap = True
+                        post_press_started_at = post_press_started_at or time.time()
+                        time.sleep(1)
+                        continue
+                    no_target_rounds += 1
+                    print(f"    {tag} captcha visible but no hold target")
+                    if no_target_rounds >= 5:
+                        print(f"    {tag} captcha target missing for multiple rounds, give up",
+                              file=sys.stderr)
+                        return "failed_px_challenge"
+                else:
+                    no_target_rounds = 0
+                    press_count += 1
+                    hold_elapsed = rr._perform_hold(page, ctx, target, 0, press_count, tag)
+                    if hold_elapsed:
+                        validation_wait_started = time.time()
+                        awaiting_reappear = True
+                        post_press_saw_gap = False
+                        post_press_started_at = time.time()
+                        if press_count >= max_press:
+                            press_wait_started = time.time()
+                        print(f"    held (#{press_count}/{max_press}) {hold_elapsed:.2f}s")
+                        continue
+                    # hold 失败:重置等待状态,立即重试
+                    awaiting_reappear = False
+                    post_press_saw_gap = False
+                    post_press_started_at = None
+                    initial_press_wait_started = time.time() - rr.INITIAL_PRESS_DELAY
+                    rr._wait_before_next_captcha_press(tag, "hold action failed")
+                    continue
+
+                # no_target 分支走到这里(未达 5 轮)继续循环
+                continue
+
+            # press_count >= max_press:等 POST_MAX_PRESS_WAIT 后放弃
+            if press_wait_started is None:
+                press_wait_started = time.time()
+                print(f"    {tag} max press {max_press} reached, wait up to "
+                      f"{rr.POST_MAX_PRESS_WAIT}s")
+            waited = time.time() - press_wait_started
+            if waited >= rr.POST_MAX_PRESS_WAIT:
+                print(f"    {tag} no redirect after {max_press} presses and "
+                      f"{rr.POST_MAX_PRESS_WAIT}s, give up", file=sys.stderr)
+                return "failed_px_challenge"
+            time.sleep(1)
+            continue
+
+        # ── else 分支(not visible and not had_captcha 等)──────────────
+        # 解锁场景:captcha 还没出现就点通用 Next/submit 等它出现。
+        # 不移植注册的 submit_wait_started/SUBMIT_RESULT_TIMEOUT/_try_submit 复杂提交超时。
+        if had_captcha:
+            # 同上面的 had_captcha 等待逻辑(已按压过但此刻不可见/不可操作)
+            if press_count >= max_press:
+                if press_wait_started is None:
+                    press_wait_started = time.time()
+                waited = time.time() - press_wait_started
+                if waited >= rr.POST_MAX_PRESS_WAIT:
+                    print(f"    {tag} no redirect after {max_press} presses and "
+                          f"{rr.POST_MAX_PRESS_WAIT}s, give up", file=sys.stderr)
+                    return "failed_px_challenge"
+                time.sleep(1)
+                continue
+            if awaiting_reappear:
+                post_press_saw_gap = True
+                if rr._wait_state_timed_out(post_press_started_at, timeout=rr.CAPTCHA_STATE_TIMEOUT):
+                    waited = time.time() - (post_press_started_at or time.time())
+                    print(f"    {tag} captcha reappear wait stuck for {int(waited)}s, give up",
+                          file=sys.stderr)
+                    return "failed_timeout"
+                time.sleep(1)
+                continue
+            if validation_wait_started is None:
+                validation_wait_started = time.time()
+                print(f"    {tag} post-captcha state unclear, keep waiting")
+            elif rr._wait_state_timed_out(validation_wait_started, timeout=rr.CAPTCHA_STATE_TIMEOUT):
+                waited = time.time() - validation_wait_started
+                print(f"    {tag} post-captcha state unclear for {int(waited)}s, give up",
+                      file=sys.stderr)
+                return "failed_timeout"
+            time.sleep(1)
+            continue
+
+        # 还没出现 captcha:点通用 Next/submit 等它出现
+        validation_wait_started = None
+        rr._click_any(page, ['button[type="submit"]', 'text:Next', 'text:下一步',
+                             '#idSIButton9', 'input[type="submit"]'], timeout=3)
+        time.sleep(2)
+
+    # 循环结束(deadline 到)
+    return "failed_timeout"
+
+
 # ── 核心解锁逻辑(同步,跑在 to_thread 里)──────────────────────────────
-def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5):
+def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5,
+                        headless=False, user_agent=None, px_timeout=240):
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
     # ── Step 1: 登录 ──────────────────────────────────────────────
@@ -162,77 +476,16 @@ def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5):
     if state == "fido_setup":
         skip_fido(page); return "unlocked"
 
-    # ── Step 2: PX 按住 + 解锁流(纯浏览器,无 EZCaptcha)─────────────
-    press_count   = 0
-    no_btn_rounds = 0
-    net_err_count = 0
-    err_page_count = 0
-
-    for i in range(60):
-        state, _ = snap(page, tag, f"U{i:02d}")
-
-        if state == "logged_in":  return "unlocked"
-        if state == "sms_verify": return "needs_phone"
-        if state == "fido_setup":
-            skip_fido(page); return "unlocked"
-        if state == "error_page":
-            err_page_count += 1
-            if err_page_count >= 3:
-                return "failed_error_page"
-            if not rr._click_any(page, ['text:Try again', 'text:重试', 'text:再试一次'], timeout=3):
-                # 不用 history.back()——它会把半登录态的 login.srf 当成 login_form,
-                # 之后通用循环不停重填密码却再也回不到 Abuse(死循环→占满 20 轮)。
-                # 改为重新导航到 Abuse 解锁入口,重建流程。
-                try: page.get("https://account.live.com/Abuse", timeout=60000)
-                except Exception: pass
-                time.sleep(4)
-            else:
-                time.sleep(5)
-            continue
-        if state == "net_error":
-            net_err_count += 1
-            if net_err_count >= 5: return "failed_net_error"
-            page.get("https://login.live.com/login.srf", timeout=60000)
-            time.sleep(3); continue
-
-        if state == "locked":
-            rr._click_any(page, ['button[type="submit"]', 'text:Next', 'text:下一步', 'input[type="submit"]'], timeout=3)
-            time.sleep(6); continue
-
-        if state == "px_challenge":
-            if press_count < max_press:
-                hold_ctx, target = rr._find_hold_context(page)
-                if target:
-                    press_count += 1
-                    try:
-                        rr._perform_hold(page, hold_ctx, target, 0, press_count, "[unlock]")
-                    except Exception as e:
-                        print(f"    [unlock] press #{press_count} error: {e}")
-                    print(f"    held (#{press_count}/{max_press})")
-                    rr._wait_before_next_captcha_press("[unlock]", "challenge failed")
-                    no_btn_rounds = 0
-                else:
-                    no_btn_rounds += 1
-                    print(f"    no hold target (round {no_btn_rounds})")
-                    if no_btn_rounds >= 5:
-                        print("    no target 5 rounds — give up"); break
-                    time.sleep(3)
-            else:
-                print(f"    all {max_press} PX presses exhausted"); break
-            continue
-
-        # 通用 next/submit
-        if rr._click_any(page, ['button[type="submit"]', 'text:Next', 'text:下一步', '#idSIButton9', 'input[type="submit"]'], timeout=3):
-            time.sleep(4)
-        else:
-            time.sleep(3)
-
-    state, _ = snap(page, tag, "U_final")
-    if state == "logged_in":  return "unlocked"
-    if state == "sms_verify": return "needs_phone"
-    if state == "fido_setup":
-        skip_fido(page); return "unlocked"
-    return f"failed_{state}"
+    # ── Step 2: PX 按住 + 解锁流(忠实移植 ruoyi 滑块状态机)──────────────
+    deadline = time.time() + px_timeout
+    state = _drive_px_loop(page, tag, max_press=max_press, deadline=deadline,
+                          headless=headless, user_agent=user_agent, snap_cb=snap)
+    # _drive_px_loop 已返回终态:unlocked / needs_phone / failed_*
+    if state == "unlocked":
+        return "unlocked"
+    if state == "needs_phone":
+        return "needs_phone"
+    return state
 
 
 # ── 浏览器启动:有头/无头都支持 ─────────────────────────────────────────
@@ -252,7 +505,7 @@ def _build_unlock_options(opts, idx, *, proxy_str, headless):
     if headless:
         rr._apply_ruoyi_headless_options(tb, "[unlock]", user_agent=ua)
         tb.headless(True)
-    return tb, profile_dir
+    return tb, profile_dir, ua
 
 
 # ── 代理摄入:复用 ruoyi fetch_proxy_list_http / parse_proxy_pool / _proxy_url_to_ruoyi ─
@@ -360,7 +613,7 @@ async def worker(accounts, proxy_list, worker_id, results, sem, *, args, launch_
 
                 run_args = SimpleNamespace(**vars(args))
                 run_args.concurrency = args.concurrency
-                tb, profile_dir = _build_unlock_options(run_args, worker_id, proxy_str=selected_proxy, headless=args.headless)
+                tb, profile_dir, ua = _build_unlock_options(run_args, worker_id, proxy_str=selected_proxy, headless=args.headless)
                 pid_profile_dir = profile_dir
 
                 # 同步启动 + 跑(放 to_thread,不阻塞 loop)
@@ -382,7 +635,8 @@ async def worker(accounts, proxy_list, worker_id, results, sem, *, args, launch_
                 browser_page, page = await asyncio.to_thread(_run)
 
                 outcome = await asyncio.wait_for(
-                    asyncio.to_thread(unlock_account_sync, page, browser_page, email, password, tag, max_press=args.max_press),
+                    asyncio.to_thread(unlock_account_sync, page, browser_page, email, password, tag,
+                                      max_press=args.max_press, headless=args.headless, user_agent=ua),
                     timeout=args.timeout)
                 print(f"[worker-{worker_id}] {email} => {outcome}")
 
