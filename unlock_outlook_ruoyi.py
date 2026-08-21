@@ -260,6 +260,54 @@ def _load_unlock_proxies(args):
     return []  # 无代理直连
 
 
+# ── File I/O(从 unlock_outlook.py 移植,新增 limit 切片)──────────────────
+def load_accounts(path, limit=0):
+    accounts = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            parts = line.split("----")
+            if len(parts) >= 2:
+                accounts.append((parts[0].strip(), parts[1].strip(), line))
+            else:
+                print(f"[warn] skip: {line[:60]}")
+    if limit and limit > 0:
+        accounts = accounts[:limit]
+    return accounts
+
+def save_results(results, ts):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    unlocked = [r for r in results if r[3] in ("unlocked", "already_ok")]
+    needs_ph = [r for r in results if r[3] == "needs_phone"]
+    failed   = [r for r in results if r[3] not in ("unlocked", "already_ok", "needs_phone")]
+
+    def write(name, rows):
+        p = os.path.join(OUTPUT_DIR, f"{name}_{ts}.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            for email, password, raw, outcome in rows:
+                f.write(f"{raw}----{outcome}\n")
+        print(f"  {name:<22s} {len(rows):4d}  -> {p}")
+
+    print(f"\n{'='*55}")
+    write("unlocked", unlocked)
+    write("needs_phone", needs_ph)
+    write("failed", failed)
+    print(f"{'─'*55}")
+    print(f"  Total     : {len(results)}")
+    print(f"  Unlocked  : {len(unlocked)}")
+    print(f"  NeedsPhone: {len(needs_ph)}")
+    print(f"  Failed    : {len(failed)}")
+    print(f"{'='*55}")
+
+    ok_path = os.path.join(OUTPUT_DIR, f"unlocked_clean_{ts}.txt")
+    with open(ok_path, "w", encoding="utf-8") as f:
+        for email, password, _, _ in unlocked:
+            f.write(f"{email}----{password}\n")
+    if unlocked:
+        print(f"\n  Clean unlocked list: {ok_path}")
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="批量解锁被锁 Outlook(ruyipage Firefox + ruoyi 按住)",
