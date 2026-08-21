@@ -101,7 +101,7 @@ def _fill_email_sync(page, email):
         return False
     rr._safe_input(el, email)
     try:
-        page.actions.press("").perform()  # Enter(Selenium Keys.ENTER)
+        page.actions.press("").perform()  # Enter(Selenium Keys.ENTER)
     except Exception:
         rr._click_any(page, ['#idSIButton9', 'text:Next', 'input[type="submit"]', 'button[type="submit"]'], timeout=3)
     return True
@@ -114,7 +114,7 @@ def _fill_password_sync(page, password):
     if not cur:
         rr._safe_input(el, password)
     try:
-        page.actions.press("").perform()
+        page.actions.press("").perform()  # Enter
     except Exception:
         rr._click_any(page, ['#idSIButton9', 'text:Next', 'input[type="submit"]', 'button[type="submit"]'], timeout=3)
     return True
