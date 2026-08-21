@@ -308,6 +308,118 @@ def save_results(results, ts):
         print(f"\n  Clean unlocked list: {ok_path}")
 
 
+# ── Worker:单账号全生命周期 ─────────────────────────────────────────────
+async def worker(accounts, proxy_list, worker_id, results, sem, *, args, launch_lock, next_launch_at):
+    async with sem:
+        for email, password, raw_line in accounts:
+            tag = f"w{worker_id}"
+            print(f"\n[worker-{worker_id}] {email}")
+            pid_profile_dir = None
+            browser_page = None
+            selected_proxy = None
+            outcome = None
+            try:
+                # 取代理(按 email hash 轮询 proxy_list,同号尽量同出口)
+                if proxy_list:
+                    selected_proxy = proxy_list[hash(email) % len(proxy_list)]
+                    print(f"[worker-{worker_id}] proxy -> {rr.mask_ruoyi_proxy(selected_proxy)}")
+                    # 探活(失败换下一条,最多试 3 条)
+                    probe_ok = False
+                    tried = set()
+                    for _ in range(3):
+                        if not selected_proxy or selected_proxy in tried:
+                            break
+                        tried.add(selected_proxy)
+                        if await asyncio.to_thread(rr._probe_proxy_before_browser, [selected_proxy], f"[w{worker_id}]"):
+                            probe_ok = True; break
+                        idx_next = (proxy_list.index(selected_proxy) + 1) % len(proxy_list)
+                        selected_proxy = proxy_list[idx_next]
+                    if not probe_ok and proxy_list:
+                        print(f"[worker-{worker_id}] 代理探活全失败,回退直连")
+                        selected_proxy = None
+
+                # 启动错峰(规避 XPCOM 文件锁)
+                async with launch_lock:
+                    wait = max(0.0, next_launch_at[0] - time.time())
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    next_launch_at[0] = time.time() + args.launch_stagger
+
+                run_args = SimpleNamespace(**vars(args))
+                run_args.concurrency = args.concurrency
+                tb, profile_dir = _build_unlock_options(run_args, worker_id, proxy_str=selected_proxy, headless=args.headless)
+                pid_profile_dir = profile_dir
+
+                # 同步启动 + 跑(放 to_thread,不阻塞 loop)
+                def _run():
+                    bp = FirefoxPage(tb)
+                    rr._track_browser_page(bp)
+                    try:
+                        bp.close_other_tabs(bp)
+                    except Exception:
+                        pass
+                    page = bp
+                    # 装请求拦截(对齐 ruoyi 注册:用 rr._start_ruoyi_resource_blocking)
+                    try:
+                        rr._start_ruoyi_resource_blocking(page, "[unlock]")
+                    except Exception:
+                        pass
+                    setattr(page, "_ruoyi_px_motion_profile", rr._new_ruoyi_px_motion_profile())
+                    return bp, page
+                browser_page, page = await asyncio.to_thread(_run)
+
+                outcome = await asyncio.wait_for(
+                    asyncio.to_thread(unlock_account_sync, page, browser_page, email, password, tag, max_press=args.max_press),
+                    timeout=args.timeout)
+                print(f"[worker-{worker_id}] {email} => {outcome}")
+
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+                print(f"[worker-{worker_id}] {email} => timeout")
+            except Exception as e:
+                outcome = f"error: {str(e)[:80]}"
+                print(f"[worker-{worker_id}] {email} => error: {e}")
+            finally:
+                if browser_page is not None:
+                    try:
+                        await asyncio.to_thread(lambda: browser_page.quit(timeout=5))
+                    except Exception:
+                        pass
+                if pid_profile_dir:
+                    try:
+                        await asyncio.to_thread(rr._cleanup_ruoyi_run_profile_dir, pid_profile_dir)
+                    except Exception:
+                        pass
+                results.append((email, password, raw_line, outcome or "failed_unknown"))
+
+
+# ── 并发编排:按 concurrency 切片,gather 所有 worker ────────────────────
+async def run(accounts, proxy_list, args):
+    if not accounts:
+        print("[error] no accounts found"); return
+    print(f"Input     : {args.input}")
+    print(f"Accounts  : {len(accounts)}" + (f" (limit {args.limit})" if args.limit else ""))
+    print(f"Concurrency: {args.concurrency}")
+    print(f"Proxies   : {len(proxy_list)}" + (" (直连)" if not proxy_list else ""))
+
+    results = []
+    sem = asyncio.Semaphore(args.concurrency)
+    chunks = [[] for _ in range(args.concurrency)]
+    for i, acc in enumerate(accounts):
+        chunks[i % args.concurrency].append(acc)
+    launch_lock = asyncio.Lock()
+    next_launch_at = [time.time()]
+
+    await asyncio.gather(*[
+        worker(chunks[i], proxy_list, i, results, sem,
+               args=args, launch_lock=launch_lock, next_launch_at=next_launch_at)
+        for i in range(args.concurrency) if chunks[i]
+    ])
+
+    from datetime import datetime
+    save_results(results, datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="批量解锁被锁 Outlook(ruyipage Firefox + ruoyi 按住)",
