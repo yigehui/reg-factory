@@ -44,6 +44,26 @@ UNLOCK_TIMEOUT = 300   # seconds per account
 DEFAULT_INPUT  = "email_abuse.txt"
 
 
+# ── Page state classifier(从 unlock_outlook.py 移植,锁号场景已验证有效)──
+def classify(text, url):
+    t, u = text.lower(), url.lower()
+    if "account.microsoft.com" in u and "unlock" not in u: return "logged_in"
+    if "account.live.com" in u and "proofs" in u:          return "logged_in"
+    if "fido/create" in u or "fido/update" in u:           return "fido_setup"
+    if "setting up your passkey" in t or "passkey" in t:   return "fido_setup"
+    if any(x in t for x in ["your account has been locked", "we've locked",
+                              "locked for your protection", "帐户已锁定"]): return "locked"
+    if "let's prove you're human" in t or "press and hold" in t: return "px_challenge"
+    if any(x in t for x in ["enter the code", "we texted", "we sent", "verification code",
+                              "验证码", "短信"]): return "sms_verify"
+    if any(x in t for x in ["verify your identity", "unusual activity"]): return "verify_needed"
+    if "something went wrong" in t: return "error_page"
+    if "chrome-error://" in u:      return "net_error"
+    if "enter your password" in t:  return "login_form"
+    if any(x in t for x in ["email or phone", "sign in", "enter your email"]): return "email_form"
+    return "unknown"
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="批量解锁被锁 Outlook(ruyipage Firefox + ruoyi 按住)",
