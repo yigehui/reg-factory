@@ -62,8 +62,10 @@ profiles_ruoyi/
 profiles_ruoyi_tmp/
 log/
 email_nograph.txt
+email_reg.txt
 emails.txt.lock
 email_nograph.txt.lock
+email_reg.txt.lock
 
 # unlock 运行期结果与选中账号清单（不进库）
 unlock_results/

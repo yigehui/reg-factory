@@ -168,6 +168,10 @@ EMAIL_NOGRAPH = os.path.join(ROOT, "email_nograph.txt")
 
 EMAILS_POOL = os.path.join(ROOT, "emails.txt")
 
+# 仅注册(跳过 Graph 授权)账号累计文件，与 EMAILS_POOL 同级
+
+EMAIL_REG = os.path.join(ROOT, "email_reg.txt")
+
 SIGNUP_URL = "https://signup.live.com/signup?lic=1"
 
 
@@ -326,6 +330,18 @@ HEADLESS_WINDOW_HEIGHT = int(os.environ.get("OUTLOOK_RUOYI_HEADLESS_HEIGHT", "80
 # 4 并发默认 10s → 约 0/10/20/30s 错峰拉满，避免四窗同时砸 signup。
 
 LAUNCH_STAGGER_SECONDS = float(os.environ.get("OUTLOOK_RUOYI_LAUNCH_STAGGER", "10") or "10")
+
+# firefox 退出后,按 profile 杀残留进程树并等待退出的总超时(秒)。
+
+# ruyipage quit() 只 terminate 主进程,子进程树残留占用 XPCOM/profile 文件锁,
+
+# 导致下个 run 启动撞 "Couldn't load XPCOM"。删 profile 前必须清干净。
+
+RUOYI_FIREFOX_EXIT_WAIT = float(os.environ.get("OUTLOOK_RUOYI_FIREFOX_EXIT_WAIT", "8") or "8")
+
+# 批次级 _force_kill_ruoyi_firefox 杀完后,等待 firefox.exe 真正消失(释放文件句柄)的总超时(秒)。
+
+RUOYI_FIREFOX_FORCEKILL_WAIT = float(os.environ.get("OUTLOOK_RUOYI_FIREFOX_FORCEKILL_WAIT", "6") or "6")
 
 # 内置 Firefox UA 池（Win10 x64，版本轮换）。可用 OUTLOOK_RUOYI_UA_POOL 覆盖（| 或换行分隔）。
 
@@ -651,10 +667,35 @@ def _cleanup_ruoyi_run_profile_dir(profile_dir, profile_root=None):
 
 
 
+def _ruoyi_firefox_running_count_by_path():
+    """按 RUOYI_FIREFOX_PATH 统计当前残留 firefox.exe 进程数(按 ExecutablePath 过滤)。"""
+    if not RUOYI_FIREFOX_PATH or not os.path.isfile(RUOYI_FIREFOX_PATH):
+        return 0
+    norm = os.path.normpath(RUOYI_FIREFOX_PATH)
+    target = norm.replace("'", "''")
+    ps = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$t='%s'.ToLower();"
+        "$p=Get-Process firefox -ErrorAction SilentlyContinue;"
+        "if($p){$k=$p|Where-Object{$_.Path -and $_.Path.ToLower() -eq $t};"
+        "@($k).Count}else{0}"
+    ) % target
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                             capture_output=True, text=True, timeout=10)
+        n = (out.stdout or "").strip()
+        if n.isdigit():
+            return int(n)
+    except Exception:
+        pass
+    return 0
+
+
 def _force_kill_ruoyi_firefox(log_fn=None):
     """强杀所有以 RUOYI_FIREFOX_PATH 启动的 firefox.exe 进程(quit 超时残留兜底)。
     按 ExecutablePath 过滤,不影响用户自己的 Firefox。仅在批次间隙(所有 slot 空闲)调用,
-    避免误杀同批正在运行的实例。返回杀掉的进程数。"""
+    避免误杀同批正在运行的实例。杀完轮询等待进程真正消失(释放 XPCOM/profile 文件句柄),
+    否则下批次启动 firefox 会撞文件锁 -> "Couldn't load XPCOM"。返回杀掉的进程数。"""
     if not RUOYI_FIREFOX_PATH or not os.path.isfile(RUOYI_FIREFOX_PATH):
         return 0
     lf = log_fn or log
@@ -667,16 +708,110 @@ def _force_kill_ruoyi_firefox(log_fn=None):
         "if($p){$k=$p|Where-Object{$_.Path -and $_.Path.ToLower() -eq $t};"
         "if($k){$n=@($k).Count; $k|Stop-Process -Force; Write-Output $n}}"
     ) % target
+    killed = 0
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                              capture_output=True, text=True, timeout=15)
         n = (out.stdout or "").strip()
         if n and n.isdigit():
-            lf(f"ruoyi 残留 Firefox 强杀: {n} 个进程(按路径 {norm})", "OK")
-            return int(n)
+            killed = int(n)
+            lf(f"ruoyi 残留 Firefox 强杀: {killed} 个进程(按路径 {norm})", "OK")
     except Exception as exc:
         lf(f"ruoyi 残留 Firefox 强杀失败: {type(exc).__name__}: {exc}", "WARN")
-    return 0
+
+    # Stop-Process 返回后 Windows 不一定立即释放 firefox 的 DLL/XPCOM 文件句柄,
+    # 紧接着启动下批次会撞文件锁。这里轮询等到进程对象真正消失再返回。
+    wait_total = max(0.0, float(RUOYI_FIREFOX_FORCEKILL_WAIT or 0.0))
+    if wait_total > 0:
+        deadline = time.time() + wait_total
+        while time.time() < deadline:
+            if _ruoyi_firefox_running_count_by_path() <= 0:
+                break
+            time.sleep(0.2)
+        still = _ruoyi_firefox_running_count_by_path()
+        if still > 0:
+            lf(f"ruoyi Firefox 强杀后仍有 {still} 个进程未退出(等 {wait_total:.1f}s 超时)", "WARN")
+    return killed
+
+
+def _kill_ruoyi_firefox_by_profile(profile_dir, timeout=8.0, log_fn=None):
+    """按 profile_dir 精准杀 firefox 进程树(主进程 + content/gpu 子进程),并等待全部退出。
+
+    ruyipage 的 quit() 只 terminate() 主进程,不杀子进程树;firefox 多进程子进程变孤儿后
+    继续占用 XPCOM 组件文件和 profile 目录,导致下个 run 启动撞文件锁 -> "Couldn't load XPCOM"。
+    本函数按命令行 --profile <profile_dir> 匹配所有相关 firefox.exe(子进程命令行同样带该参数),
+    taskkill /F 逐个杀,再轮询确认退出。按 profile_dir 唯一匹配(mkdtemp 唯一路径),不误杀其他 slot。
+
+    返回 (killed, all_gone)。"""
+    import json
+
+    lf = log_fn or log
+    path = os.path.abspath(str(profile_dir or "").strip())
+    if not path or not os.path.isabs(path):
+        return 0, True
+    needle = os.path.normpath(path).lower()
+
+    ps_list = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-CimInstance Win32_Process | "
+        "Where-Object{$_.Name -eq 'firefox.exe'} | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+
+    def _match_pids():
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_list],
+                                 capture_output=True, text=True, timeout=15)
+            raw = (out.stdout or "").strip()
+        except Exception:
+            return []
+        try:
+            data = json.loads(raw) if raw else []
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        pids = []
+        for item in data:
+            try:
+                pid = int(item.get("ProcessId") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid <= 0:
+                continue
+            cmd = str(item.get("CommandLine") or "").lower()
+            if needle in cmd:
+                pids.append(pid)
+        return pids
+
+    pids = _match_pids()
+    killed = 0
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            killed += 1
+        except Exception:
+            pass
+
+    # 轮询等待该 profile 关联的 firefox 全部退出,确保 XPCOM/profile 文件句柄释放。
+    all_gone = True
+    wait_total = max(0.0, float(timeout or 0.0))
+    if wait_total > 0:
+        deadline = time.time() + wait_total
+        while time.time() < deadline:
+            if not _match_pids():
+                break
+            all_gone = False
+            time.sleep(0.2)
+        if _match_pids():
+            all_gone = False
+
+    if killed:
+        lf(f"ruoyi 按 profile 清 firefox 进程树: 杀 {killed} 个(run={os.path.basename(path)})", "OK")
+    if not all_gone:
+        lf(f"ruoyi 按 profile 清 firefox 仍有残留未退出(等 {wait_total:.1f}s 超时)", "WARN")
+    return killed, all_gone
 
 
 def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
@@ -1229,7 +1364,7 @@ def _timed_step(tag, name, fn, *args, detail=None, **kwargs):
 
 def _summarize_batch_metrics(results, elapsed_list, total_elapsed, px_stats=None):
 
-    success_statuses = {"ok", "no_graph", True}
+    success_statuses = {"ok", "no_graph", "reg_only", True}
 
     fail_statuses = {"fail", False}
 
@@ -2577,6 +2712,52 @@ def append_account_to_email_nograph(email, password):
 
 
 
+def append_account_to_email_reg(email, password):
+
+    """仅注册(跳过 Graph 授权)账号追加到 email_reg.txt，格式 email----password。"""
+
+    if not email or not password:
+
+        return False
+
+    try:
+
+        existing = set()
+
+        with _interprocess_lock(EMAIL_REG):
+
+            if os.path.isfile(EMAIL_REG):
+
+                with open(EMAIL_REG, encoding="utf-8") as f:
+
+                    for line in f:
+
+                        line = line.strip()
+
+                        if line and not line.startswith("#"):
+
+                            existing.add(line.split("----")[0].strip().lower())
+
+            if email.lower() in existing:
+
+                return True
+
+            with open(EMAIL_REG, "a", encoding="utf-8") as f:
+
+                f.write(f"{email}----{password}\n")
+
+        log(f"email_reg += {email}", "OK")
+
+        return True
+
+    except Exception as exc:
+
+        log(f"append_account_to_email_reg failed: {type(exc).__name__}: {exc}", "WARN")
+
+        return False
+
+
+
 def _append_nograph_account(email, password, nograph_file):
 
     """no_graph 账号写入 per-run accounts_ruoyi_nograph_{ts}.txt，与成功号 live_file 对称。"""
@@ -3506,6 +3687,55 @@ def _try_option_call(obj, names, *args, **kwargs):
 
 
 
+
+
+def _apply_ruoyi_quiet_prefs(tb, tag=""):
+
+    """有头/无头都关掉会弹窗的 firefox 行为:会话恢复、崩溃报告、退出警告、默认浏览器检查。
+
+    XPCOM 启动失败由进程树清理治本,这里灭其他边缘弹窗(恢复会话/crash reporter/默认浏览器)。"""
+
+    prefs = {
+
+        "browser.sessionstore.enabled": False,
+
+        "browser.sessionstore.resume_from_crash": False,
+
+        "browser.warnOnQuit": False,
+
+        "browser.shell.checkDefaultBrowser": False,
+
+        "toolkit.crashreporter.enabled": False,
+
+        "dom.ipc.crashreporter.enabled": False,
+
+    }
+
+    applied = []
+
+    for key, value in prefs.items():
+
+        ok, method = _try_option_call(
+
+            tb,
+
+            ("set_preference", "set_pref", "set_prefs", "set_option"),
+
+            key,
+
+            value,
+
+        )
+
+        if ok:
+
+            applied.append(key)
+
+    if applied:
+
+        log(f"  {tag} ruoyi quiet prefs applied: {','.join(applied)}")
+
+    return bool(applied)
 
 
 def _apply_ruoyi_headless_options(tb, tag, user_agent=None):
@@ -9311,6 +9541,8 @@ def register_outlook(opts, proxy_pool, idx):
 
     _apply_ruoyi_browser_ua(tb, tag, user_agent)
 
+    _apply_ruoyi_quiet_prefs(tb, tag)
+
     if is_headless:
 
         _apply_ruoyi_headless_options(tb, tag, user_agent=user_agent)
@@ -10391,6 +10623,26 @@ def register_outlook(opts, proxy_pool, idx):
 
         _untrack_browser_page(browser_page)
 
+        # quit() 只 terminate 主进程,子进程树残留会占用 XPCOM/profile 文件锁,
+
+        # 导致下个 run 启动撞 "Couldn't load XPCOM"。删 profile 前先清进程树并等退出。
+
+        try:
+
+            _kill_ruoyi_firefox_by_profile(
+
+                profile_dir,
+
+                timeout=RUOYI_FIREFOX_EXIT_WAIT,
+
+                log_fn=lambda m, s: log(f"  {tag} {m}", s),
+
+            )
+
+        except Exception as exc:
+
+            log(f"  {tag} 清 firefox 进程树失败: {type(exc).__name__}: {exc}", "WARN")
+
         _cleanup_ruoyi_run_profile_dir(profile_dir)
 
         clear_fn = getattr(helpers, "clear_account_generation_options", None)
@@ -10494,6 +10746,22 @@ def _resolve_graph_auth_proxy(args_or_opts, reg_proxy, tag):
 async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=None, reg_proxy=None):
 
     tag = f"#{idx}"
+
+    if getattr(args, "skip_graph_auth", False):
+
+        async with save_lock:
+
+            await asyncio.to_thread(append_account_to_email_reg, email, password)
+
+        total_elapsed = time.perf_counter() - started
+
+        log(f"{tag} 跳过 Graph 授权(仅注册);saved to email_reg: {email}", "OK")
+
+        log(f"{tag} 授权结果: SKIP(reg_only)", "OK")
+
+        log(f"{tag} 结果: OK(reg_only) {email} total={total_elapsed:.2f}s", "OK")
+
+        return "reg_only", total_elapsed, px_metrics
 
     if graph and graph.get("refresh_token"):
 
@@ -10820,7 +11088,9 @@ async def _run_direct_batch(args, helpers, consumable_pool):
 
     px_stats = [_normalize_px_metrics(i + 1, r[2] if isinstance(r, tuple) and len(r) > 2 else None) for i, r in enumerate(results)]
 
-    ok = sum(1 for r in statuses if r == "ok")
+    ok = sum(1 for r in statuses if r in ("ok", "reg_only"))
+
+    reg_only = sum(1 for r in statuses if r == "reg_only")
 
     no_graph = sum(1 for r in statuses if r == "no_graph")
 
@@ -10833,6 +11103,10 @@ async def _run_direct_batch(args, helpers, consumable_pool):
     ok += sum(1 for r in statuses if r is True)
 
     summary = _summarize_batch_metrics(statuses, elapsed_list, time.perf_counter() - batch_started, px_stats=px_stats)
+
+    if reg_only:
+
+        log(f"REG_ONLY: {reg_only} -> {EMAIL_REG}", "OK")
 
     return ok, no_graph, fail, summary["total_elapsed"], summary["avg_success_elapsed"], summary["px_stats"]
 
@@ -10978,6 +11252,12 @@ def main():
                     default=_env_bool("OUTLOOK_RUOYI_GRAPH_AUTH_REG_PROXY", False),
 
                     help="Graph 授权复用注册代理；默认关闭(直连授权)，开启后按当前账号注册代理走授权")
+
+    ap.add_argument("--skip-graph-auth", action="store_true",
+
+                    default=_env_bool("OUTLOOK_RUOYI_SKIP_GRAPH_AUTH", False),
+
+                    help="只注册不授权 Graph；注册成功的号追加到 email_reg.txt(默认关闭，保持注册后授权)")
 
     ap.add_argument("--confirm-before-register", action="store_true", help="页面打开后先尝试点确认")
 
@@ -11218,6 +11498,12 @@ def _run_one_batch(args, helpers, consumable_pool, stagger_val):
         log(f"未授权输出: {EMAIL_NOGRAPH}")
 
     log(f"email_nograph: {EMAIL_NOGRAPH}")
+
+    if os.path.isfile(EMAIL_REG):
+
+        log(f"仅注册(跳过授权)输出: {EMAIL_REG}")
+
+    log(f"email_reg: {EMAIL_REG}")
 
     _force_kill_ruoyi_firefox()  # 批次结束强杀本批残留 Firefox(防累积导致 XPCOM)
 

@@ -235,6 +235,8 @@ SCRIPTS = [
             {"flag": "--no-verify", "type": "bool", "default": False, "help": "注册后不校验 Outlook 登录"},
             {"flag": "--graph-auth-use-reg-proxy", "type": "bool", "default": False,
              "help": "Graph 授权复用注册代理；默认直连授权，开启后按当前账号注册代理授权"},
+            {"flag": "--skip-graph-auth", "type": "bool", "default": False,
+             "help": "只注册不授权 Graph；注册成功的号追加到 email_reg.txt"},
             {"flag": "--confirm-before-register", "type": "bool", "default": False,
              "help": "注册页打开后自动点确认，再开始填写"},
             {"flag": "--loop", "type": "bool", "default": False,
