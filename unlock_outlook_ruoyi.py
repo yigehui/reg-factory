@@ -222,6 +222,44 @@ def unlock_account_sync(page, ctx, email, password, tag, *, max_press=5):
     return f"failed_{state}"
 
 
+# ── 浏览器启动:有头/无头都支持 ─────────────────────────────────────────
+def _build_unlock_options(opts, idx, *, proxy_str, headless):
+    tb = FirefoxOptions()
+    tb.set_browser_path(rr.RUOYI_FIREFOX_PATH)
+    profile_dir = rr._ruoyi_profile_dir(opts, idx)
+    tb.set_profile(profile_dir)
+    if proxy_str:
+        tb.set_proxy(proxy_str)
+        print(f"[unlock-ruoyi] proxy: {rr.mask_ruoyi_proxy(proxy_str)}")
+    else:
+        print("[unlock-ruoyi] 没挂代理——直接本机出口", file=sys.stderr)
+    ua = rr._pick_user_agent(idx)
+    rr._apply_ruoyi_browser_ua(tb, "[unlock]", ua)
+    rr._apply_ruoyi_quiet_prefs(tb, "[unlock]")
+    if headless:
+        rr._apply_ruoyi_headless_options(tb, "[unlock]", user_agent=ua)
+        tb.headless(True)
+    return tb, profile_dir
+
+
+# ── 代理摄入:复用 ruoyi fetch_proxy_list_http / parse_proxy_pool / _proxy_url_to_ruoyi ─
+def _load_unlock_proxies(args):
+    explicit = str(getattr(args, "proxy", "") or "").strip()
+    if explicit:
+        norm = rr._proxy_url_to_ruoyi(explicit)
+        if not norm:
+            raise SystemExit(f"[ERR] 非法代理 --proxy: {explicit}")
+        return [norm]
+    url = str(getattr(args, "proxy_url", "") or "").strip()
+    if url:
+        print(f"[unlock-ruoyi] 拉取代理池: {url[:80]}...")
+        return rr.fetch_proxy_list_http(url)
+    pf = str(getattr(args, "proxy_file", "") or "").strip()
+    if pf:
+        return rr.parse_proxy_pool(pf)
+    return []  # 无代理直连
+
+
 def build_parser():
     ap = argparse.ArgumentParser(
         description="批量解锁被锁 Outlook(ruyipage Firefox + ruoyi 按住)",
