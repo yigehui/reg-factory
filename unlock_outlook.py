@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Outlook Account Batch Unlock Script
-Uses BitBrowser + Playwright — reuses the same PX press-and-hold logic as registration.
+Outlook Account Batch Unlock Script  --  ruyipage Firefox edition
+
+业务逻辑(状态机 / 登录 / PX 按压 / 解锁流程 / 并发 / 文件 IO)照搬原 unlock_outlook.py,
+浏览器层从 BitBrowser + Playwright 换成 ruyipage Firefox BiDi,复用 register_outlook_ruoyi 的:
+  - 浏览器启动栈(FirefoxOptions + set_per_tab_proxies + FirefoxPage)
+  - 代理池(ConsumableProxyPool: file / http / aimili-list / aimili-random,per-tab socks5)
+  - PX press-and-hold(_find_hold_context + _perform_hold_with_px_screenshots,ctx.actions 链)
+  - 页面 helper(_safe_input / _click_next / _body_text / _maybe_skip_passkey / ...)
+
+代理格式对外 user:pass@host:port(与 outlook_reg_loop --proxy-file 一致),
+ruyi 内部归一化为 host:port:user:pwd 喂给 ruyipage set_per_tab_proxies(它只认这个)。
 
 Usage:
   python unlock_outlook.py --input outlook_accounts/accounts_xxx.txt
   python unlock_outlook.py --input emails_locked.txt --concurrency 2
-  python unlock_outlook.py --input outlook_accounts/accounts_xxx.txt --proxy-file proxies.txt
-  python unlock_outlook.py   (auto-finds latest locked file)
+  python unlock_outlook.py --proxy-file proxies_outlook.txt --proxy-source aimili-list --aimili-url http://host:8787 --aimili-token XXX
+  python unlock_outlook.py                         (auto-scan all accounts, skip unlocked)
 
 Input file format (---- separated, one per line):
   email----password
@@ -15,14 +24,15 @@ Input file format (---- separated, one per line):
 
 Output (unlock_results/):
   unlocked_*.txt          successfully unlocked
-  needs_phone_*.txt       requires SMS — cannot auto-unlock
+  needs_phone_*.txt       requires SMS - cannot auto-unlock
   failed_*.txt            failed / timeout
 """
 
-import argparse, asyncio, os, random, re, sys, time
+import argparse, asyncio, importlib.util, os, signal, sys, time
 from datetime import datetime
+from types import SimpleNamespace
 
-# 顶部加载 .env（真实环境变量优先），保持仓库内无明文凭据
+# 顶部加载 .env 凭据(真实环境变量优先),保持仓库内无明文凭据
 try:
     from config import EZCAPTCHA_API_KEY as _EZCAPTCHA_KEY, EZCAPTCHA_API_BASE as _EZCAPTCHA_BASE
 except Exception:
@@ -34,117 +44,66 @@ if sys.platform == "win32":
     sys.stdin.reconfigure(encoding="utf-8")
 
 import requests
-from playwright.async_api import async_playwright
+
+# ── 复用 ruyi 模块(register_outlook_ruoyi)─────────────────────────────
+_RUOYI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "register_outlook_ruoyi.py")
+_spec = importlib.util.spec_from_file_location("_unlock_ruoyi", _RUOYI_PATH)
+_ruoyi = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_ruoyi)
+
+from ruyipage import FirefoxOptions, FirefoxPage
 
 # ── Config ───────────────────────────────────────────────────────────
-BITBROWSER_API  = os.environ.get("BITBROWSER_API", "http://127.0.0.1:54345")
-EZCAPTCHA_KEY   = _EZCAPTCHA_KEY
-EZCAPTCHA_BASE  = _EZCAPTCHA_BASE
 OUTPUT_DIR      = "unlock_results"
 SCREENSHOT_DIR  = "screenshots_unlock"
 UNLOCK_TIMEOUT  = 300   # seconds per account
+EZCAPTCHA_KEY   = _EZCAPTCHA_KEY
+EZCAPTCHA_BASE  = _EZCAPTCHA_BASE
+LOGIN_URL       = "https://login.live.com/login.srf"
+PX_APP_ID       = "PXzC5j78di"
+DEFAULT_MAX_PRESS = 5
+LOADING_WAIT_TIMEOUT = 60   # PX 挑战后微软 Loading 转圈页等待上限(秒),超时 give up
+MAX_PROXY_RETRY = 3   # 代理无法访问微软时,换节点重开浏览器重试上限
 
-DEFAULT_PROXIES = [
-    "tiantian1_custom_zone_US_sid_61816963_time_5:Zhq249161@us.ipwo.net:7878",
-    "tiantian1_custom_zone_US_sid_81769847_time_5:Zhq249161@us.ipwo.net:7878",
-    "tiantian1_custom_zone_US_sid_68657662_time_5:Zhq249161@us.ipwo.net:7878",
-    "tiantian1_custom_zone_US_sid_71333778_time_5:Zhq249161@us.ipwo.net:7878",
-    "tiantian1_custom_zone_US_sid_29976524_time_5:Zhq249161@us.ipwo.net:7878",
-]
+# ── 从 ruyi 复用的符号 ────────────────────────────────────────────────
+RUOYI_FIREFOX_PATH            = _ruoyi.RUOYI_FIREFOX_PATH
+ConsumableProxyPool           = _ruoyi.ConsumableProxyPool
+select_proxy_for_account      = _ruoyi.select_proxy_for_account
+release_proxy_for_account     = _ruoyi.release_proxy_for_account
+set_consumable_proxy_pool     = _ruoyi.set_consumable_proxy_pool
+mask_ruoyi_proxy              = _ruoyi.mask_ruoyi_proxy
+set_log_level                 = _ruoyi.set_log_level
 
+_install_shutdown_handlers    = _ruoyi._install_shutdown_handlers
+_track_browser_page           = _ruoyi._track_browser_page
+_untrack_browser_page         = _ruoyi._untrack_browser_page
+_quit_browser_page            = _ruoyi._quit_browser_page
+_force_kill_ruoyi_firefox     = _ruoyi._force_kill_ruoyi_firefox
+_pick_user_agent              = _ruoyi._pick_user_agent
+_browser_model_name           = _ruoyi._browser_model_name
+_ruoyi_profile_dir            = _ruoyi._ruoyi_profile_dir
+_apply_ruoyi_browser_ua       = _ruoyi._apply_ruoyi_browser_ua
+_apply_ruoyi_headless_options = _ruoyi._apply_ruoyi_headless_options
+_log_current_ip               = _ruoyi._log_current_ip
+_probe_proxy_before_browser   = _ruoyi._probe_proxy_before_browser
 
-# ── BitBrowser ───────────────────────────────────────────────────────
-_BROWSER_CLIENT = None
+# PX 按压(直接复用 ruyi 成熟实现)
+_find_hold_context            = _ruoyi._find_hold_context
+_perform_hold_with_px_screenshots = _ruoyi._perform_hold_with_px_screenshots
+_new_ruoyi_px_motion_profile  = _ruoyi._new_ruoyi_px_motion_profile
+_wait_before_next_captcha_press = _ruoyi._wait_before_next_captcha_press
+_maybe_skip_passkey           = _ruoyi._maybe_skip_passkey
 
-
-def _fingerprint_provider():
-    return (
-        os.environ.get("FINGERPRINT_BROWSER")
-        or os.environ.get("BROWSER_PROVIDER")
-        or "bitbrowser"
-    ).strip().lower()
-
-
-def _bb_post(path, data=None):
-    global _BROWSER_CLIENT
-    if _fingerprint_provider() in {"adspower", "ads_power", "ads"}:
-        if _BROWSER_CLIENT is None:
-            from bitbrowser import BitBrowser
-            _BROWSER_CLIENT = BitBrowser()
-        return _BROWSER_CLIENT._post(path, data or {})
-    r = requests.post(f"{BITBROWSER_API}{path}", json=data or {}, timeout=120)
-    r.raise_for_status()
-    res = r.json()
-    if not res.get("success"):
-        raise Exception(f"BitBrowser: {res.get('msg', '?')}")
-    return res
-
-def _parse_proxy(s):
-    if not s: return None
-    pt = "http"
-    for pfx in ["socks5://", "http://", "https://"]:
-        if s.lower().startswith(pfx):
-            pt = pfx.split("://")[0]; s = s[len(pfx):]
-    s = s.replace(",", "@", 1) if "@" not in s and "," in s else s
-    m = re.match(r'^(.+):(.+)@(.+):(\d+)$', s)
-    if m:
-        return {"type": pt, "username": m.group(1), "password": m.group(2),
-                "host": m.group(3), "port": m.group(4)}
-    m2 = re.match(r'^(.+):(\d+)$', s)
-    if m2:
-        return {"type": pt, "host": m2.group(1), "port": m2.group(2)}
-    return None
-
-def create_browser(name="unlock", proxy_str=None):
-    data = {"name": name, "remark": "outlook unlock",
-            "proxyMethod": 2, "browserFingerPrint": {"coreVersion": "130"}}
-    p = _parse_proxy(proxy_str)
-    if p:
-        data.update({"proxyType": p.get("type", "http"),
-                     "host": p["host"], "port": p["port"]})
-        if p.get("username"): data["proxyUserName"] = p["username"]
-        if p.get("password"): data["proxyPassword"] = p["password"]
-    else:
-        data["proxyType"] = "noproxy"
-    return _bb_post("/browser/update", data)["data"]["id"]
-
-def open_browser(pid):
-    d = _bb_post("/browser/open", {"id": pid})["data"]
-    return d.get("ws") or d.get("webdriver")
-
-def close_browser(pid):
-    try: _bb_post("/browser/close", {"id": pid})
-    except Exception: pass
-
-def delete_browser(pid):
-    try: _bb_post("/browser/delete", {"id": pid})
-    except Exception: pass
-
-def cleanup_stale_browsers():
-    """启动时清理所有残留的 unlock/scan profile"""
-    try:
-        page, cleaned = 0, 0
-        while True:
-            r = _bb_post("/browser/list", {"page": page, "pageSize": 100})
-            items = r.get("data", {}).get("list", [])
-            if not items: break
-            for item in items:
-                name = item.get("name", "")
-                if any(name.startswith(p) for p in ["unlock_", "scan_", "quick_check"]):
-                    close_browser(item["id"])
-                    delete_browser(item["id"])
-                    cleaned += 1
-            total = r.get("data", {}).get("totalNum", 0)
-            page += 1
-            if page * 100 >= total: break
-        if cleaned:
-            print(f"[startup] cleaned {cleaned} stale browser profiles")
-    except Exception as e:
-        print(f"[startup] cleanup error: {e}")
+# 页面操作 helper
+_body_text                    = _ruoyi._body_text
+_safe_input                   = _ruoyi._safe_input
+_click_any                    = _ruoyi._click_any
+_click_next                   = _ruoyi._click_next
+_ele                          = _ruoyi._ele
 
 
-# ── EZCaptcha PX ────────────────────────────────────────────────────
-def solve_px(page_url, app_id="PXzC5j78di", max_wait=90):
+# ── EZCaptcha PX API (fallback, 与原版一致)──────────────────────────
+def solve_px(page_url, app_id=PX_APP_ID, max_wait=90):
     try:
         resp = requests.post(f"{EZCAPTCHA_BASE}/createTask", json={
             "clientKey": EZCAPTCHA_KEY,
@@ -173,310 +132,514 @@ def solve_px(page_url, app_id="PXzC5j78di", max_wait=90):
         print(f"    [px] error: {e}"); return None
 
 
-# ── Page state classifier ────────────────────────────────────────────
-def classify(text, url):
-    t, u = text.lower(), url.lower()
+def inject_px_solution(page, sol):
+    """把 EZCaptcha 返回的 PX cookie/token 注入页面(ruyipage 版)。"""
+    try:
+        for key in ['_pxCaptcha', '_px3', '_px2', '_pxhd', '_pxvid', '_pxde']:
+            val = sol.get(key)
+            if val:
+                page.run_js_loaded(
+                    f'document.cookie="{key}={val};domain=.live.com;path=/";'
+                )
+        tok = sol.get("token") or sol.get("uuid")
+        if tok:
+            page.run_js_loaded(
+                'var h=document.querySelector(\'input[name="_pxCaptcha"]\');'
+                f'if(h){{h.value="{tok}";}}'
+            )
+    except Exception as e:
+        print(f"    inject px error: {e}")
+
+
+# 解锁后过渡页(如 account.live.com/Abuse?id=389)的"继续"按钮选择器
+# 参考 register_outlook_ruoyi 继续页处理:文案按钮优先,再 fallback submit
+_CONTINUE_SELECTORS = [
+    'text:Continue', 'text:OK', 'text:Next', 'text:Got it',
+    'text:Accept', 'text:Agree', 'text:I agree', 'text:Yes',
+    'text:继续', 'text:下一步', 'text:同意',
+    'css:#idSIButton9', 'css:button[type="submit"]', 'css:input[type="submit"]',
+]
+
+# Something went wrong 等错误页的"重试"按钮选择器(大小写/中英文变体)
+_RETRY_SELECTORS = [
+    'text:Try again', 'text:Try Again', 'text:try again',
+    'text:重试', 'text:再试一次', 'text:再试',
+]
+
+
+# ── Page state classifier (套原 classify 文案到 ruyipage)─────────────
+def classify(page):
+    url = page.url or ""
+    # 遍历所有 context(主文档 + iframe)取 body 文本 + h1/h2 标题,合并匹配
+    # 成功文案(Your account has been unblocked)可能在 iframe 里,主文档拿不到
+    text_parts = []
+    heading_parts = []
+    for ctx in _ruoyi._all_contexts(page):
+        try:
+            text_parts.append(_ruoyi._context_text(ctx) or "")
+        except Exception:
+            pass
+        try:
+            heading_parts.append(ctx.run_js_loaded(
+                "return Array.from(document.querySelectorAll('h1,h2')).map(e=>e.innerText||'').join('\\n');") or "")
+        except Exception:
+            pass
+    t = ("\n".join(text_parts) + "\n" + "\n".join(heading_parts)).lower()
+    u = (url or "").lower()
+    # PX 人工挑战优先:Abuse?id=389 等页可能内嵌 PX,要先按压而非点继续/跳过
+    if "let's prove you're human" in t or "press and hold" in t: return "px_challenge"
+    # 解锁成功文案优先于 URL 判定(无论哪个页面/iframe 出现都算成功)
+    if "account has been unblocked" in t:                  return "logged_in"
+    if any(x in t for x in ["stay signed in", "保持登录"]):  return "logged_in"
+    # 微软 Loading 转圈页(PX 按压后等解锁结果):第一行 Loading + 页脚,排除 PX 文案
+    if _ruoyi._microsoft_loading_page(page):               return "loading"
+    if "account.live.com/abuse" in u:                       return "abuse"
     if "account.microsoft.com" in u and "unlock" not in u: return "logged_in"
     if "account.live.com" in u and "proofs" in u:          return "logged_in"
     if "fido/create" in u or "fido/update" in u:           return "fido_setup"
     if "setting up your passkey" in t or "passkey" in t:   return "fido_setup"
     if any(x in t for x in ["your account has been locked", "we've locked",
                               "locked for your protection", "帐户已锁定"]): return "locked"
-    if "let's prove you're human" in t or "press and hold" in t: return "px_challenge"
     if any(x in t for x in ["enter the code", "we texted", "we sent", "verification code",
                               "验证码", "短信"]): return "sms_verify"
     if any(x in t for x in ["verify your identity", "unusual activity"]): return "verify_needed"
     if "something went wrong" in t: return "error_page"
-    if "chrome-error://" in u:      return "net_error"
+    if "chrome-error://" in u or "about:neterror" in u: return "net_error"
     if "enter your password" in t:  return "login_form"
     if any(x in t for x in ["email or phone", "sign in", "enter your email"]): return "email_form"
     return "unknown"
 
-async def snap(page, tag, name):
-    path = f"{SCREENSHOT_DIR}/{tag}_{name}.png"
-    try: await page.screenshot(path=path)
-    except Exception: pass
-    url = page.url
-    try: text = await page.evaluate("() => document.body.innerText")
-    except Exception: text = ""
-    state = classify(text, url)
-    print(f"    [{name}] {state}  {url[:60]}")
-    return state, text
 
-
-# ── Skip passkey / FIDO setup ────────────────────────────────────────
-async def skip_fido(page):
-    for sel in ['button:has-text("Cancel")', 'button:has-text("取消")',
-                'button:has-text("Skip")',   'button:has-text("Not now")',
-                'button:has-text("Maybe later")', 'button:has-text("Do it later")']:
-        try:
-            btn = page.locator(sel).filter(
-                has_not=page.locator('[aria-label="Close"],[data-testid="dismissIcon"]')
-            ).first
-            if await btn.count() > 0 and await btn.is_visible():
-                txt = (await btn.text_content() or "").strip()
-                print(f"    skip passkey: '{txt}'")
-                await btn.click(timeout=5000)
-                return True
-        except Exception:
-            pass
+def snap(page, tag, name, idx):
     try:
-        await page.goto("https://account.microsoft.com/", timeout=20000,
-                        wait_until="domcontentloaded")
-        return True
+        path = f"{SCREENSHOT_DIR}/{tag}_{name}.png"
+        page.screenshot(path=path, full_page=True)
     except Exception:
         pass
-    return False
+    state = classify(page)
+    print(f"    [{name}] {state}  {(page.url or '')[:60]}")
+    return state
 
 
-# ── Press-and-hold (same logic as register_outlook_standalone.py) ────
-async def _press_hold(page, box):
-    bx, by, bw, bh = box['x'], box['y'], box['width'], box['height']
-    cx = bx + bw * random.uniform(0.35, 0.65)
-    cy = by + bh * random.uniform(0.40, 0.70)
-    sx, sy = random.uniform(200, 800), random.uniform(200, 400)
-    await page.mouse.move(sx, sy)
-    await asyncio.sleep(random.uniform(0.3, 0.8))
-    steps = random.randint(15, 30)
-    ctrl_x = (sx + cx) / 2 + random.uniform(-100, 100)
-    ctrl_y = (sy + cy) / 2 + random.uniform(-80, 80)
-    for step in range(1, steps + 1):
-        t = step / steps
-        mx = (1-t)**2*sx + 2*(1-t)*t*ctrl_x + t**2*cx + random.uniform(-1.5, 1.5)
-        my = (1-t)**2*sy + 2*(1-t)*t*ctrl_y + t**2*cy + random.uniform(-1.5, 1.5)
-        await page.mouse.move(mx, my)
-        await asyncio.sleep(random.uniform(0.005, 0.025))
-    await asyncio.sleep(random.uniform(0.1, 0.3))
-    await page.mouse.down()
-    hold = random.uniform(9.0, 11.0)
-    t0 = asyncio.get_event_loop().time()
-    while asyncio.get_event_loop().time() - t0 < hold:
-        await page.mouse.move(cx + random.uniform(-0.8, 0.8),
-                              cy + random.uniform(-0.8, 0.8))
-        await asyncio.sleep(random.uniform(0.08, 0.25))
-    await page.mouse.up()
-    return hold
-
-async def _find_hold_target(page):
-    for sel in ['button:has-text("Press and hold")', 'button:has-text("按住不放")',
-                'button:has-text("长按")', '#px-captcha']:
-        try:
-            btn = page.locator(sel).first
-            if await btn.count() > 0:
-                box = await btn.bounding_box()
-                if box and box['width'] > 30: return box
-        except Exception: pass
+def clear_live_cookies(page):
+    """账号间隔离:清 live.com 域 cookie,避免上个账号 session 残留。"""
     try:
-        iframes = page.locator('iframe[src*="hsprotect.net"]')
-        for i in range(await iframes.count()):
-            box = await iframes.nth(i).bounding_box()
-            if box and box['width'] > 50 and box['height'] > 30: return box
-    except Exception: pass
-    for f in page.frames:
-        if not f.url or f.url == "about:blank" or f == page.main_frame: continue
-        try:
-            for sel in ['#px-captcha', 'button[class*="hold"]', 'button']:
-                btns = f.locator(sel)
-                for bi in range(await btns.count()):
-                    box = await btns.nth(bi).bounding_box()
-                    if box and box['width'] > 30 and box['height'] > 20: return box
+        page.run_js_loaded(
+            "document.cookie.split(';').forEach(function(c){"
+            "var k=(c.split('=')[0]||'').trim(); if(!k) return;"
+            "['','.live.com','login.live.com','account.live.com'].forEach(function(d){"
+            "document.cookie=k+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;domain='+d+';path=/';"
+            "});}); return true;"
+        )
+    except Exception:
+        pass
+
+
+def _fill_login_email(page, email, tag):
+    try:
+        el = _ele(page, 'css:input[name="loginfmt"]', timeout=8) \
+             or _ele(page, 'css:input[type="email"]', timeout=2)
+        if el:
+            _safe_input(el, email)
+            _click_next(page, tag)
+    except Exception as e:
+        print(f"    fill(email) error: {e}")
+
+
+def _fill_login_password(page, password, tag):
+    try:
+        el = _ele(page, 'css:input[type="password"]', timeout=8)
+        if el:
+            _safe_input(el, password)
+            _click_next(page, tag)
+    except Exception as e:
+        print(f"    fill(pwd) error: {e}")
+
+
+def _page_go_back(page):
+    for fn in ("back", "go_back"):
+        m = getattr(page, fn, None)
+        if callable(m):
+            try:
+                m(); return
+            except Exception:
+                pass
+    try:
+        page.run_js_loaded("history.back();")
+    except Exception:
+        pass
+
+
+# ── per-tab 代理归一化 ─────────────────────────────────────────────
+def _per_tab_format(proxy_str):
+    """归一化为 ruyipage set_per_tab_proxies 要求的 scheme://host:port:user:pass。
+    支持多种输入格式:
+      user:pass@host:port | host:port:user:pass
+      socks5://user:pass@host:port | http://user:pass@host:port
+      socks5://host:port:user:pass (已合规,原样返回)
+      host:port (无认证,per-tab 不支持,抛错跳过)
+    per-tab 内核按 userContextId 认证,必须带账号密码,且 user/pass 不能含冒号。
+    """
+    s = str(proxy_str or "").strip()
+    if not s:
+        raise ValueError("空代理")
+    # 已是 ruyipage 私有格式 scheme://host:port:user:pass(:// 后无 @) -> 原样
+    if "://" in s and "@" not in s.split("://", 1)[1]:
+        return s
+    parsed = _ruoyi._parse_ruoyi_proxy(s)
+    if not parsed or not parsed.get("host") or not parsed.get("port"):
+        raise ValueError(f"无法解析代理: {proxy_str}")
+    scheme = (parsed.get("scheme") or "socks5").lower()
+    user = parsed.get("username") or ""
+    pwd = parsed.get("password") or ""
+    if not user or not pwd:
+        raise ValueError(f"per-tab 代理必须带账号密码: {proxy_str}")
+    if ":" in user or ":" in pwd:
+        raise ValueError(f"per-tab 代理 user/pass 不能含冒号: {proxy_str}")
+    return f"{scheme}://{parsed['host']}:{parsed['port']}:{user}:{pwd}"
+
+
+# ── 浏览器启动 (参考 ruyi register_outlook :8844-8985, 精简)─────────
+def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
+    _install_shutdown_handlers()
+    user_agent = _pick_user_agent(idx)
+    opts = SimpleNamespace(concurrency=concurrency, ruoyi_slot=None)
+
+    tb = FirefoxOptions()
+    tb.set_browser_path(RUOYI_FIREFOX_PATH)
+    tb.set_profile(_ruoyi_profile_dir(opts, idx))
+
+    if proxy_pool:
+        per_tab = []
+        for p in proxy_pool:
+            try:
+                per_tab.append(_per_tab_format(p))
+            except ValueError as exc:
+                print(f"  {tag} 跳过不合规 per-tab 代理: {exc}", file=sys.stderr)
+        if per_tab:
+            tb.set_per_tab_proxies(per_tab, exhausted="wrap")
+            print(f"  {tag} 挂载 {len(per_tab)}/{len(proxy_pool)} 条代理到 per-tab 池(wrap)")
+        else:
+            print(f"  {tag} 代理池归一化后为空 -- 本机直连", file=sys.stderr)
+    else:
+        print(f"  {tag} 没挂代理 -- 直接本机出口", file=sys.stderr)
+
+    _apply_ruoyi_browser_ua(tb, tag, user_agent)
+    if headless:
+        _apply_ruoyi_headless_options(tb, tag, user_agent=user_agent)
+        tb.headless(True)
+
+    print(f"  {tag} 启动 ruyipage Firefox: model={_browser_model_name(RUOYI_FIREFOX_PATH)} "
+          f"headless={headless} ua={user_agent[:60]}...")
+
+    page = FirefoxPage(tb)
+    _track_browser_page(page)
+    setattr(page, "_ruoyi_px_motion_profile", _new_ruoyi_px_motion_profile())
+
+    try:
+        page.close_other_tabs(page)
+    except Exception:
+        pass
+
+    if proxy_pool:
+        try: _log_current_ip(proxy_pool, tag)
         except Exception: pass
-    return None
+
+    return page
 
 
-# ── Core unlock logic ─────────────────────────────────────────────────
-async def unlock_account(page, context, email, password, tag):
+def close_firefox(page):
+    """关闭单个账号浏览器:quit(force=True) 真正杀 firefox.exe 进程。
+
+    ruyipage 的 page.close() 只关当前标签页(源码 _pages/firefox_page.py 注释
+    明写"关闭当前标签页"),不杀进程;若用它,每做完一个账号 firefox 窗口残留,
+    concurrency=N 时实际窗口数会随账号数累积远超 N。必须用 quit(force=True)。
+
+    切勿在此调 _force_kill_ruoyi_firefox():它按 RUOYI_FIREFOX_PATH 全局强杀
+    所有 ruyi firefox,会误杀同批其他正在运行的 worker 实例。全局强杀只在
+    批次边界(所有 worker 空闲)调用,见 run() 末尾。
+    """
+    if page is None:
+        return
+    try:
+        _quit_browser_page(page, tag="unlock")
+    except Exception:
+        pass
+    _untrack_browser_page(page)
+
+
+def _load_login_page(page):
+    """加载 LOGIN_URL 并等渲染;wait_loading 超时/异常返回 False。
+
+    返回 False 视为连接问题(代理不稳/目标站加载超时),计入 net_err_count,
+    累计达阈值返回 proxy_dead -> discard 节点换新重试,避免空转空跑。
+    """
+    try:
+        page.get(LOGIN_URL)
+    except Exception:
+        return False
+    try:
+        page.wait_loading(20)
+        return True
+    except Exception:
+        return False
+
+
+# ── Core unlock logic (照搬原 unlock_account, 改 ruyipage API)────────
+def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS, timeout=UNLOCK_TIMEOUT):
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    deadline = time.time() + timeout
 
     # ── Step 1: Login ────────────────────────────────────────────────
-    await page.goto("https://login.live.com/login.srf",
-                    timeout=60000, wait_until="domcontentloaded")
-    await asyncio.sleep(2)
-
     net_err_count = 0
+    if not _load_login_page(page):
+        net_err_count += 1
+    time.sleep(2)
+
     for i in range(20):
-        state, _ = await snap(page, tag, f"L{i:02d}")
+        if time.time() > deadline: return "timeout"
+        state = snap(page, tag, f"L{i:02d}", idx)
+        if state == "abuse":
+            _click_any(page, _CONTINUE_SELECTORS, timeout=2)
+            time.sleep(3); continue
         if state == "logged_in":  return "already_ok"
         if state == "sms_verify": return "needs_phone"
         if state == "fido_setup":
-            await skip_fido(page); await asyncio.sleep(4)
+            _maybe_skip_passkey(page, tag); time.sleep(4)
             return "unlocked"
         if state in ("locked", "px_challenge"): break
         if state == "net_error":
             net_err_count += 1
-            if net_err_count >= 3: return "failed_net_error"
-            await page.goto("https://login.live.com/login.srf",
-                            timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(3); continue
+            if net_err_count >= 3: return "proxy_dead"
+            if not _load_login_page(page):
+                net_err_count += 1
+                if net_err_count >= 3: return "proxy_dead"
+            time.sleep(3); continue
+        if state == "error_page":
+            tried = _click_any(page, _RETRY_SELECTORS, timeout=2)
+            if not tried:
+                _page_go_back(page)
+            time.sleep(5 if tried else 3)
+            continue
         if state == "email_form":
-            try:
-                await page.locator('input[type="email"],input[name="loginfmt"]').first.fill(email, timeout=15000)
-                await page.keyboard.press("Enter")
-            except Exception as e:
-                print(f"    fill(email) error: {e}")
-            await asyncio.sleep(3); continue
+            _fill_login_email(page, email, tag)
+            time.sleep(3); continue
         if state == "login_form":
-            try:
-                pwd = page.locator('input[type="password"]').first
-                if await pwd.count() > 0 and not await pwd.input_value():
-                    await pwd.fill(password, timeout=15000)
-                await page.keyboard.press("Enter")
-            except Exception as e:
-                print(f"    fill(pwd) error: {e}")
-            await asyncio.sleep(3); continue
-        for sel in ['#idSIButton9', 'button:has-text("Next")',
-                    'input[type="submit"]', 'button[type="submit"]']:
-            b = page.locator(sel).first
-            if await b.count() > 0 and await b.is_visible():
-                await b.click(timeout=8000); await asyncio.sleep(2); break
-        else:
-            await asyncio.sleep(2)
+            _fill_login_password(page, password, tag)
+            time.sleep(3); continue
+        if not _click_any(page, ['css:#idSIButton9', 'css:button[type="submit"]',
+                                  'css:input[type="submit"]'], timeout=2):
+            time.sleep(2)
 
-    state, _ = await snap(page, tag, "L_final")
+    state = snap(page, tag, "L_final", idx)
     if state == "logged_in":  return "already_ok"
     if state == "sms_verify": return "needs_phone"
     if state == "fido_setup":
-        await skip_fido(page); await asyncio.sleep(4)
+        _maybe_skip_passkey(page, tag); time.sleep(4)
         return "unlocked"
 
     # ── Step 2: PX press-and-hold + unlock flow ──────────────────────
     press_count   = 0
-    max_press     = 5
     no_btn_rounds = 0
     px_api_tried  = False
     net_err_count = 0
+    abuse_rounds  = 0
+    loading_wait_started = None
 
     for i in range(60):
-        state, _ = await snap(page, tag, f"U{i:02d}")
+        if time.time() > deadline: return "timeout"
+        state = snap(page, tag, f"U{i:02d}", idx)
 
+        # 离开 Loading 页重置计时(loading -> 别的状态 -> 再 loading 重新计时)
+        if state != "loading" and loading_wait_started is not None:
+            loading_wait_started = None
+
+        if state == "loading":
+            # 微软 Loading 转圈页(PX 按压后等解锁结果):等它转完出 unblocked/跳转
+            # 参考注册 _update_loading_wait_state + loading_timed_out -> return timeout
+            if loading_wait_started is None:
+                loading_wait_started = time.time()
+                print(f"    [{tag}] Microsoft Loading, waiting for redirect...")
+            elif time.time() - loading_wait_started > LOADING_WAIT_TIMEOUT:
+                print(f"    [{tag}] Loading stuck {int(time.time()-loading_wait_started)}s, give up", file=sys.stderr)
+                return "failed_loading_timeout"
+            time.sleep(3); continue
+
+        if state == "abuse":
+            # Abuse?id=389 中间过渡页:点英文"继续"尝试跳 logged_in
+            # 跳到 logged_in 才算成功;连点 5 轮没跳走 -> failed_abuse,不误判成功
+            if abuse_rounds >= 5:
+                return "failed_abuse"
+            abuse_rounds += 1
+            _click_any(page, _CONTINUE_SELECTORS, timeout=2)
+            time.sleep(3); continue
         if state == "logged_in":  return "unlocked"
         if state == "sms_verify": return "needs_phone"
         if state == "fido_setup":
-            await skip_fido(page); await asyncio.sleep(4)
+            _maybe_skip_passkey(page, tag); time.sleep(4)
             return "unlocked"
         if state == "error_page":
-            tried = False
-            for sel in ['button:has-text("Try again")', 'button:has-text("重试")',
-                        'button:has-text("再试一次")', 'a:has-text("Try again")']:
-                b = page.locator(sel).first
-                if await b.count() > 0 and await b.is_visible():
-                    try: await b.click(timeout=8000)
-                    except Exception: pass
-                    await asyncio.sleep(5); tried = True; break
+            tried = _click_any(page, _RETRY_SELECTORS, timeout=2)
             if not tried:
-                await page.go_back(); await asyncio.sleep(3)
+                _page_go_back(page)
+            time.sleep(5 if tried else 3)
             continue
         if state == "net_error":
             net_err_count += 1
-            if net_err_count >= 5: return "failed_net_error"
-            await page.goto("https://login.live.com/login.srf",
-                            timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(3); continue
+            if net_err_count >= 5: return "proxy_dead"
+            if not _load_login_page(page):
+                net_err_count += 1
+                if net_err_count >= 5: return "proxy_dead"
+            time.sleep(3); continue
 
         if state == "locked":
-            for sel in ['button[type="submit"]', 'button:has-text("Next")',
-                        'button:has-text("下一步")', 'input[type="submit"]']:
-                b = page.locator(sel).first
-                if await b.count() > 0 and await b.is_visible():
-                    try: await b.click(timeout=8000)
-                    except Exception: pass
-                    await asyncio.sleep(6); break
-            continue
+            _click_any(page, ['css:button[type="submit"]', 'css:#idSIButton9',
+                              'css:input[type="submit"]'], timeout=2)
+            time.sleep(6); continue
 
         if state == "px_challenge":
             if press_count < max_press:
-                box = await _find_hold_target(page)
-                if box:
+                # 等待找到真正按压按钮(#px-captcha 等)再按,不用 iframe-box fallback 急按
+                ctx = None; target = None
+                for c in _ruoyi._all_contexts(page):
+                    try:
+                        t = _ruoyi._find_hold_target(c)
+                    except Exception:
+                        t = None
+                    if t and _ruoyi._target_quality(t) <= 5:
+                        ctx, target = c, t
+                        break
+                if target and ctx:
                     press_count += 1
-                    held = await _press_hold(page, box)
-                    print(f"    held {held:.1f}s (#{press_count})")
-                    await asyncio.sleep(random.uniform(3, 6))
+                    held = _perform_hold_with_px_screenshots(
+                        page, ctx, target, idx, press_count, tag, enabled=True)
+                    print(f"    held {held} (#{press_count})")
+                    _wait_before_next_captcha_press(tag, reason="unlock press")
                     no_btn_rounds = 0
                 else:
                     no_btn_rounds += 1
                     print(f"    no hold target (round {no_btn_rounds})")
-                    await asyncio.sleep(3)
+                    time.sleep(3)
             elif not px_api_tried:
                 px_api_tried = True
                 print("    fallback: EZCaptcha PX API...")
                 sol = solve_px(page_url=page.url)
                 if sol:
-                    for key in ['_pxCaptcha', '_px3', '_px2', '_pxhd', '_pxvid', '_pxde']:
-                        if key in sol:
-                            await context.add_cookies([{
-                                "name": key, "value": str(sol[key]),
-                                "domain": ".live.com", "path": "/"
-                            }])
-                    tok = sol.get("token") or sol.get("uuid")
-                    if tok:
-                        await page.evaluate(f"""() => {{
-                            const h = document.querySelector('input[name="_pxCaptcha"]');
-                            if (h) h.value = "{tok}";
-                        }}""")
-                    await page.reload(timeout=15000); await asyncio.sleep(5)
+                    inject_px_solution(page, sol)
+                    try: page.get(page.url)
+                    except Exception: pass
+                    time.sleep(5)
                 else:
-                    print("    PX API failed — giving up"); break
+                    print("    PX API failed - giving up"); break
             else:
                 print("    all PX attempts exhausted"); break
             continue
 
         # Generic next/submit for intermediate steps
-        for sel in ['button[type="submit"]', 'button:has-text("Next")',
-                    'button:has-text("下一步")', '#idSIButton9', 'input[type="submit"]']:
-            b = page.locator(sel).first
-            if await b.count() > 0 and await b.is_visible():
-                await b.click(timeout=8000); await asyncio.sleep(4); break
-        else:
-            await asyncio.sleep(3)
+        if not _click_any(page, ['css:button[type="submit"]', 'css:#idSIButton9',
+                                  'css:input[type="submit"]'], timeout=2):
+            time.sleep(3)
 
-    state, _ = await snap(page, tag, "U_final")
+    state = snap(page, tag, "U_final", idx)
     if state == "logged_in":  return "unlocked"
+    if state == "abuse":      return "failed_abuse"
     if state == "sms_verify": return "needs_phone"
     if state == "fido_setup":
-        await skip_fido(page); await asyncio.sleep(4)
+        _maybe_skip_passkey(page, tag); time.sleep(4)
         return "unlocked"
     return f"failed_{state}"
 
 
 # ── Worker ────────────────────────────────────────────────────────────
-async def worker(accounts, proxy, worker_id, results, sem):
+async def _attempt_account(pool, worker_id, args, concurrency, tag, email, password):
+    """take 代理 -> 开浏览器 -> 解锁 -> 关浏览器。返回 outcome。
+    proxy_dead 时调用方 discard 失效代理后重试(换节点)。"""
+    selected_pool = []
+    reused = False
+    if pool is not None:
+        try:
+            selected_pool = select_proxy_for_account(pool, runtime=pool) or []
+        except Exception:
+            selected_pool = []
+        if not selected_pool and hasattr(pool, "borrow_reuse"):
+            selected_pool = pool.borrow_reuse() or []
+            reused = bool(selected_pool)
+        masked = mask_ruoyi_proxy(selected_pool[0]) if selected_pool else "noproxy"
+        rem = pool.remaining() if hasattr(pool, "remaining") else "?"
+        print(f"[worker-{worker_id}] proxy -> {masked} remaining={rem}{' [reused]' if reused else ''}")
+
+    # 代理预检(开浏览器前):走代理打 login.live.com / signup.live.com,
+    # 不通直接 proxy_dead -> 末尾 discard 节点换新重试,不浪费浏览器窗口。
+    # 与 ruyi 注册 _probe_proxy_before_browser 一致(打目标站本身,非 IP 查询服务)。
+    if selected_pool:
+        try:
+            precheck_ok = await asyncio.to_thread(
+                _probe_proxy_before_browser, selected_pool, f"[{tag}][precheck]")
+        except Exception as exc:
+            print(f"[worker-{worker_id}] proxy precheck error: {exc}", file=sys.stderr)
+            precheck_ok = False
+        if not precheck_ok:
+            print(f"[worker-{worker_id}] proxy precheck failed (login.live.com 不可达) -> proxy_dead", file=sys.stderr)
+            # discard 废代理(非 reused),让 worker 重试 take 换新节点;reused 不动(共享出口)
+            if pool is not None and not reused and hasattr(pool, "discard"):
+                try: pool.discard(selected_pool[0])
+                except Exception: pass
+            return "proxy_dead"
+
+    page = None
+    try:
+        page = await asyncio.to_thread(
+            launch_firefox, selected_pool, worker_id, args.headless, concurrency, tag)
+    except Exception as e:
+        print(f"[worker-{worker_id}] launch error: {e}")
+        # launch 失败多半代理问题:discard 失效代理,return proxy_dead 让 worker 换节点重试(不当放弃)
+        if pool is not None and selected_pool and not reused:
+            if hasattr(pool, "discard"):
+                try: pool.discard(selected_pool[0])
+                except Exception: pass
+            else:
+                try: release_proxy_for_account(selected_pool[0], runtime=pool)
+                except Exception: pass
+        return "proxy_dead"
+
+    try:
+        await asyncio.to_thread(clear_live_cookies, page)
+        outcome = await asyncio.to_thread(
+            unlock_account, page, email, password, tag, worker_id,
+            args.max_press, args.timeout)
+    except Exception as e:
+        outcome = f"error: {str(e)[:80]}"
+    finally:
+        await asyncio.to_thread(close_firefox, page)
+
+    # proxy_dead: 代理失效,discard 永久移除(让重试 take 换新节点);其他结果正常 release
+    if pool is not None and selected_pool and not reused:
+        if outcome == "proxy_dead" and hasattr(pool, "discard"):
+            try: pool.discard(selected_pool[0])
+            except Exception: pass
+        else:
+            try: release_proxy_for_account(selected_pool[0], runtime=pool)
+            except Exception: pass
+    return outcome
+
+
+async def worker(accounts, pool, worker_id, results, sem, args, concurrency):
     async with sem:
+        tag = f"w{worker_id}"
         for email, password, raw_line in accounts:
-            tag = f"w{worker_id}"
-            pid = None
             print(f"\n[worker-{worker_id}] {email}")
-            try:
-                pid = create_browser(f"unlock_{worker_id}", proxy)
-                ws  = open_browser(pid)
-                if not ws:
-                    raise Exception("no WS url from BitBrowser")
-
-                async with async_playwright() as pw:
-                    browser = await pw.chromium.connect_over_cdp(ws)
-                    ctx  = browser.contexts[0] if browser.contexts else await browser.new_context()
-                    page = ctx.pages[0]       if ctx.pages       else await ctx.new_page()
-
-                    outcome = await asyncio.wait_for(
-                        unlock_account(page, ctx, email, password, tag),
-                        timeout=UNLOCK_TIMEOUT
-                    )
-
-                print(f"[worker-{worker_id}] {email} => {outcome}")
-                results.append((email, password, raw_line, outcome))
-
-            except asyncio.TimeoutError:
-                print(f"[worker-{worker_id}] {email} => timeout")
-                results.append((email, password, raw_line, "timeout"))
-            except Exception as e:
-                print(f"[worker-{worker_id}] {email} => error: {e}")
-                results.append((email, password, raw_line, f"error: {str(e)[:80]}"))
-            finally:
-                if pid:
-                    close_browser(pid)
-                    delete_browser(pid)
+            outcome = await _attempt_account(pool, worker_id, args, concurrency, tag, email, password)
+            # 代理无法访问微软 -> discard 失效节点 -> 换新节点重开浏览器重试
+            retry = 0
+            while outcome == "proxy_dead" and retry < MAX_PROXY_RETRY:
+                retry += 1
+                print(f"[worker-{worker_id}] 代理无法访问微软,换节点重试 {retry}/{MAX_PROXY_RETRY}", file=sys.stderr)
+                outcome = await _attempt_account(pool, worker_id, args, concurrency, tag, email, password)
+            print(f"[worker-{worker_id}] {email} => {outcome}")
+            results.append((email, password, raw_line, outcome))
 
 
-# ── File I/O ──────────────────────────────────────────────────────────
+# ── File I/O (照搬原版)───────────────────────────────────────────────
 def load_accounts(path):
     accounts = []
     with open(path, "r", encoding="utf-8") as f:
@@ -495,7 +658,6 @@ def scan_all_accounts():
     reg_dir = "outlook_accounts"
     unlock_dir = "unlock_results"
 
-    # Collect already-unlocked emails
     unlocked_emails = set()
     if os.path.isdir(unlock_dir):
         for uf in os.listdir(unlock_dir):
@@ -506,7 +668,6 @@ def scan_all_accounts():
                         if parts and parts[0]:
                             unlocked_emails.add(parts[0].lower())
 
-    # Collect all registered accounts, deduplicate by email, skip unlocked
     seen = set()
     accounts = []
     if os.path.isdir(reg_dir):
@@ -527,19 +688,6 @@ def scan_all_accounts():
         print(f"[auto] Skipping {len(unlocked_emails)} already-unlocked accounts")
     print(f"[auto] {len(accounts)} new accounts to unlock from {reg_dir}/")
     return accounts
-
-def load_proxies(path):
-    if not path:
-        return [None]   # no proxy by default
-    if not os.path.exists(path):
-        return DEFAULT_PROXIES
-    proxies = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                proxies.append(line)
-    return proxies or DEFAULT_PROXIES
 
 def save_results(results, ts):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -565,13 +713,28 @@ def save_results(results, ts):
     print(f"  Failed    : {len(failed)}")
     print(f"{'='*55}")
 
-    # Convenience: write just email----password for unlocked accounts
     ok_path = os.path.join(OUTPUT_DIR, f"unlocked_clean_{ts}.txt")
     with open(ok_path, "w", encoding="utf-8") as f:
         for email, password, _, _ in unlocked:
             f.write(f"{email}----{password}\n")
     if unlocked:
         print(f"\n  Clean unlocked list: {ok_path}")
+
+
+# ── 代理池构建 (参考 outlook_reg_loop._one_attempt_ruoyi)────────────
+def build_pool(args):
+    source_args = SimpleNamespace(
+        proxy_file=args.proxy_file or "",
+        proxy_source=args.proxy_source,
+        proxy_url=getattr(args, "proxy_url", "") or "",
+        aimili_url=args.aimili_url,
+        aimili_token=args.aimili_token,
+    )
+    pool = ConsumableProxyPool.from_args(source_args).start()
+    set_consumable_proxy_pool(pool)
+    st = pool.stats() if hasattr(pool, "stats") else {}
+    print(f"[pool] source={st.get('source', args.proxy_source)} size={st.get('remaining', '?')}")
+    return pool
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -590,7 +753,7 @@ def find_latest_input():
             return os.path.join(d, files[0])
     return None
 
-async def run(accounts_or_file, proxies, concurrency):
+async def run(accounts_or_file, args, pool):
     if isinstance(accounts_or_file, str):
         accounts = load_accounts(accounts_or_file)
         label = accounts_or_file
@@ -601,10 +764,10 @@ async def run(accounts_or_file, proxies, concurrency):
     if not accounts:
         print("[error] no accounts found"); return
 
+    concurrency = args.concurrency
     print(f"Input     : {label}")
     print(f"Accounts  : {len(accounts)}")
     print(f"Concurrency: {concurrency}")
-    print(f"Proxies   : {len(proxies)}")
 
     results = []
     sem     = asyncio.Semaphore(concurrency)
@@ -613,32 +776,92 @@ async def run(accounts_or_file, proxies, concurrency):
         chunks[i % concurrency].append(acc)
 
     await asyncio.gather(*[
-        worker(chunks[i], proxies[i % len(proxies)], i, results, sem)
+        worker(chunks[i], pool, i, results, sem, args, concurrency)
         for i in range(concurrency)
         if chunks[i]
     ])
 
+    # 批次结束:所有 worker 已空闲,强杀残留 ruyi Firefox(quit 超时兜底,防窗口累积/XPCOM)
+    try:
+        _force_kill_ruoyi_firefox()
+    except Exception:
+        pass
+
     save_results(results, datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+def _install_force_shutdown():
+    """Ctrl-C 直接强杀:不等浏览器优雅关闭。
+    解锁卡在被锁/PX 页时,ruyi 的 _close_tracked_browser_pages 同步关 Firefox 会挂,
+    导致优雅 handler 卡死、Ctrl-C 无响应。这里直接 os._exit。"""
+    _ruoyi._SHUTDOWN_HANDLERS_INSTALLED = True  # 阻止 launch_firefox 内 _install_shutdown_handlers 装优雅 handler
+
+    def _handler(signum, _frame):
+        print("\n[shutdown] 收到中断,强杀退出(os._exit)", file=sys.stderr)
+        os._exit(0)
+
+    for sig_name in ("SIGINT", "SIGBREAK", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handler)
+            except Exception:
+                pass
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch Outlook Account Unlock",
+        description="Batch Outlook Account Unlock (ruyipage Firefox edition)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python unlock_outlook.py --input outlook_accounts/accounts_20260414_124527.txt
   python unlock_outlook.py --input emails_locked.txt --concurrency 2
-  python unlock_outlook.py --input emails.txt --proxy-file proxies.txt --concurrency 3
+  python unlock_outlook.py --proxy-file proxies_outlook.txt --proxy-source aimili-list --aimili-url http://host:8787 --aimili-token XXX
   python unlock_outlook.py                          (auto-scan all accounts, skip unlocked)
 """)
     parser.add_argument("--input", "-i", default=None,
         help="Input file (email----password per line). "
              "Auto-scans outlook_accounts/ and skips already-unlocked if omitted.")
-    parser.add_argument("--proxy-file", "-p", default=None,
-        help="Proxy list file (one per line)")
+    parser.add_argument("--proxy-file", "-p",
+        default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+        help="Proxy list file (one user:pass@host:port per line)")
+    parser.add_argument("--proxy-source",
+        default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
+        choices=["file", "http", "aimili-list", "aimili-random"],
+        help="file/http/aimili-list/aimili-random (file=本地文件;http=HTTP GET 拉 txt 列表)")
+    parser.add_argument("--proxy-url",
+        default=os.environ.get("OUTLOOK_PROXY_URL", ""),
+        help="HTTP GET 代理列表地址(返回 txt,每行一条;配合 --proxy-source=http)")
+    parser.add_argument("--aimili-url",
+        default=(os.environ.get("OUTLOOK_AIMILI_POOL_URL")
+                 or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")),
+        help="AimiliVPN URL: 根地址或 /api/pool/proxies(/random) 完整地址")
+    parser.add_argument("--aimili-token",
+        default=os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", ""),
+        help="AimiliVPN 代理池 API Token")
     parser.add_argument("--concurrency", "-c", type=int, default=1,
         help="Parallel workers (default: 1)")
+    parser.add_argument("--headless", action="store_true",
+        help="无头模式启动 Firefox")
+    parser.add_argument("--max-press", type=int,
+        default=int(os.environ.get("OUTLOOK_REG_MAX_PRESS", str(DEFAULT_MAX_PRESS))),
+        help="PX press-and-hold cap (default: 5)")
+    parser.add_argument("--timeout", type=int, default=UNLOCK_TIMEOUT,
+        help="hard cap per account (seconds)")
+    parser.add_argument("--log-level",
+        default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
+        choices=["DEBUG", "INFO", "WARN", "PROD", "ERR"],
+        help="log verbosity")
     args = parser.parse_args()
+
+    set_log_level(args.log_level)
+    _install_force_shutdown()
+    os.environ["OUTLOOK_PROXY_FILE"] = args.proxy_file
+    os.environ["OUTLOOK_RUOYI_PROXY_SOURCE"] = args.proxy_source
+    if args.aimili_url:   os.environ["OUTLOOK_AIMILI_POOL_URL"] = args.aimili_url
+    if args.aimili_token: os.environ["OUTLOOK_AIMILI_POOL_TOKEN"] = args.aimili_token
+    if getattr(args, "proxy_url", ""): os.environ["OUTLOOK_PROXY_URL"] = args.proxy_url
+    os.environ["OUTLOOK_REG_MAX_PRESS"] = str(args.max_press)
 
     if args.input:
         if not os.path.exists(args.input):
@@ -646,15 +869,13 @@ Examples:
             sys.exit(1)
         accounts_or_file = args.input
     else:
-        # Auto-scan all accounts, skip already unlocked
         accounts_or_file = scan_all_accounts()
         if not accounts_or_file:
             print("[info] No new accounts to unlock.")
             sys.exit(0)
 
-    cleanup_stale_browsers()
-    proxies = load_proxies(args.proxy_file)
-    asyncio.run(run(accounts_or_file, proxies, args.concurrency))
+    pool = build_pool(args)
+    asyncio.run(run(accounts_or_file, args, pool))
 
 if __name__ == "__main__":
     main()

@@ -64,3 +64,7 @@ log/
 email_nograph.txt
 emails.txt.lock
 email_nograph.txt.lock
+
+# unlock 运行期结果与选中账号清单（不进库）
+unlock_results/
+selected_accounts_*.txt

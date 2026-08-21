@@ -42,6 +42,18 @@ function renderChoiceOptions(choices, selected){
   }).join('');
 }
 
+// ---------------------------------------------------------------- 条件字段 visible_if
+// schema 可在参数上加 visible_if: {flag, equals|in}
+// 依赖字段值满足时显示该行，否则隐藏；隐藏字段不进 collectArgs/collectFormValues
+function fieldVisible(a, values){
+  const cond = a.visible_if;
+  if(!cond || !cond.flag) return true;
+  const cur = values[cond.flag];
+  const curStr = (cur===undefined || cur===null) ? '' : String(cur);
+  if(cond.in) return cond.in.map(String).includes(curStr);
+  return cond.equals !== undefined ? String(cond.equals)===curStr : true;
+}
+
 // ---------------------------------------------------------------- 状态灯轮询
 async function pollStatus(){
   try{
@@ -147,8 +159,42 @@ function renderForm(s, saved={}){
   h.innerHTML = `<h2 class="form-title">${s.title}</h2><p class="form-desc">${s.desc||''}</p>`;
   p.appendChild(h);
 
+  // 依赖字段当前值快照(供 visible_if 判定)
+  const values = {};
+  s.args.forEach(a=>{
+    const label = a.flag.replace(/^--/,'');
+    const val = argValue(a, saved);
+    if(a.type==='multi'){
+      values[a.flag] = Array.isArray(val) ? val.map(String) : (val ? [String(val)] : []);
+    }else{
+      values[a.flag] = (val===undefined||val===null) ? '' : val;
+    }
+  });
+
+  const applyVisibility = ()=>{
+    s.args.forEach(a=>{
+      const label = a.flag.replace(/^--/,'');
+      // 依赖字段值实时取最新控件值
+      const depEl = $(`#f_${label}`);
+      if(depEl && a.type!=='multi'){
+        if(a.type==='bool'){ values[a.flag] = depEl.checked; }
+        else if(a.type==='int'){ const raw=depEl.value.trim(); values[a.flag]= raw===''? '': parseInt(raw,10); }
+        else { values[a.flag] = depEl.value.trim(); }
+      }
+      if(a.type==='multi'){
+        values[a.flag] = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+      }
+    });
+    s.args.forEach(a=>{
+      const row = document.getElementById(`row_${a.flag}`);
+      if(!row) return;
+      row.style.display = fieldVisible(a, values) ? '' : 'none';
+    });
+  };
+
   s.args.forEach(a=>{
     const f = document.createElement('div'); f.className='field';
+    f.id = `row_${a.flag}`;
     const label = a.flag.replace(/^--/,'');
     const val = argValue(a, saved);
     if(a.type==='bool'){
@@ -171,13 +217,19 @@ function renderForm(s, saved={}){
         }).join('')}</div>
         ${a.help?`<div class="fhelp">${escHtml(a.help)}</div>`:''}`;
     }else{
-      const t = a.type==='int' ? 'number' : 'text';
+      const t = a.type==='int' ? 'number' : (a.secret ? 'password' : 'text');
       f.innerHTML = `<label>${escHtml(label)}</label>
-        <input type="${t}" id="f_${label}" value="${escAttr(val!==undefined&&val!==null?val:'')}" placeholder="${escAttr(a.help||'')}">
+        <input type="${t}" id="f_${label}" value="${escAttr(val!==undefined&&val!==null?val:'')}" placeholder="${escAttr(a.help||'')}" ${a.secret?'autocomplete="new-password"':''}>
         ${a.help?`<div class="fhelp">${escHtml(a.help)}</div>`:''}`;
     }
     p.appendChild(f);
+    // 任何字段变化都触发显隐重算(被依赖的字段如 --proxy-source 自身没有 visible_if,
+    // 它的 change 也要触发,否则依赖它的 --proxy-url 等不会显隐更新)
+    const el = $(`#f_${label}`);
+    if(el){ el.addEventListener('change', applyVisibility); }
   });
+
+  applyVisibility();
 
   const actions = document.createElement('div');
   actions.className = 'form-actions';
@@ -185,7 +237,7 @@ function renderForm(s, saved={}){
   btn.className='btn-run'; btn.textContent='▶ 运行';
   btn.onclick = runScript;
   actions.appendChild(btn);
-  if(['register_outlook_ruoyi'].includes(s.id)){
+  if(['register_outlook_ruoyi', 'unlock_outlook'].includes(s.id)){
     const saveBtn = document.createElement('button');
     saveBtn.className = 'btn-run';
     saveBtn.textContent = '保存当前配置';
@@ -208,7 +260,20 @@ function renderForm(s, saved={}){
 
 function collectFormValues(s){
   const args = {};
+  const values = {};
   s.args.forEach(a=>{
+    const label = a.flag.replace(/^--/,'');
+    const depEl = $(`#f_${label}`);
+    if(a.type==='bool'){
+      values[a.flag] = depEl ? depEl.checked : a.default;
+    }else if(a.type==='multi'){
+      values[a.flag] = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+    }else{
+      values[a.flag] = depEl ? depEl.value.trim() : (a.default||'');
+    }
+  });
+  s.args.forEach(a=>{
+    if(!fieldVisible(a, values)) return;
     const label = a.flag.replace(/^--/,'');
     if(a.type==='bool'){
       args[a.flag] = $(`#f_${label}`).checked;
@@ -223,12 +288,26 @@ function collectFormValues(s){
 
 function collectArgs(s){
   const args = {};
+  const values = {};
   s.args.forEach(a=>{
     const label = a.flag.replace(/^--/,'');
+    const depEl = $(`#f_${label}`);
     if(a.type==='bool'){
-      args[a.flag] = $(`#f_${label}`).checked;
+      values[a.flag] = depEl ? depEl.checked : a.default;
     }else if(a.type==='multi'){
-      args[a.flag] = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+      values[a.flag] = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+    }else{
+      values[a.flag] = depEl ? depEl.value.trim() : (a.default||'');
+    }
+  });
+  s.args.forEach(a=>{
+    if(!fieldVisible(a, values)) return;
+    const label = a.flag.replace(/^--/,'');
+    if(a.type==='bool'){
+      if($(`#f_${label}`).checked) args[a.flag] = true;
+    }else if(a.type==='multi'){
+      const v = $$(`input[data-multi="${label}"]:checked`).map(x=>x.value);
+      if(v.length) args[a.flag] = v;
     }else{
       const v = $(`#f_${label}`).value.trim();
       if(v!=='') args[a.flag] = a.type==='int' ? parseInt(v,10) : v;

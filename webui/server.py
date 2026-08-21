@@ -772,8 +772,25 @@ async def api_env_set(request: Request):
     return {"ok": True, "saved": len(updates)}
 
 
+def _field_visible(spec, args):
+    """schema 参数的 visible_if 条件判定(与前端 app.js fieldVisible 对齐)。
+    无条件或条件满足 -> True；依赖字段值不匹配 -> False。
+    用于 _build_cmd 服务端过滤：即使前端误传了隐藏字段值，也不拼进 CLI。"""
+    cond = spec.get("visible_if")
+    if not cond or not cond.get("flag"):
+        return True
+    cur = args.get(cond["flag"])
+    cur_str = "" if cur in (None, "") else str(cur)
+    if "in" in cond:
+        return cur_str in {str(v) for v in cond["in"]}
+    if "equals" in cond:
+        return str(cond["equals"]) == cur_str
+    return True
+
+
 def _build_cmd(script, args):
-    """把前端提交的 args(dict) 按 schema 拼成命令行 list。"""
+    """把前端提交的 args(dict) 按 schema 拼成命令行 list。
+    带有 visible_if 的字段在依赖条件不满足时被跳过(与前端 collectArgs 一致)。"""
     cmd = [sys.executable, "-u", os.path.join(ROOT, script["file"])]
     cmd.extend(str(x) for x in script.get("fixed_args", []))
     positional = []
@@ -784,8 +801,10 @@ def _build_cmd(script, args):
         val = args[flag]
         typ = spec["type"]
         if spec.get("positional"):
-            if val not in (None, "", []):
+            if _field_visible(spec, args) and val not in (None, "", []):
                 positional.append(str(val))
+            continue
+        if not _field_visible(spec, args):
             continue
         if typ == "bool":
             if val:

@@ -1918,7 +1918,12 @@ def fetch_proxy_list_http(proxy_url, timeout=12):
         ),
     })
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    # 强制直连拉列表:urllib 默认会吃 HTTP_PROXY/HTTPS_PROXY/WinIE 系统代理,
+    # 把这次拉代理的请求也送进本机代理(Clash/V2Ray/公司代理),端口拒绝就 WinError 10061。
+    # 这里用空 ProxyHandler 显式禁用代理,确保直连到代理池 API。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    with opener.open(req, timeout=timeout) as resp:
 
         data = resp.read().decode("utf-8", errors="replace")
 
@@ -2218,6 +2223,56 @@ class ConsumableProxyPool:
             self._active_exit_keys.discard(exit_key)
 
             return released
+
+
+
+    def borrow_reuse(self):
+
+        """代理不足(take 返回 [])时强制复用池里任意一条。
+
+        不删除、不加入 _active_exit_keys、release 无效 -- 仅供并发 worker 数 > 代理数时共享出口 IP。
+
+        返回 [proxy] 或 []。"""
+
+        with self._lock:
+
+            if not self._list:
+
+                self._load_locked()
+
+            if not self._list:
+
+                return []
+
+            return [self._list[random.randrange(len(self._list))]]
+
+
+
+    def discard(self, proxy):
+
+        """永久移除一条代理(失效/不可用),不再分配。take 不会再取到它。"""
+
+        proxy = str(proxy or "").strip()
+
+        if not proxy:
+
+            return False
+
+        with self._lock:
+
+            exit_key = self._active_proxy_keys.pop(proxy, None) or _proxy_exit_key(proxy)
+
+            self._active_exit_keys.discard(exit_key)
+
+            try:
+
+                self._list.remove(proxy)
+
+            except ValueError:
+
+                pass
+
+            return True
 
 
 
@@ -2817,23 +2872,23 @@ class _RuoyiHarCollector:
 
     def start(self):
 
-        listen = getattr(self.page, "listen", None)
+        capture = getattr(self.page, "capture", None)
 
-        if listen is None:
+        if capture is None:
 
-            log(f"  {self.tag} HAR listen API unavailable", "WARN")
+            log(f"  {self.tag} HAR capture API unavailable", "WARN")
 
             return False
 
         try:
 
-            listen.start(targets=True, collect_response=False)
+            capture.start(targets=True, collect_bodies=True)
 
             self.started = True
 
         except Exception as exc:
 
-            log(f"  {self.tag} HAR listen start failed: {type(exc).__name__}: {exc}", "WARN")
+            log(f"  {self.tag} HAR capture start failed: {type(exc).__name__}: {exc}", "WARN")
 
             return False
 
@@ -2845,7 +2900,7 @@ class _RuoyiHarCollector:
 
                 try:
 
-                    packet = listen.wait(timeout=0.5)
+                    packet = capture.wait(timeout=0.5)
 
                 except Exception:
 
@@ -2889,9 +2944,9 @@ class _RuoyiHarCollector:
 
         try:
 
-            if self.started and getattr(self.page, "listen", None) is not None:
+            if self.started and getattr(self.page, "capture", None) is not None:
 
-                self.page.listen.stop()
+                self.page.capture.stop()
 
         except Exception:
 
@@ -2949,7 +3004,7 @@ class _RuoyiHarCollector:
 
             method = getattr(packet, "method", "") or ""
 
-            status = int(getattr(packet, "status", 0) or 0)
+            status = int(getattr(packet, "response_status", 0) or getattr(packet, "status", 0) or 0)
 
         except Exception:
 
@@ -3015,19 +3070,49 @@ class _RuoyiHarCollector:
 
     def _packet_to_entry(self, packet):
 
-        req = getattr(packet, "request", None) or {}
+        url = getattr(packet, "url", "") or ""
 
-        resp = getattr(packet, "response", None) or {}
+        method = getattr(packet, "method", "") or ""
 
-        url = getattr(packet, "url", "") or req.get("url") or ""
+        status = int(getattr(packet, "response_status", 0) or 0)
 
-        method = getattr(packet, "method", "") or req.get("method") or ""
+        req_headers = getattr(packet, "request_headers", None) or {}
 
-        status = int(getattr(packet, "status", 0) or resp.get("status", 0) or 0)
-
-        headers = getattr(packet, "headers", None) or resp.get("headers") or {}
+        resp_headers = getattr(packet, "response_headers", None) or {}
 
         event_type = getattr(packet, "event_type", "") or ""
+
+        is_failed = bool(getattr(packet, "is_failed", False))
+
+        req_body = None
+
+        try:
+
+            req_body = packet.request_body
+
+        except Exception:
+
+            req_body = None
+
+        resp_body = None
+
+        try:
+
+            resp_body = packet.response_body
+
+        except Exception:
+
+            resp_body = None
+
+        mime_type = ""
+
+        if isinstance(resp_headers, dict):
+
+            mime_type = str(resp_headers.get("content-type", ""))
+
+        req_body_size = len(req_body) if req_body else 0
+
+        resp_body_size = len(resp_body) if resp_body else 0
 
         return {
 
@@ -3043,7 +3128,7 @@ class _RuoyiHarCollector:
 
                 "httpVersion": "HTTP/2",
 
-                "headers": self._headers_to_list(req.get("headers") or {}),
+                "headers": self._headers_to_list(req_headers),
 
                 "queryString": [],
 
@@ -3051,7 +3136,9 @@ class _RuoyiHarCollector:
 
                 "headersSize": -1,
 
-                "bodySize": -1,
+                "bodySize": req_body_size,
+
+                "postData": {"mimeType": str(req_headers.get("content-type", "")) if isinstance(req_headers, dict) else "", "text": req_body} if req_body else None,
 
             },
 
@@ -3059,19 +3146,21 @@ class _RuoyiHarCollector:
 
                 "status": status,
 
-                "statusText": event_type,
+                "statusText": "fetchError" if is_failed else event_type,
 
                 "httpVersion": "HTTP/2",
 
-                "headers": self._headers_to_list(headers),
+                "headers": self._headers_to_list(resp_headers),
 
                 "cookies": [],
 
                 "content": {
 
-                    "size": -1,
+                    "size": resp_body_size,
 
-                    "mimeType": str(headers.get("content-type", "")) if isinstance(headers, dict) else "",
+                    "mimeType": mime_type,
+
+                    "text": resp_body,
 
                 },
 
@@ -3079,7 +3168,7 @@ class _RuoyiHarCollector:
 
                 "headersSize": -1,
 
-                "bodySize": -1,
+                "bodySize": resp_body_size,
 
             },
 
@@ -8826,75 +8915,10 @@ def _log_current_ip(proxy_pool, tag):
 
 
 
-def _apply_ruoyi_proxy_geo_emulation(page, proxy_pool, tag):
-
-    emu = getattr(page, "emulation", None)
-
-    if emu is None:
-
-        log(f"  {tag} ruoyi geo emulation API not available", "WARN")
-
-        return False
-
-    identity = _probe_proxy_identity(proxy_pool, timeout=15)
-
-    if not identity or not identity.get("ip"):
-
-        log(f"  {tag} ruoyi geo emulation skipped: proxy geo lookup failed", "WARN")
-
-        return False
-
-    timezone_id = str(identity.get("timezone") or "").strip()
-
-    latitude = identity.get("latitude")
-
-    longitude = identity.get("longitude")
-
-    applied = []
-
-    if timezone_id:
-
-        try:
-
-            emu.set_timezone(timezone_id)
-
-            applied.append(f"timezone={timezone_id}")
-
-        except Exception as exc:
-
-            log(f"  {tag} set_timezone failed: {type(exc).__name__}: {exc}", "WARN")
-
-    if latitude is not None and longitude is not None:
-
-        try:
-
-            emu.set_geolocation(latitude, longitude, accuracy=100)
-
-            applied.append(f"geo=({latitude:.4f},{longitude:.4f})")
-
-        except Exception as exc:
-
-            log(f"  {tag} set_geolocation failed: {type(exc).__name__}: {exc}", "WARN")
-
-    if applied:
-
-        country_text = str(identity.get("country_code") or identity.get("country") or "UNKNOWN").strip() or "UNKNOWN"
-
-        log(
-
-            f"  {tag} ruoyi geo emulation applied: ip={identity.get('ip') or '-'} country={country_text} "
-
-            + " ".join(applied),
-
-            "INFO",
-
-        )
-
-        return True
-
-    log(f"  {tag} ruoyi geo emulation skipped: no usable timezone/geolocation from proxy exit", "WARN")
-
-    return False
+# _apply_ruoyi_proxy_geo_emulation 已移除:ruyipage 155 内核在 privileged scope 拒绝
+# emulation.setTimezoneOverride/setGeolocationOverride,且反复打 IP 查询服务只为设
+# timezone/geo,对注册/解锁成功率无增益。保留 _probe_proxy_identity/_log_current_ip
+# 用于出口 IP 记录与去重。
 
 
 def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT):
@@ -9434,10 +9458,6 @@ def register_outlook(opts, proxy_pool, idx):
             log(f"  {tag} 关闭默认空白页失败: {type(close_exc).__name__}: {close_exc}", "WARN")
 
 
-
-        if proxy_pool:
-
-            _apply_ruoyi_proxy_geo_emulation(page, proxy_pool, tag)
 
         if bool(getattr(opts, "block_resources", False)):
 
