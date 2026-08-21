@@ -457,8 +457,29 @@ def main():
         print(f"[ERR] 定制 Firefox 内核不存在: {rr.RUOYI_FIREFOX_PATH}", file=sys.stderr)
         print("请先运行: .venv\\Scripts\\python.exe -m ruyipage install", file=sys.stderr)
         sys.exit(1)
+
+    if not os.path.exists(args.input):
+        print(f"[error] 账号文件不存在: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    accounts = load_accounts(args.input, limit=args.limit)
+    if not accounts:
+        print("[info] no accounts to unlock."); sys.exit(0)
+
+    # 启动前清理残留 ruoyi Firefox(对齐 ruoyi main 的 _force_kill_ruoyi_firefox)
+    try:
+        rr._force_kill_ruoyi_firefox()
+    except Exception:
+        pass
+
+    proxy_list = _load_unlock_proxies(args)
     print(f"[unlock-ruoyi] input={args.input} limit={args.limit} conc={args.concurrency} "
-          f"headless={args.headless} proxy_url={'yes' if args.proxy_url else 'no'}")
+          f"headless={args.headless} proxies={len(proxy_list)}")
+
+    try:
+        asyncio.run(run(accounts, proxy_list, args))
+    except KeyboardInterrupt:
+        print("\n[unlock-ruoyi] 收到 Ctrl-C,退出")
 
 if __name__ == "__main__":
     main()
