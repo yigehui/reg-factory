@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.parse
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +59,29 @@ REDIRECT_URI = "http://localhost"
 SCOPE = "offline_access https://graph.microsoft.com/Mail.Read"
 OUTPUT_DIR = "outlook_accounts"
 LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERR": 40}
+
+# 失败网页保存开关:默认不保存(全量跑几千个 graph_debug_*.html 纯占盘)。
+# 开启方式:env OUTLOOK_SAVE_DEBUG_HTML=1/true,或调用方 set_save_debug_html(True)。
+SAVE_DEBUG_HTML = str(os.environ.get("OUTLOOK_SAVE_DEBUG_HTML", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+# 每线程失败原因槽:get_graph_token 失败时记下 abuse/noexist/pwd_incorrect/...,
+# 调用方(如 auth_nograph_to_all)不落盘也能分类。threading.local 保证并发不串号。
+_tls = threading.local()
+
+
+def set_save_debug_html(enabled):
+    """运行时开关:授权失败是否保存网页到 outlook_accounts/。"""
+    global SAVE_DEBUG_HTML
+    SAVE_DEBUG_HTML = bool(enabled)
+
+
+def _set_thread_fail_reason(reason):
+    _tls.fail_reason = str(reason or "")
+
+
+def get_thread_fail_reason():
+    """读本线程最近一次 get_graph_token 的失败原因;没记过返回 ''(不抛)。"""
+    return str(getattr(_tls, "fail_reason", "") or "")
 
 
 def _normalize_log_level(value, default="INFO"):
@@ -115,6 +139,8 @@ def _mask_proxy_url(proxy_url):
 
 
 def _save_graph_debug_html(email, idx, reason, html):
+    if not SAVE_DEBUG_HTML:
+        return ""  # 开关关:不落盘不建目录,日志侧 debug= 为空即"未保存"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     safe = str(email or f"idx_{idx}").replace("@", "_").replace("/", "_")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -179,9 +205,177 @@ def _extract_flow_token(text):
     return ""
 
 
-def get_graph_token(email, password, idx=0, proxies=None):
+def _parse_proof_add_form(text, url):
+    """从 proofs/Add 真表单页解析出 form action + hidden 字段(含 canary)。
+    返回 (form_action, form_data) 或 (None, None)。"""
+    form_match = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>', text, re.DOTALL | re.IGNORECASE)
+    if not form_match:
+        return None, None
+    form_action = form_match.group(1).replace("&amp;", "&")
+    form_body = form_match.group(2)
+    hidden = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', form_body)
+    form_data = {n: v for n, v in hidden}
+    if not form_action.startswith("http"):
+        base = urllib.parse.urlparse(url)
+        form_action = f"{base.scheme}://{base.netloc}{form_action}"
+    return form_action, form_data
+
+
+def _parse_proof_verify_form(text, url):
+    """从 proofs/Verify 页解析 frmVerifyProof 的 action(含 epid)+ hidden(canary/action=VerifyProof)。
+    返回 (form_action, form_data) 或 (None, None)。epid 在 action URL 里,一起带回去。"""
+    # 只取 frmVerifyProof 这个 form(页面还有个 frmSubmitSLT 干扰,且 slt 为空不提交)
+    form_match = re.search(
+        r'<form[^>]*(?:id|name)="frmVerifyProof"[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
+        text, re.DOTALL | re.IGNORECASE)
+    if not form_match:
+        # 退而求其次:含 Verify 的 form
+        form_match = re.search(r'<form[^>]*action="([^"]*proofs/Verify[^"]*)"[^>]*>(.*?)</form>',
+                               text, re.DOTALL | re.IGNORECASE)
+        if not form_match:
+            return None, None
+    form_action = form_match.group(1).replace("&amp;", "&")
+    form_body = form_match.group(2)
+    hidden = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', form_body)
+    form_data = {n: v for n, v in hidden}
+    if not form_action.startswith("http"):
+        base = urllib.parse.urlparse(url)
+        form_action = f"{base.scheme}://{base.netloc}{form_action}"
+    return form_action, form_data
+
+
+def bind_proof_in_session(session, html, url, cf_address, cf_jwt=None, use_admin=False, idx=0,
+                          cm_module=None, max_wait=180, poll=6):
+    """在一个已登录的 requests.Session 里,把 proofs/Add 真绑成 cf 辅助邮箱。
+    步骤:AddProof(填 EmailAddress)→ 微软发码到 cf → 收码 → VerifyProof(填 iOttText)。
+    成功后返回下一个响应 resp(通常落在 Consent 或已登录页),调用方继续跟 oauth。
+    失败返回 None。
+
+    cm_module: common.cloudflare_mail 模块(避免循环 import,由调用方传入)。
+    """
+    tag = f"[#{idx}]"
+    if cm_module is None:
+        try:
+            from common import cloudflare_mail as cm_module
+        except Exception as e:
+            _graph_log(tag, f"bind_proof: cloudflare_mail 不可用: {e}", "ERR")
+            return None
+    cm = cm_module
+
+    # 1) proofs/Add:解析 form + 填 EmailAddress
+    form_action, form_data = _parse_proof_add_form(html, url)
+    if not form_action:
+        debug_path = _save_graph_debug_html(cf_address or "bind", idx, "proofs_add_no_form", html)
+        _graph_log(tag, f"bind: proofs/Add 无 form debug={debug_path}", "WARN")
+        return None
+    if not cf_address:
+        _graph_log(tag, "bind: 缺 cf 辅助邮箱地址", "ERR")
+        return None
+    # AddProof 提交字段:canary(已有)+ action=AddProof + EmailAddress + iProofOptions=Email
+    form_data["action"] = "AddProof"
+    form_data["EmailAddress"] = cf_address
+    form_data.setdefault("iProofOptions", "Email")
+    # 提交前记 cf 收件箱基线 id(微软发码很快,基线必须在提交前取)
+    base_last_id = 0
+    try:
+        if use_admin:
+            raws = cm.fetch_admin_mails(cf_address, limit=20)
+            base_last_id = max([m.get("id", 0) for m in raws] or [0])
+        else:
+            mails = cm.fetch_parsed_mails(cf_jwt, limit=20)
+            base_last_id = max([m.get("id", 0) for m in mails] or [0])
+    except Exception as e:
+        _graph_log(tag, f"bind: 取 cf 基线失败(继续): {e}", "WARN")
+    _graph_log(tag, f"bind: 提交 AddProof email={cf_address} base_id={base_last_id}")
+
+    resp = session.post(form_action, data=form_data, timeout=30, allow_redirects=True)
+    vurl = getattr(resp, "url", "") or ""
+    vtext = resp.text or ""
+    _graph_log(tag, f"bind: AddProof -> {resp.status_code} url={vurl[:80]}")
+
+    # 2) 跟重定向到 proofs/Verify(可能要追一跳)
+    for _ in range(5):
+        if "proofs/verify" in (vurl or "").lower():
+            break
+        # 有时落在中间页(Consent 不应在这阶段;proofs/Add 重复说明没绑成功)
+        if "consent" in (vurl or "").lower() or "localhost" in (vurl or ""):
+            break
+        fm = re.search(r'<form[^>]*action="([^"]+)"', vtext, re.IGNORECASE)
+        if fm and ("DoSubmit" in vtext or "fmHF" in vtext):
+            fa = fm.group(1).replace("&amp;", "&")
+            if not fa.startswith("http"):
+                base = urllib.parse.urlparse(vurl)
+                fa = f"{base.scheme}://{base.netloc}{fa}"
+            hid = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', vtext)
+            resp = session.post(fa, data={n: v for n, v in hid}, timeout=30, allow_redirects=True)
+            vurl = getattr(resp, "url", "") or ""; vtext = resp.text or ""
+            continue
+        break
+
+    if "proofs/verify" not in (vurl or "").lower():
+        debug_path = _save_graph_debug_html(cf_address or "bind", idx, "proofs_verify_not_reached", vtext)
+        _graph_log(tag, f"bind: 未到 proofs/Verify (url={vurl[:80]}) debug={debug_path}", "WARN")
+        return None
+
+    # 3) 解析 Verify form(canary/epid 在 action URL)+ 收码
+    vaction, vdata = _parse_proof_verify_form(vtext, vurl)
+    if not vaction:
+        debug_path = _save_graph_debug_html(cf_address or "bind", idx, "proofs_verify_no_form", vtext)
+        _graph_log(tag, f"bind: proofs/Verify 无 form debug={debug_path}", "WARN")
+        return None
+    vdata["action"] = "VerifyProof"
+    code = cm.wait_for_code(cf_jwt, received_after_id=base_last_id, max_wait=max_wait,
+                            poll=poll, use_admin=use_admin, address=cf_address)
+    if not code:
+        # 兜底:基线后没新码,可能是重试同一 proof(微软限频不发新码),
+        # 但收件箱里基线那封码对当前 pending proof 仍有效 —— 取最新一封匹配码试。
+        code = _fetch_latest_code_fallback(cm, cf_address, cf_jwt, use_admin)
+        if not code:
+            _graph_log(tag, "bind: cf 取码超时(且无兜底可用码)", "WARN")
+            return None
+        _graph_log(tag, f"bind: 用兜底最新码 {code}(重试场景基线码仍有效)")
+    else:
+        _graph_log(tag, f"bind: 取到验证码 {code}")
+    vdata["iOttText"] = code
+    # allow_redirects=False:绑完后重定向链会一路跟到 http://localhost/?code=...
+    # 若 allow_redirects=True,requests 会真去连本地 80 端口 → ConnectionError。
+    # 让主循环手动 follow Location(它有 localhost code 拦截),避免本地连不上炸掉。
+    resp = session.post(vaction, data=vdata, timeout=30, allow_redirects=False)
+    _graph_log(tag, f"bind: VerifyProof -> {resp.status_code} url={getattr(resp,'url','')[:80]}")
+    return resp
+
+
+def _fetch_latest_code_fallback(cm, address, jwt, use_admin):
+    """wait_for_code 超时兜底:直接取收件箱里最新一封匹配的微软安全码(忽略基线)。
+    用于重试同一 pending proof 时微软限频不发新码、但旧码仍有效的场景。"""
+    try:
+        if use_admin:
+            raws = cm.fetch_admin_mails(address, limit=10)
+            mails = [cm.parse_admin_mail(m) for m in raws]
+        else:
+            mails = cm.fetch_parsed_mails(jwt, limit=10)
+        for m in mails:
+            code = cm.extract_code(m.get("text") or m.get("html") or "") or cm.extract_code(m.get("subject"))
+            if code:
+                return code
+    except Exception:
+        pass
+    return None
+
+
+def get_graph_token(email, password, idx=0, proxies=None, bind_secondary=None):
+    """Get refresh_token via pure HTTP OAuth flow (no browser).
+
+    bind_secondary: 可选 dict,传入则 proofs/Add 真绑辅助邮箱(而非 Skip):
+      {"cf_address": "...", "cf_jwt": "..."/None, "use_admin": bool, "cm": cloudflare_mail模块}
+    不传则保持原 Skip 行为(向后兼容,不影响注册链路)。
+
+    失败时返回 None,并把原因记到线程槽(get_thread_fail_reason() 可读:
+    abuse/noexist/pwd_incorrect/rate_limited/... ),供调用方不落盘也能分类。"""
+
     """Get refresh_token via pure HTTP OAuth flow (no browser)."""
     tag = f"[#{idx}]"
+    _set_thread_fail_reason("")  # 清旧值,失败前不残留上一号的原因
     session = requests.Session()
     session.trust_env = False
     if proxies:
@@ -224,6 +418,7 @@ def get_graph_token(email, password, idx=0, proxies=None):
         if not flow_token:
             debug_path = _save_graph_debug_html(email, idx, "no_flow_token", text)
             _graph_log(tag, f"FAIL: no flow token found debug={debug_path}", "WARN")
+            _set_thread_fail_reason("no_flow_token")
             return None
 
         if not post_url:
@@ -246,10 +441,31 @@ def get_graph_token(email, password, idx=0, proxies=None):
         }
 
         t_submit = datetime.now()
-        resp2 = session.post(post_url, data=login_data, timeout=30, allow_redirects=True)
+        # allow_redirects=False:已绑邮箱的号登录后会一路 302 到 http://localhost/?code=...,
+        # 若 allow_redirects=True,requests 会真去连本地 80 → ConnectionError。手动 follow 让
+        # 主循环的 redirect follower 拦截 localhost code。
+        resp2 = session.post(post_url, data=login_data, timeout=30, allow_redirects=False)
         _graph_log(tag, f"submit credentials {(datetime.now() - t_submit).total_seconds():.2f}s status={resp2.status_code} url={getattr(resp2, 'url', '')[:120]}")
 
         for _ in range(5):
+            # 先 follow 302 到下个页面(非 localhost),再判 DoSubmit 跳板
+            while resp2.status_code in (301, 302, 303, 307):
+                loc = resp2.headers.get("Location", "")
+                if "code=" in loc or "error=" in loc:
+                    break  # localhost code/error,留给主循环处理
+                if not loc:
+                    break
+                if not loc.startswith("http"):
+                    base = urllib.parse.urlparse(getattr(resp2, "url", "") or post_url)
+                    loc = f"{base.scheme}://{base.netloc}{loc if loc.startswith('/') else '/'+loc}"
+                try:
+                    resp2 = session.get(loc, timeout=30, allow_redirects=False)
+                except Exception:
+                    if "code=" in loc:
+                        break
+                    raise
+            if "code=" in (resp2.headers.get("Location", "") if resp2.status_code in (301, 302, 303, 307) else ""):
+                break  # 已到 localhost code 重定向,跳出跳板循环交给主循环
             _html = resp2.text or ''
             if ('DoSubmit' in _html or ('fmHF' in _html and 'onload' in _html)) and 'action=' in _html:
                 _m = re.search(r'action="([^"]+)"', _html)
@@ -257,27 +473,51 @@ def get_graph_token(email, password, idx=0, proxies=None):
                     _fa = _m.group(1).replace('&amp;', '&')
                     _hid = re.findall(r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', _html)
                     _fd = {n: v for n, v in _hid}
-                    resp2 = session.post(_fa, data=_fd, timeout=30, allow_redirects=True)
+                    resp2 = session.post(_fa, data=_fd, timeout=30, allow_redirects=False)
                     _graph_log(tag, f"auto-submit intermediate -> {getattr(resp2, 'url', '')[:120]}", "DEBUG")
                     continue
             break
 
         auth_code = None
+
+        def _is_code_redirect(loc):
+            """Location 是 localhost?code= 重定向(授权成功)。
+            可能绝对(http://localhost/?code=)或相对(/?code=、?code=)。"""
+            return "code=" in loc and ("localhost" in loc or loc.lstrip().startswith("/?")
+                    or loc.lstrip().startswith("?"))
+
+        def _is_error_redirect(loc):
+            return "error=" in loc and ("localhost" in loc or loc.lstrip().startswith("/?")
+                    or loc.lstrip().startswith("?"))
+
+        def _abs_localhost(loc):
+            if not loc.startswith("http") and (loc.startswith("/?") or loc.startswith("?")):
+                return f"http://localhost/{loc.lstrip('/')}"
+            return loc
+
         for _step in range(15):
             while resp2.status_code in (301, 302, 303, 307):
                 loc = resp2.headers.get("Location", "")
-                if "localhost" in loc and "code=" in loc:
-                    resp2 = type('R', (), {'url': loc, 'text': '', 'status_code': 200})()
+                _graph_log(tag, f"redirect status={resp2.status_code} loc={loc[:90]}", "DEBUG")
+                if _is_code_redirect(loc):
+                    resp2 = type('R', (), {'url': _abs_localhost(loc), 'text': '', 'status_code': 200})()
                     break
-                if "localhost" in loc and "error" in loc:
-                    resp2 = type('R', (), {'url': loc, 'text': '', 'status_code': 200})()
+                if _is_error_redirect(loc):
+                    resp2 = type('R', (), {'url': _abs_localhost(loc), 'text': '', 'status_code': 200})()
                     break
-                resp2 = session.get(loc, timeout=30, allow_redirects=False)
+                try:
+                    resp2 = session.get(loc, timeout=30, allow_redirects=False)
+                except Exception:
+                    # 兜底:连 localhost:80 被拒等——loc 带 code= 即视为授权成功,提取 code。
+                    if "code=" in loc:
+                        resp2 = type('R', (), {'url': _abs_localhost(loc), 'text': '', 'status_code': 200})()
+                        break
+                    raise
 
             url = resp2.url
             text = resp2.text if hasattr(resp2, 'text') and resp2.text else ''
 
-            if "localhost" in url and "code=" in url:
+            if "code=" in url and ("localhost" in url or url.startswith("http://localhost")):
                 parsed = urllib.parse.urlparse(url)
                 params = urllib.parse.parse_qs(parsed.query)
                 auth_code = params.get("code", [None])[0]
@@ -285,10 +525,11 @@ def get_graph_token(email, password, idx=0, proxies=None):
                     _graph_log(tag, "got auth code!")
                     break
 
-            if "localhost" in url and "error" in url:
+            if "error=" in url and ("localhost" in url or url.startswith("http://localhost")):
                 parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
                 err = parsed.get("error_description", parsed.get("error", ["?"]))[0]
                 _graph_log(tag, f"OAuth error: {err[:100]}", "WARN")
+                _set_thread_fail_reason("oauth_error")
                 return None
 
             if "Consent/Update" in url or "Consent/update" in url:
@@ -307,9 +548,29 @@ def get_graph_token(email, password, idx=0, proxies=None):
                     continue
                 debug_path = _save_graph_debug_html(email, idx, "consent_update", text)
                 _graph_log(tag, f"FAIL: Consent/Update with no ServerData debug={debug_path}", "WARN")
+                _set_thread_fail_reason("consent_update")
                 return None
 
             if "proofs/Add" in url or "proofs/add" in url:
+                # 优先路径:真绑辅助邮箱(若调用方传了 bind_secondary)
+                if bind_secondary:
+                    bs = bind_secondary
+                    bresp = bind_proof_in_session(
+                        session, text, url,
+                        cf_address=bs.get("cf_address"),
+                        cf_jwt=bs.get("cf_jwt"),
+                        use_admin=bs.get("use_admin", False),
+                        idx=idx,
+                        cm_module=bs.get("cm"),
+                    )
+                    if bresp is None:
+                        _graph_log(tag, "FAIL: 辅助邮箱绑定失败", "WARN")
+                        _set_thread_fail_reason("bind_fail")
+                        return None
+                    # 绑定成功后,继续跟 oauth(把 resp2 换成绑定后的响应,循环继续追 code/consent)
+                    resp2 = bresp
+                    continue
+                # 兼容路径:不绑,只 Skip(原行为)
                 form_match2 = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>', text, re.DOTALL | re.IGNORECASE)
                 if form_match2:
                     form_action2 = form_match2.group(1).replace("&amp;", "&")
@@ -325,6 +586,7 @@ def get_graph_token(email, password, idx=0, proxies=None):
                     continue
                 debug_path = _save_graph_debug_html(email, idx, "proofs_add", text)
                 _graph_log(tag, f"FAIL: proofs/Add with no form debug={debug_path}", "WARN")
+                _set_thread_fail_reason("proofs_add")
                 return None
 
             form_match = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>', text, re.DOTALL | re.IGNORECASE)
@@ -364,6 +626,7 @@ def get_graph_token(email, password, idx=0, proxies=None):
             if err_text:
                 detail += f" err={err_text[:200]!r}"
             low = (err_text or plain or "").lower()
+            url_low = (url or "").lower()
             if "bad user credential" in low or "too many signin" in low:
                 _graph_log(
                     tag,
@@ -377,10 +640,22 @@ def get_graph_token(email, password, idx=0, proxies=None):
                     f"FAIL: stuck at {url[:100]} (status={resp2.status_code}){detail} debug={debug_path}",
                     "WARN",
                 )
+            # 记线程内失败原因(调用方不落盘也能分类;口径同 auth_nograph_to_all._classify_failure)
+            if "/abuse" in url_low:
+                _set_thread_fail_reason("abuse")
+            elif "doesn't exist" in low or "does not exist" in low:
+                _set_thread_fail_reason("noexist")
+            elif "too many requests" in low or "too many signin" in low or "bad user credential" in low:
+                _set_thread_fail_reason("rate_limited")
+            elif str(err_code) == "80041012" or "password is incorrect" in low:
+                _set_thread_fail_reason("pwd_incorrect")
+            else:
+                _set_thread_fail_reason("unknown")
             return None
 
         if not auth_code:
             _graph_log(tag, "FAIL: no auth code extracted", "WARN")
+            _set_thread_fail_reason("no_auth_code")
             return None
 
         _graph_log(tag, "exchanging code for tokens...")
@@ -417,10 +692,12 @@ def get_graph_token(email, password, idx=0, proxies=None):
         else:
             err = token_data.get("error_description", token_data.get("error", "?"))
             _graph_log(tag, f"token error: {str(err)[:150]}", "WARN")
+            _set_thread_fail_reason("token_error")
             return None
 
     except Exception as e:
         _graph_log(tag, f"error: {type(e).__name__}: {e}", "ERR")
+        _set_thread_fail_reason("exc")
         return None
 
 
