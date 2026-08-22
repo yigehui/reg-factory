@@ -70,3 +70,6 @@ email_reg.txt.lock
 # unlock 运行期结果与选中账号清单（不进库）
 unlock_results/
 selected_accounts_*.txt
+
+# PX 环境对拍报告(机器本地快照,不进库)
+px_env_report.json
