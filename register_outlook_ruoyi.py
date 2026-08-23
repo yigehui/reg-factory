@@ -310,6 +310,10 @@ POST_PRESS_LOADING_CHECK = 8
 
 CAPTCHA_STATE_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_CAPTCHA_STATE_TIMEOUT", "20") or "20")
 
+# 真按钮异步渲染等待上限：PX iframe 已出现但 "Press and hold" 按钮还没渲染时，等这么久。
+
+BUTTON_RENDER_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BUTTON_RENDER_TIMEOUT", "30") or "30")
+
 BIRTHDAY_ENTRY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_ENTRY_TIMEOUT", "2.5") or "2.5")
 
 BIRTHDAY_SUBMIT_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_SUBMIT_TIMEOUT", "2.0") or "2.0")
@@ -8136,10 +8140,17 @@ def _find_hold_target(ctx):
         "défi|vérifi",
         "prüfung|verifiz",
     ]
+    done_patterns = [
+        r"challenge\s+completed",
+        r"completed,\s*please\s+wait",
+        r"completed",
+        r"已完成",
+    ]
     script = (r"""
 return (() => {
   const HOLD_PATTERNS = %s.map((src) => new RegExp(src, 'i'));
   const CHALLENGE_PATTERNS = %s.map((src) => new RegExp(src, 'i'));
+  const DONE_PATTERNS = %s.map((src) => new RegExp(src, 'i'));
   const SHORT_LABEL_MAX = 32;
   const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const matchesAny = (text, patterns) => {
@@ -8186,8 +8197,14 @@ return (() => {
   };
   const candidates = [];
   const seen = new Set();
+  const isDone = (el) => {
+    // PX 已完成(Human Challenge completed, please wait)：含 completed 文字的元素绝不当按压目标，
+    // 否则完成态残留按钮会被反复按压直到 max_press 误判失败。
+    const s = norm([el?.innerText || '', el?.textContent || '', el?.getAttribute?.('aria-label') || ''].join(' '));
+    return !!s && DONE_PATTERNS.some(re => re.test(s));
+  };
   const addCandidate = (el, quality, source, labelEl = null) => {
-    if (!el || seen.has(el) || !visible(el) || !buttonish(el)) return;
+    if (!el || seen.has(el) || !visible(el) || !buttonish(el) || isDone(el)) return;
     seen.add(el);
     candidates.push(pack(el, quality, source, labelEl));
   };
@@ -8230,7 +8247,7 @@ return (() => {
   );
   return candidates[0];
 })()
-""" % (json.dumps(hold_patterns, ensure_ascii=True), json.dumps(challenge_patterns, ensure_ascii=True)))
+""" % (json.dumps(hold_patterns, ensure_ascii=True), json.dumps(challenge_patterns, ensure_ascii=True), json.dumps(done_patterns, ensure_ascii=True)))
     try:
         target = ctx.run_js_loaded(script)
     except Exception:
@@ -8705,6 +8722,79 @@ def _captcha_is_validating(page):
         return True
 
     return False
+
+
+_PX_VALIDATING_TEXT_KWS = (
+    "verifying",
+    "verification",
+    "checking",
+    "loading",
+    "please wait",
+    "just a moment",
+    "v?rification",
+    "chargement",
+    "veuillez patienter",
+)
+
+
+_PX_CAPTCHA_TEXT_KWS = (
+    "press and hold",
+    "verify you're human",
+    "captcha",
+    "perimeterx",
+    "appuyer et maintenir",
+    "按住",
+    "长按",
+)
+
+
+def _px_probe(page, min_quality=5):
+    """合并探测：一次拿 visible/validating/hold_ctx/hold_target，等价于
+    _captcha_visible + _captcha_is_validating + _find_hold_context 但 JS 往返
+    从 3N 降到 N（主循环热路径，多线程下是主要拖慢来源）。
+
+    关键：iframe-box(只拿到 PX 容器中心、真按钮还没渲染)绝不能当可按压目标——
+    直接按中心会选中 iframe 内容导致人机挑战不加载/卡死。这种情况只标记
+    captcha_hint=True 让主循环等真按钮渲染，不按、不提交。"""
+
+    hold_ctx, hold_target = _find_hold_context(page, min_quality=min_quality)
+
+    target_quality = _target_quality(hold_target)
+    is_iframe_box = isinstance(hold_target, dict) and hold_target.get("source") == "iframe-box"
+    # 真按钮(非 iframe-box)且质量达标才算可按；iframe-box 只当"PX 在加载"信号
+    target_actionable = (
+        hold_target is not None
+        and not is_iframe_box
+        and target_quality <= min_quality
+    )
+    captcha_hint = bool(is_iframe_box)
+
+    iframe_hint = _context_has_iframe_hint(page)
+
+    visible = bool(target_actionable or iframe_hint or captcha_hint)
+
+    if not visible:
+        low = _body_text(page).lower()
+        visible = any(kw in low for kw in _PX_CAPTCHA_TEXT_KWS)
+        if visible:
+            captcha_hint = True
+
+    validating = False
+    if target_actionable:
+        validating = False
+    elif _px_captcha_completed_wait(page):
+        validating = True
+    elif iframe_hint:
+        # 复刻原 _captcha_is_validating 语义：iframe 在但拿不到任何 hold_target 才算 validating；
+        # 拿到 iframe-box(非 None)不算 validating，只算"等真按钮渲染"。
+        if hold_target is None:
+            validating = True
+        else:
+            low = _body_text(page).lower()
+            validating = any(kw in low for kw in _PX_VALIDATING_TEXT_KWS)
+
+    return visible, validating, hold_ctx, hold_target, captcha_hint
+
 
 
 
@@ -9756,6 +9846,8 @@ def register_outlook(opts, proxy_pool, idx):
 
     initial_press_wait_started = None
 
+    button_wait_started = None
+
     validation_wait_started = None
 
     microsoft_loading_wait_started = None
@@ -10193,11 +10285,10 @@ def register_outlook(opts, proxy_pool, idx):
 
 
 
-            visible = _captcha_visible(page)
+            visible, validating, hold_ctx, hold_target, captcha_hint = _px_probe(page, min_quality=5)
 
-            validating = _captcha_is_validating(page)
-
-            hold_ctx, hold_target = _find_hold_context(page, min_quality=5)
+            # iframe-box 兜底(PX 容器在、真按钮未渲染)不算可按目标，只在 captcha_hint 里用
+            is_iframe_box_target = isinstance(hold_target, dict) and hold_target.get("source") == "iframe-box"
 
             actionable = bool(
 
@@ -10207,9 +10298,19 @@ def register_outlook(opts, proxy_pool, idx):
 
                 and hold_target is not None
 
+                and (not is_iframe_box_target)
+
                 and _target_quality(hold_target) <= 5
 
             )
+
+            # PX 已出现(iframe-box 或文本命中)但真按钮还没渲染时，先标记 had_captcha，
+            # 阻止下面的 _try_submit 在按钮渲染前抢点 submit。
+            if captcha_hint and not had_captcha:
+                had_captcha = True
+                last_progress_at = time.time()
+                if not captcha_signup_url:
+                    captcha_signup_url = current_url
 
             loading_page = _microsoft_loading_page(page)
             loop_now = time.time()
@@ -10431,6 +10532,8 @@ def register_outlook(opts, proxy_pool, idx):
 
                 validation_wait_started = None
 
+                button_wait_started = None
+
                 if not captcha_signup_url:
 
                     captcha_signup_url = current_url
@@ -10558,6 +10661,32 @@ def register_outlook(opts, proxy_pool, idx):
             else:
 
                 if had_captcha:
+
+                    # PX 已出现(iframe-box/文本命中)但真按钮还没渲染——等按钮，不按、不提交。
+
+                    # 给较长宽限(按钮异步渲染最多 ~20s)，避免被下面的 validation_wait(20s)误杀。
+
+                    if captcha_hint and not actionable and press_count == 0:
+
+                        if button_wait_started is None:
+
+                            button_wait_started = time.time()
+
+                            log(f"  {tag} PX challenge loading, waiting for hold button to render")
+
+                        elif _wait_state_timed_out(button_wait_started, timeout=BUTTON_RENDER_TIMEOUT):
+
+                            waited = int(time.time() - button_wait_started)
+
+                            log(f"  {tag} hold button did not render for {waited}s, give up", "WARN")
+
+                            _shot(page, "timeout_button_render", idx)
+
+                            return _finish(reason="timeout")
+
+                        time.sleep(1)
+
+                        continue
 
                     if press_count >= max_press:
 
