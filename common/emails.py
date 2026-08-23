@@ -56,12 +56,13 @@ def next_email(platform):
                 if email.lower() in used:
                     continue
                 password = parts[1].strip() if len(parts) >= 2 else ""
-                token = parts[2].strip() if len(parts) >= 3 else ""
-                client_id = parts[3].strip() if len(parts) >= 4 else ""
+                # emails.txt 新格式: [2]=client_id [3]=refresh_token(原 [2]=token [3]=client_id,已对调)
+                refresh_token = parts[3].strip() if len(parts) >= 4 else ""
+                client_id = parts[2].strip() if len(parts) >= 3 else ""
                 with open(_used_file(platform), "a", encoding="utf-8") as uf:
                     uf.write(f"{email}----{password}----reserved\n")
                 print(f"  [email] picked for {platform}: {email}")
-                return email, password, token, client_id
+                return email, password, refresh_token, client_id
         print(f"  [email] no unused emails left for {platform}")
         return None
 

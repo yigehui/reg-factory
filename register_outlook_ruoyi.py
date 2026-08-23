@@ -2665,7 +2665,7 @@ def append_graph_account_to_emails_pool(email, password, graph):
 
             with open(EMAILS_POOL, "a", encoding="utf-8") as f:
 
-                f.write(f"{email}----{password}----{token}----{client_id}\n")
+                f.write(f"{email}----{password}----{client_id}----{token}----{graph.get('cf_address', '')}----{graph.get('cf_password') or ''}\n")
 
         log(f"emails.txt += {email} (token=yes)", "OK")
 
@@ -9371,55 +9371,6 @@ def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT)
     return False
 
 
-def _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag, reg_proxy=None):
-
-    if not email or not password:
-
-        return False
-
-    # 尊重"只注册不授权"开关:勾了就不拉 Graph token(用户只想要号,不要授权),
-    # Loading 超时直接走正常超时 fail,不兜底授权。
-    if getattr(opts, "skip_graph_auth", False):
-        log(f"  {tag} loading timeout fallback skipped: skip_graph_auth on")
-        return False
-
-    extract_graph = getattr(helpers, "extract_graph_token_http", None)
-
-    if not callable(extract_graph):
-
-        log(f"  {tag} loading timeout fallback skipped: extract_graph_token_http unavailable", "WARN")
-
-        return False
-
-    log(f"  {tag} Microsoft Loading timeout fallback -> Graph token extracting…", "WARN")
-
-    auth_proxy_str = _resolve_graph_auth_proxy(opts, reg_proxy, tag)
-
-    try:
-
-        graph = extract_graph(email, password, idx, 3, auth_proxy_str)
-
-    except Exception as exc:
-
-        log(f"  {tag} loading timeout graph fallback failed: {type(exc).__name__}: {exc}", "WARN")
-
-        return False
-
-    if not graph or not graph.get("refresh_token"):
-
-        log(f"  {tag} loading timeout graph fallback missing refresh_token", "WARN")
-
-        return False
-
-    setattr(opts, "_ruoyi_graph_fallback", graph)
-
-    log(f"  {tag} loading timeout fallback confirmed account via Graph token", "OK")
-
-    return True
-
-
-
-
 def _probe_proxy_targets(proxy_pool, timeout=PROXY_PRECHECK_TIMEOUT):
 
     proxies = _proxy_for_ip_lookup(proxy_pool, "[proxy-precheck]")
@@ -10359,10 +10310,6 @@ def register_outlook(opts, proxy_pool, idx):
 
                     waited = int(loop_now - (microsoft_loading_wait_started or loop_now))
 
-                    if _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag, reg_proxy=selected_browser_proxy):
-
-                        break
-
                     log(f"  {tag} Microsoft Loading stuck for {waited}s, give up", "WARN")
 
                     _shot(page, "timeout_loading", idx)
@@ -10977,7 +10924,7 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
         with open(live_file, "a", encoding="utf-8") as f:
 
-            f.write(f"{email}----{password}----{graph['refresh_token']}----{graph.get('client_id', '')}\n")
+            f.write(f"{email}----{password}----{graph.get('client_id', '')}----{graph['refresh_token']}----{graph.get('cf_address', '')}----{graph.get('cf_password') or ''}\n")
 
     if token_file:
 
@@ -11005,9 +10952,13 @@ def _save_direct_result(email, password, graph, live_file, token_file):
 
                     "password": password,
 
+                    "client_id": graph.get("client_id"),
+
                     "refresh_token": graph.get("refresh_token"),
 
-                    "client_id": graph.get("client_id"),
+                    "secondary_email": graph.get("cf_address"),
+
+                    "secondary_password": graph.get("cf_password"),
 
                 }
 
@@ -11071,7 +11022,10 @@ def _build_bind_secondary(email, idx, tag, reg_proxy=None):
             "cf_jwt": d.get("jwt"),
             "use_admin": d.get("use_admin", False),
             "cm": cm,
+            "cf_password": d.get("password"),  # 地址密码(ENABLE_ADDRESS_PASSWORD 开启才有;None=未开启),透传给落盘第6字段
         }
+        if bs["cf_password"]:
+            log(f"  {tag} bind_secondary: cf 邮箱密码已生成 {d['address']} / {bs['cf_password']}")
         log(f"  {tag} bind_secondary: cf 辅助邮箱就绪 {d['address']} (use_admin={d.get('use_admin', False)})")
         return bs
     except Exception as e:
@@ -11227,7 +11181,6 @@ async def _run_one_direct(args, helpers, proxy_pool, idx, total, save_lock, cons
         if ruoyi_slot is not None:
             run_args.ruoyi_slot = ruoyi_slot
         result = await asyncio.to_thread(register_outlook, run_args, selected_pool, idx)
-        fallback_graph = getattr(run_args, "_ruoyi_graph_fallback", None)
 
         if isinstance(result, tuple) and len(result) >= 4:
 

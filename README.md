@@ -204,7 +204,8 @@ python mailbox_broker.py --port 8765
 python outlook_reg_loop.py                     # 循环
 python outlook_reg_loop.py --count 20          # 注册 20 个后退出
 python outlook_reg_loop.py --confirm-before-register --max-press 10 --timeout 300
-python register_outlook_standalone.py --count 5 --mode browser --confirm-before-register
+# ruoyi 有头注册(主路径)：见 WebUI「Outlook 自注册(ruoyi)」菜单
+python register_outlook_ruoyi.py --count 5 --concurrency 2 --confirm-before-register
 ```
 > Outlook 自注册成功后会立即提取 Microsoft Graph `refresh_token`；只有拿到 RT 的账号才写入 `_outlook_pool/` 与 `emails.txt`。
 > `emails.txt` / `outlook_accounts/accounts_*.txt` 格式为 `email----password----refresh_token----client_id`。
@@ -509,7 +510,7 @@ python export_chatgpt2api.py --json                                # 导出 {acc
 | `register_three_platforms.py` | 三平台（Claude/ChatGPT/Grok）注册编排 |
 | `register.py` / `register_chatgpt.py` / `register_grok.py` | 各平台注册主流程 |
 | `register_github.py` | GitHub 注册主流程（单页表单 + Arkose 验证视觉求解 + 邮件 launch code） |
-| `outlook_reg_loop.py` / `register_outlook_standalone.py` | Outlook 自注册养号 |
+| `outlook_reg_loop.py` | Outlook 自注册养号调度（`register_outlook_standalone.py` / `register_outlook_ruoyi.py` 作为 helper 库被它加载） |
 | `unlock_outlook.py` / `extract_graph_tokens.py` | Outlook 解锁 / 提取 Graph refresh_token |
 | `oauth_codex.py` | Codex OAuth → SUB2API + CPA（带 refresh_token，自动接码过 add-phone，支持 `--manual-phone`） |
 | `upload_tokens.py` | 把 `tokens/` 标准 token 上传到 CPA / SUB2API / webchat2api |

@@ -407,12 +407,16 @@ def extract_graph_for_account(email, password, idx=0, attempts=3, proxy_str=None
             log(f"[#{idx}] graph auth ignores reg proxy ({mask_proxy(proxy_str)}); force direct")
         else:
             log(f"[#{idx}] graph proxy -> direct")
+        # 8月起微软对新号收紧:无辅助邮箱一律 access_denied。抽取前先建 cf 辅助邮箱并透传 bind_secondary。
+        bind_secondary = _build_bind_secondary_loop(email, idx, "")
         for attempt in range(attempts):
-            res = get_graph_token(email, password, idx=idx, proxies=None)
+            res = get_graph_token(email, password, idx=idx, proxies=None, bind_secondary=bind_secondary)
             if res and res.get("refresh_token"):
                 graph = {
                     "refresh_token": res["refresh_token"],
                     "client_id": res.get("client_id") or "",
+                    "cf_address": res.get("cf_address") or "",
+                    "cf_password": res.get("cf_password") or "",
                 }
                 log(f"[#{idx}] graph token extracted for {email}", "OK")
                 return graph
@@ -433,6 +437,8 @@ def append_graph_account_to_emails_pool(email, password, graph):
     """Append only Graph-ready accounts to emails.txt."""
     token = (graph or {}).get("refresh_token") or ""
     client_id = (graph or {}).get("client_id") or ""
+    sec_email = (graph or {}).get("cf_address") or ""
+    sec_pw = (graph or {}).get("cf_password") or ""
     if not token:
         log(f"emails.txt skip {email}: no graph refresh_token", "WARN")
         return False
@@ -447,7 +453,8 @@ def append_graph_account_to_emails_pool(email, password, graph):
         if email.lower() in existing:
             return True
         with open(EMAILS_POOL, "a", encoding="utf-8") as f:
-            f.write(f"{email}----{password}----{token}----{client_id}\n")
+            # emails.txt 6 字段: 邮箱----密码----client_id----refresh_token----辅助邮箱----辅助邮箱密码
+            f.write(f"{email}----{password}----{client_id}----{token}----{sec_email}----{sec_pw}\n")
         log(f"emails.txt += {email} (token=yes)", "OK")
         return True
     except Exception as exc:
@@ -479,6 +486,30 @@ def append_account_to_email_nograph(email, password):
         return False
 
 
+def _build_bind_secondary_loop(email, idx, tag):
+    """loop 侧建 cf 辅助邮箱,透传给 get_graph_token 的 bind_secondary。
+    与 register_outlook_ruoyi._build_bind_secondary 等价(8月收紧必须先绑,否则 access_denied)。
+    失败返回 None,不阻断抽取(退回原 Skip 兼容路径)。"""
+    try:
+        from common import cloudflare_mail as cm
+        cm.set_proxy(os.environ.get("CF_MAIL_PROXY") or None)
+        d = cm.create_or_get_address(email)
+        bs = {
+            "cf_address": d["address"],
+            "cf_jwt": d.get("jwt"),
+            "use_admin": d.get("use_admin", False),
+            "cm": cm,
+            "cf_password": d.get("password"),  # 地址密码(ENABLE_ADDRESS_PASSWORD 开启才有;None=未开启)
+        }
+        if bs["cf_password"]:
+            log(f"[#{idx}] bind_secondary: cf 邮箱密码已生成 {d['address']} / {bs['cf_password']}")
+        log(f"[#{idx}] bind_secondary: cf 辅助邮箱就绪 {d['address']}")
+        return bs
+    except Exception as e:
+        log(f"[#{idx}] bind_secondary 失败: {type(e).__name__}: {e}", "WARN")
+        return None
+
+
 def append_to_emails_pool(email, password):
     """把成功号桥接进 emails.txt 池，供账号注册侧 common/emails.next_email 消费。
     注册成功后立即用纯 HTTP OAuth 抽 Graph refresh_token（extract_graph_tokens.get_graph_token），
@@ -490,11 +521,14 @@ def append_to_emails_pool(email, password):
         return append_graph_account_to_emails_pool(email, password, graph)
     try:
         from extract_graph_tokens import get_graph_token
+        # 8月起微软对新号收紧:无辅助邮箱一律 access_denied。抽取前先建 cf 辅助邮箱并透传 bind_secondary。
+        # 建一次循环复用(避免重试时重复建 cf 邮箱);失败返回 None,退回原 Skip 兼容路径不阻断。
+        bind_secondary = _build_bind_secondary_loop(email, 0, "")
         # 抽取经代理偶发 TLS 抖动(SSLEOFError)，单试一次一抖就回退 fresh、白丢 token 快路；
         # 这里重试 3 次(短退避)，绝大多数抖动二/三次就过。
         res = None
         for _try in range(3):
-            res = get_graph_token(email, password)
+            res = get_graph_token(email, password, bind_secondary=bind_secondary)
             if res and res.get("refresh_token"):
                 break
             if _try < 2:
@@ -503,10 +537,14 @@ def append_to_emails_pool(email, password):
         if res and res.get("refresh_token"):
             token = res["refresh_token"]
             client_id = res.get("client_id") or "fresh"
+            sec_email = res.get("cf_address") or ""
+            sec_pw = res.get("cf_password") or ""
             log(f"graph token extracted for {email}", "OK")
         else:
+            sec_email = sec_pw = ""
             log(f"graph token 抽取失败(3 次)，回退 fresh: {email}", "WARN")
     except Exception as e:
+        sec_email = sec_pw = ""
         log(f"graph token 抽取异常，回退 fresh: {type(e).__name__}: {e}", "WARN")
     try:
         existing = set()
@@ -519,7 +557,8 @@ def append_to_emails_pool(email, password):
         if email.lower() in existing:
             return
         with open(EMAILS_POOL, "a", encoding="utf-8") as f:
-            f.write(f"{email}----{password}----{token}----{client_id}\n")
+            # emails.txt 6 字段: 邮箱----密码----client_id----refresh_token----辅助邮箱----辅助邮箱密码
+            f.write(f"{email}----{password}----{client_id}----{token}----{sec_email}----{sec_pw}\n")
         log(f"emails.txt += {email} (token={'yes' if token != 'fresh' else 'fresh'})", "OK")
     except Exception as e:
         log(f"append_to_emails_pool failed: {type(e).__name__}: {e}", "WARN")

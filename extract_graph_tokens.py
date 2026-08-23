@@ -692,6 +692,8 @@ def get_graph_token(email, password, idx=0, proxies=None, bind_secondary=None):
                 "password": password,
                 "refresh_token": rt,
                 "client_id": CLIENT_ID,
+                "cf_address": (bind_secondary or {}).get("cf_address"),
+                "cf_password": (bind_secondary or {}).get("cf_password"),
             }
         else:
             err = token_data.get("error_description", token_data.get("error", "?"))

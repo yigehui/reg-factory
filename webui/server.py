@@ -550,10 +550,13 @@ def _parse_mail_line(line):
     email, password = parts[0], parts[1]
     if not _EMAIL_RE.match(email):
         return None
-    token = parts[2] if len(parts) >= 3 else ""
-    client_id = parts[3] if len(parts) >= 4 else ""
+    # emails.txt 新格式: [2]=client_id [3]=refresh_token(原 [2]=token [3]=client_id,已对调)
+    client_id = parts[2] if len(parts) >= 3 else ""
+    token = parts[3] if len(parts) >= 4 else ""
+    secondary_email = parts[4] if len(parts) >= 5 else ""
+    secondary_password = parts[5] if len(parts) >= 6 else ""
     # 去掉尾部空字段，避免写出 "email----pass--------"(多余空列)
-    fields = [email, password, token, client_id]
+    fields = [email, password, client_id, token, secondary_email, secondary_password]
     while len(fields) > 2 and fields[-1] == "":
         fields.pop()
     return fields
@@ -831,11 +834,9 @@ def _build_cmd(script, args):
 _OUTLOOK_WEBUI_SCRIPTS = {
     "outlook_reg_loop",
     "register_outlook_ruoyi",
-    "register_outlook_standalone",
     "launch_ruoyi_browser",
     "bind_secondary_email_http",
     "auth_bound_accounts",
-    "unlock_outlook_ruoyi",
 }
 
 

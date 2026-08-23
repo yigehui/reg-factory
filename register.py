@@ -297,7 +297,8 @@ def read_next_email_from_file():
                 if email_addr in used:
                     continue
                 password = parts[1].strip() if len(parts) >= 2 else ""
-                token = parts[2].strip() if len(parts) >= 3 else ""
+                # emails.txt 新格式: [2]=client_id [3]=refresh_token(原 [2]=token);token=refresh_token 现取 [3]
+                token = parts[3].strip() if len(parts) >= 4 else ""
                 # 立即标记为已使用，防止其他线程取到同一个
                 with open(EMAILS_USED_FILE, "a", encoding="utf-8") as uf:
                     uf.write(f"{email_addr}----{password}----reserved\n")
@@ -3935,8 +3936,9 @@ async def main():
                     if not line or line.startswith("#"):
                         continue
                     parts = line.split("----")
-                    if len(parts) >= 3:
-                        email_list.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+                    # emails.txt 新格式: [2]=client_id [3]=refresh_token(原 [2]=token);第3列取 refresh_token=parts[3]
+                    if len(parts) >= 4:
+                        email_list.append((parts[0].strip(), parts[1].strip(), parts[3].strip()))
                     elif len(parts) >= 2:
                         email_list.append((parts[0].strip(), parts[1].strip(), ""))
             print(f"  loaded {len(email_list)} emails from {args.emails}")

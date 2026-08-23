@@ -131,8 +131,9 @@ def read_fresh_emails():
             parts = line.split("----")
             email = parts[0].strip()
             password = parts[1].strip() if len(parts) > 1 else ""
-            token = parts[2].strip() if len(parts) > 2 else ""
-            client_id = parts[3].strip() if len(parts) > 3 else ""
+            # emails.txt 新格式: [2]=client_id [3]=refresh_token(原 [2]=token [3]=client_id,已对调)
+            token = parts[3].strip() if len(parts) > 3 else ""
+            client_id = parts[2].strip() if len(parts) > 2 else ""
             out.append((email, password, token, client_id))
     return out
 
