@@ -484,7 +484,10 @@ def load_account_queue(path):
 
 ACCOUNT_FORMAT_PRESETS = {
     "random": "",
-    "name": "{first}_{last}",
+    # 名字库仅 30x21=630 组合,Outlook 常见英文名几乎全被占,裸 {first}_{last} 必 taken,
+    # 每次重试浪费 3-5s。初始就带 4 位随机数字(630 万种),把 taken 概率压到极低。
+    # 姓名页仍用干净 first/last(独立 generate_name),不受影响。
+    "name": "{first}_{last}{digits:4}",
     "name_digits": "{first}_{last}{digits:3}",
 }
 

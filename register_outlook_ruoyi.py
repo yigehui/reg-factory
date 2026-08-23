@@ -5617,6 +5617,16 @@ _RUOYI_RESOURCE_ALLOW_HOST_HINTS = (
     "client.px-cloud.net",
 )
 
+# 纯遥测/分析域名黑名单(HAR 实测)：OneCollector 遥测等，与注册功能/PX 放行无关，始终屏蔽减负。
+# 不含 hsprotect/px-cloud(PX 行为遥测，放行判定需要)与 logincdn(注册表单 JS + 按钮图)。
+_RUOYI_TELEMETRY_HOSTS = (
+    "browser.events.data.microsoft.com",  # OneCollector 遥测(9 个空响应)
+    "arc.msn.com",                         # 微软分析
+    "vortex.data.microsoft.com",           # 微软遥测
+    "telemetry.microsoft.com",
+    "events.data.microsoft.com",
+)
+
 _RUOYI_RESOURCE_BLOCK_EXTS = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
@@ -5633,6 +5643,20 @@ def _ruoyi_should_block_resource_request(req):
     if any(host in low for host in _RUOYI_RESOURCE_ALLOW_HOST_HINTS):
 
         return False
+
+    # 遥测黑名单：纯遥测域名与注册/PX 无关，始终屏蔽(不依赖 --block-resources)。
+    # 用 host 精确匹配避免误伤(只比对 netloc，不含路径)。
+    try:
+
+        host = (urllib.parse.urlsplit(low).netloc or "").lower()
+
+        if host and any(host == th or host.endswith("." + th) for th in _RUOYI_TELEMETRY_HOSTS):
+
+            return True
+
+    except Exception:
+
+        pass
 
     headers = getattr(req, "headers", None) or {}
 
@@ -9569,13 +9593,20 @@ def _apply_account_options(opts=None):
 
         resolved_format = resolve_format_fn(mode, custom)
 
+        # 名字库仅 30×21=630 组合,Outlook 常见英文名几乎全被占,裸名 {first}_{last} 必 taken,
+        # 每次重试浪费 3-5s。name 模式初始邮箱就带 4 位随机数字(630 万种),把 taken 概率压到极低。
+        # 姓名页仍用干净 first/last(独立 generate_name),不受影响。
+        if str(mode).lower() == "name":
+
+            resolved_format = "{first}_{last}{digits:4}"
+
     elif custom and str(mode).lower() == "custom":
 
         resolved_format = str(custom)
 
     elif str(mode).lower() == "name":
 
-        resolved_format = "{first}_{last}"
+        resolved_format = "{first}_{last}{digits:4}"
 
     elif str(mode).lower() == "name_digits":
 
@@ -11569,7 +11600,7 @@ def main():
 
                     default=_env_bool("OUTLOOK_RUOYI_BLOCK_RESOURCES", False),
 
-                    help="屏蔽 image/font/media 资源请求")
+                    help="屏蔽 image/font/media 资源请求(遥测域名无论是否勾选都会屏蔽)")
 
     ap.add_argument("--timeout", "-t", type=int, default=REGISTER_TIMEOUT, help="单号超时(秒)")
 

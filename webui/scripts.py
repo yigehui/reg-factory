@@ -206,7 +206,7 @@ SCRIPTS = [
             {"flag": "--timeout", "type": "int", "default": 300, "help": "单号超时(秒)"},
             {"flag": "--max-press", "type": "str", "default": "5", "help": "验证码按住次数上限"},
             {"flag": "--headless", "type": "bool", "default": False, "help": "无头模式"},
-            {"flag": "--block-resources", "type": "bool", "default": False, "help": "屏蔽 image/font/media 请求"},
+            {"flag": "--block-resources", "type": "bool", "default": True, "help": "屏蔽 image/font/media + 微软遥测请求(默认开；取消勾选可关)"},
             {"flag": "--log-level", "type": "choice", "default": "INFO",
              "choices": ["DEBUG", "INFO", "WARN", "PROD", "ERR"],
              "help": "Outlook/Graph 日志等级"},
