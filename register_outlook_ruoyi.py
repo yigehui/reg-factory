@@ -8090,8 +8090,6 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
                 break
             time.sleep(0.5)  # 等 React 重渲染 indicator(svg 增删)
             _final_checked = _mkt_is_checked()
-            log(f"  {tag} marketingOptIn attempt{_attempt+1}: after click checked={_final_checked}")
-        log(f"  {tag} marketingOptIn submit state: checked={_final_checked}")
 
     _click_next(page, tag, wait_before=False, wait_after=False)
 
@@ -9773,8 +9771,6 @@ def register_outlook(opts, proxy_pool, idx):
         if _direct_signup:
 
             # 直接以 SIGNUP_URL 启动:Firefox 启动即注册页,跳过关空白页+page.get 导航
-
-            log(f"  {tag} direct signup: Firefox 已直接打开注册页,跳过空白页关闭与重复导航")
 
             signup_opened = True
 
