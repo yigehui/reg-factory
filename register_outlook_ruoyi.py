@@ -4020,6 +4020,16 @@ try {{
 
 }} catch(e) {{}}
 
+// hardwareConcurrency 伪装:本机 20 线程少见,PX 会据此触发 px-cloud.net/v
+
+// 二次审查导致按压不放行;改 16 对齐正常机器(实测 PX 秒过)
+
+try {{
+
+  Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 16, configurable: true}});
+
+}} catch(e) {{}}
+
 return true;
 
 """
@@ -4037,9 +4047,12 @@ def _ensure_ruoyi_headless_preload(page, tag=None, log_once=False, user_agent=No
 
     if not callable(add_script):
 
+        # preload 是 patch_js 的兜底注入渠道;主路径 _apply_ruoyi_headless_page_patches
+        # 的 run_js_loaded(inject_js) 已生效(实测按压1次秒过),preload 缺失不影响注册,
+        # 降级为 DEBUG 不刷 WARN。
         if log_once:
 
-            log(f"  {tag} ruoyi headless preload API not available", "WARN")
+            log(f"  {tag} ruoyi headless preload API not available(patches via run_js)", "DEBUG")
 
         return False
 
@@ -4067,9 +4080,13 @@ def _ensure_ruoyi_headless_preload(page, tag=None, log_once=False, user_agent=No
 
     except Exception as exc:
 
+        # 155 内核下 add_preload_script 走 BiDi 需 --remote-allow-system-access,未加会抛
+        # "System access is required"。但 patch_js 主路径(run_js_loaded IIFE 注入)已生效,
+        # preload 非必需;且加 allow_system_access 会扩大调试权限、增加反检测风险,
+        # 故降级为 DEBUG 静默处理,不刷 WARN。
         if log_once:
 
-            log(f"  {tag} ruoyi headless preload failed: {type(exc).__name__}: {exc}", "WARN")
+            log(f"  {tag} ruoyi headless preload skipped({type(exc).__name__}); patches via run_js", "DEBUG")
 
         return False
 
@@ -4088,13 +4105,17 @@ def _apply_ruoyi_headless_page_patches(page, tag=None, log_once=False, user_agen
 
     patch_js = _build_headless_patch_js(ua)
 
+    # patch_js 以 return 结尾(函数体),需包成 IIFE 才能 run_js 直接执行
+
+    inject_js = f"(() => {{ {patch_js} }})()"
+
     ok_count = 0
 
     for ctx in _all_contexts(page):
 
         try:
 
-            if ctx.run_js_loaded(patch_js):
+            if ctx.run_js_loaded(inject_js):
 
                 ok_count += 1
 
@@ -7978,7 +7999,10 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
 
         try:
 
-            checked = bool(getattr(cb, "is_checked", False))
+            # is_checked 是方法不是属性:getattr 拿到的是绑定方法, bool() 恒 True
+            # 会导致「已勾选」误判而从不点击。必须实际调用 is_checked()
+            _is_checked_fn = getattr(cb, "is_checked", None)
+            checked = bool(_is_checked_fn()) if callable(_is_checked_fn) else False
 
         except Exception:
 
@@ -7990,13 +8014,16 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
 
             log(f"  {tag} checked required checkbox")
 
-    # Add your name 页面默认勾上的营销订阅,提交前取消掉
-
+    # Add your name 页营销订阅 checkbox(marketingOptIn):用户要求提交时不勾选。
+    # Fluent UI Checkbox 结构: <span class="fui-Checkbox"><input id=marketingOptIn
+    #   data-testid=marketingOptIn><div class="fui-Checkbox__indicator"/><label/></span>
+    # 真实勾选态以 input.checked 为准(Fluent 用原生 input 作受控源),span aria-checked 兜底。
+    # 取消优先点 label(Fluent 监听 label click 切换内部状态,最可靠),回读确认,JS 兜底。
     mkt = _ele(
 
         page,
 
-        'css:#marketingOptIn, input[name="marketingOptIn"], '
+        'css:[data-testid="marketingOptIn"], #marketingOptIn, input[name="marketingOptIn"], '
 
         'input[id*="marketingOptIn" i], [role="checkbox"][aria-label*="marketing" i]',
 
@@ -8006,25 +8033,77 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
 
     if mkt is not None:
 
-        try:
+        # marketingOptIn 取消勾选(Fluent UI Checkbox,真实 BiDi 点击实证):
+        # 1) 真实勾选态以 input.checked 为准(ruyipage is_checked() 对 Fluent 读不到,作废)
+        # 2) 真实 BiDi 鼠标点 <label> 或 <input> 能 toggle 翻转(合成 JS click 无效);
+        #    点 indicator/span 无效。优先点 label(可视可点区域大,最可靠)。
+        # 3) 默认 input.checked=false(没勾);仅在已勾(true)时点一次翻回 false,没勾时绝不点(点反勾上)。
+        def _mkt_is_checked():
+            # 调试实证:Fluent UI Checkbox 的 input.checked 与真实勾选态同步可靠
+            # (真实 BiDi 点击 label/input 后 inputChecked 会 false->true 翻转)。
+            # ruyipage is_checked() 对 Fluent 读不到恒 False,作废。这里只读权威 React 态:
+            # input.checked 为主,容器 aria-checked=true 兜底。不用图标判定(陈旧渲染会误判,
+            # 且点击是 toggle 语义,误判已勾会导致把未勾点成勾)。
+            try:
 
-            already = bool(mkt.run_js(
+                return bool(mkt.run_js(r"""function(){
+  const inp = this;
+  if (!inp) return false;
+  if (inp.checked) return true;
+  const box = inp.closest('.fui-Checkbox') || inp.parentElement;
+  if (box) {
+    const ac = box.getAttribute('aria-checked');
+    if (ac === 'true' || ac === 'mixed') return true;
+  }
+  return false;
+}"""))
 
-                "function(){ return !!(this.checked || "
+            except Exception:
 
-                "this.getAttribute('aria-checked') === 'true'); }"
+                return False
 
-            ))
+        def _click_mkt_real():
+            # 真实 BiDi 点击:优先 label(实测翻转可靠),回退 input
+            for sel in ('css:label[for="marketingOptIn"]', 'css:#marketingOptIn'):
 
-        except Exception:
+                try:
 
-            already = bool(getattr(mkt, "is_checked", False))
+                    cand = _ele(page, sel, timeout=0.4)
 
-        if already:
+                    if cand is None:
 
-            _safe_click(mkt)
+                        continue
 
-            log(f"  {tag} unchecked marketingOptIn")
+                    cand.click_self()
+
+                    return True
+
+                except Exception:
+
+                    continue
+
+            return False
+
+        if _mkt_is_checked():
+
+            _click_mkt_real()
+
+            time.sleep(0.4)
+
+            if _mkt_is_checked():
+
+                _click_mkt_real()
+
+                time.sleep(0.3)
+
+            log(f"  {tag} unchecked marketingOptIn(ensured false before submit)")
+
+        _final_checked = _mkt_is_checked()
+        if _final_checked:
+            _click_mkt_real()
+            time.sleep(0.3)
+            _final_checked = _mkt_is_checked()
+        log(f"  {tag} marketingOptIn submit state: checked={_final_checked}")
 
     _click_next(page, tag, wait_before=False, wait_after=False)
 
@@ -9342,6 +9421,16 @@ def _apply_account_options(opts=None):
 
 
 
+    custom = (
+
+        getattr(opts, "account_format", None)
+
+        or os.environ.get("OUTLOOK_ACCOUNT_FORMAT")
+
+        or ""
+
+    )
+
     mode = (
 
         getattr(opts, "account_format_mode", None)
@@ -9352,15 +9441,13 @@ def _apply_account_options(opts=None):
 
     )
 
-    custom = (
+    # 用户填了指定格式模板就按模板走,无视 mode 预设(WebUI 默认 name,易漏切到 custom)
 
-        getattr(opts, "account_format", None)
+    if str(custom).strip() and str(mode).strip().lower() != "custom":
 
-        or os.environ.get("OUTLOOK_ACCOUNT_FORMAT")
+        mode = "custom"
 
-        or ""
 
-    )
 
     password_format = (
 
@@ -9549,6 +9636,22 @@ def register_outlook(opts, proxy_pool, idx):
 
         tb.headless(True)
 
+    # 直接以注册页 URL 启动 Firefox(命令行末尾带 URL),省掉「先开空白页再 page.get 导航」的等待。
+    # 默认开启;OUTLOOK_RUOYI_DIRECT_SIGNUP=0 关闭走原 about:blank 启动+导航流程。
+    _direct_signup = _env_bool("OUTLOOK_RUOYI_DIRECT_SIGNUP", True)
+
+    if _direct_signup:
+
+        try:
+
+            tb.set_argument(SIGNUP_URL)
+
+        except Exception as _e:
+
+            log(f"  {tag} set_argument(SIGNUP_URL) 失败,回退空白页启动: {_e}", "WARN")
+
+            _direct_signup = False
+
 
 
     log(
@@ -9679,15 +9782,25 @@ def register_outlook(opts, proxy_pool, idx):
 
             log(f"  {tag} 使用当前打开页面承载注册页，不再新建 container tab")
 
-        try:
+        if _direct_signup:
 
-            browser_page.close_other_tabs(page)
+            # 直接以 SIGNUP_URL 启动:Firefox 启动即注册页,跳过关空白页+page.get 导航
 
-            log(f"  {tag} 已关闭 Firefox 启动默认空白页，仅保留当前注册页")
+            log(f"  {tag} direct signup: Firefox 已直接打开注册页,跳过空白页关闭与重复导航")
 
-        except Exception as close_exc:
+            signup_opened = True
 
-            log(f"  {tag} 关闭默认空白页失败: {type(close_exc).__name__}: {close_exc}", "WARN")
+        else:
+
+            try:
+
+                browser_page.close_other_tabs(page)
+
+                log(f"  {tag} 已关闭 Firefox 启动默认空白页，仅保留当前注册页")
+
+            except Exception as close_exc:
+
+                log(f"  {tag} 关闭默认空白页失败: {type(close_exc).__name__}: {close_exc}", "WARN")
 
 
 
@@ -9695,11 +9808,9 @@ def register_outlook(opts, proxy_pool, idx):
 
             _start_ruoyi_resource_blocking(page, tag)
 
-        if is_headless and not signup_opened:
+        _apply_ruoyi_headless_page_patches(page, tag, log_once=True, user_agent=user_agent)
 
-            _apply_ruoyi_headless_page_patches(page, tag, log_once=True, user_agent=user_agent)
-
-            headless_patch_logged = True
+        headless_patch_logged = True
 
         if capture_har:
 
@@ -9713,9 +9824,7 @@ def register_outlook(opts, proxy_pool, idx):
 
         _, step_timings["wait_loading"] = _timed_step(tag, "wait_loading", page.wait_loading, 20)
 
-        if is_headless:
-
-            _apply_ruoyi_headless_page_patches(page, tag, log_once=False, user_agent=user_agent)
+        _apply_ruoyi_headless_page_patches(page, tag, log_once=False, user_agent=user_agent)
 
         try:
 
@@ -9919,15 +10028,13 @@ def register_outlook(opts, proxy_pool, idx):
 
         while time.time() < deadline:
 
-            if is_headless:
+            _apply_ruoyi_headless_page_patches(
 
-                _apply_ruoyi_headless_page_patches(
+                page, tag, log_once=(not headless_patch_logged), user_agent=user_agent
 
-                    page, tag, log_once=(not headless_patch_logged), user_agent=user_agent
+            )
 
-                )
-
-                headless_patch_logged = True
+            headless_patch_logged = True
 
             submitted = False
 
