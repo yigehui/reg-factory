@@ -3742,10 +3742,6 @@ def _apply_ruoyi_quiet_prefs(tb, tag=""):
 
             applied.append(key)
 
-    if applied:
-
-        log(f"  {tag} ruoyi quiet prefs applied: {','.join(applied)}")
-
     return bool(applied)
 
 
