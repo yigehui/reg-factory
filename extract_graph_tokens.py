@@ -22,7 +22,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
-    sys.stdin.reconfigure(encoding="utf-8")
+    # pytest 下 stdin 是 DontReadFromInput(无 reconfigure),兼容之
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 import requests
 
@@ -245,7 +249,7 @@ def _parse_proof_verify_form(text, url):
 
 
 def bind_proof_in_session(session, html, url, cf_address, cf_jwt=None, use_admin=False, idx=0,
-                          cm_module=None, max_wait=180, poll=6):
+                          cm_module=None, max_wait=180, poll=3):
     """在一个已登录的 requests.Session 里,把 proofs/Add 真绑成 cf 辅助邮箱。
     步骤:AddProof(填 EmailAddress)→ 微软发码到 cf → 收码 → VerifyProof(填 iOttText)。
     成功后返回下一个响应 resp(通常落在 Consent 或已登录页),调用方继续跟 oauth。

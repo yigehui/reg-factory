@@ -427,7 +427,7 @@ def _handle_login_verify_email(page, dumper, cf_address, cf_jwt, use_admin):
         h2 = ""
     if re.search(r'(enter.*code|code we sent|iOttText|proofs/Verify)', h2, re.I):
         _log("Verify your email 提交后进入验证码页,从 cf 收码并回填")
-        code = cm.wait_for_code(cf_jwt, received_after_id=base_last_id, max_wait=180, poll=6,
+        code = cm.wait_for_code(cf_jwt, received_after_id=base_last_id, max_wait=180, poll=3,
                                 use_admin=use_admin, address=cf_address)
         if not code:
             _log("Verify your email 取码超时", "WARN")
@@ -578,7 +578,7 @@ def bind_secondary_email(page, dumper, cf_address, cf_jwt, use_admin=False):
     dumper.snapshot("bind_code_page")
 
     # 4) 从 cf 收码
-    code = cm.wait_for_code(cf_jwt, received_after_id=base_last_id, max_wait=180, poll=6,
+    code = cm.wait_for_code(cf_jwt, received_after_id=base_last_id, max_wait=180, poll=3,
                             use_admin=use_admin, address=cf_address)
     if not code:
         _log("cf 取码超时", "WARN")

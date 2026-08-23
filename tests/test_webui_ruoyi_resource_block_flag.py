@@ -10,7 +10,9 @@ class WebuiRuoyiResourceBlockFlagTests(unittest.TestCase):
         spec = next((arg for arg in script['args'] if arg['flag'] == '--block-resources'), None)
         self.assertIsNotNone(spec)
         self.assertEqual('bool', spec['type'])
-        self.assertFalse(spec['default'])
+        # WebUI schema default=True:前端默认勾选→发 --block-resources→开;
+        # 取消勾选→不发 flag→CLI argparse default(env 控制,False)→关。bool 单向。
+        self.assertTrue(spec['default'])
 
     def test_build_cmd_includes_block_resources_when_checked(self):
         script = scripts.script_by_id('register_outlook_ruoyi')

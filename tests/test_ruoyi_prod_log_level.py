@@ -9,7 +9,8 @@ import run_full_flow as full
 
 
 def _load_webui_scripts():
-    path = Path(__file__).resolve().parent / 'webui' / 'scripts.py'
+    # 测试在 tests/ 下,webui/scripts.py 在项目根:parent=tests/,再上一级才是根
+    path = Path(__file__).resolve().parent.parent / 'webui' / 'scripts.py'
     spec = importlib.util.spec_from_file_location('webui_scripts_for_test', path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

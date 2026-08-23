@@ -7261,7 +7261,7 @@ def _fill_birthday(page, year, month, day, tag, idx):
 
             page.actions.press("\ue00c").perform()  # Escape
 
-            time.sleep(0.2)
+            time.sleep(0.12)
 
         except Exception:
 
@@ -7383,11 +7383,11 @@ return false;
 
                 return False
 
-        time.sleep(0.25)
+        time.sleep(0.15)
 
         if _click_option_exact(candidates):
 
-            time.sleep(0.15)
+            time.sleep(0.1)
 
             _press_escape()
 
@@ -7399,7 +7399,7 @@ return false;
 
                 page.actions.type(str(typed_fallback)).press("\ue007").perform()
 
-                time.sleep(0.15)
+                time.sleep(0.1)
 
                 _press_escape()
 
@@ -7749,8 +7749,6 @@ return true;
 
             log(f"  {tag} month={'ok' if month_filled else 'FAIL'} idx={month_idx} val={month}")
 
-            time.sleep(0.1)
-
 
 
         if day_idx is not None:
@@ -7774,8 +7772,6 @@ return true;
                 day_filled = _combo_shows_value(metas[day_idx], day_candidates)
 
             log(f"  {tag} day={'ok' if day_filled else 'FAIL'} idx={day_idx} val={day}")
-
-            time.sleep(0.1)
 
         else:
 
@@ -9591,26 +9587,14 @@ def _apply_account_options(opts=None):
 
     if callable(resolve_format_fn):
 
+        # 邮箱前缀格式统一由 ACCOUNT_FORMAT_PRESETS/resolve_account_format 决定:
+        # random→纯随机, custom→用户填的固定内容(不展开模板,见 _generate_prefix 的 literal 分支)。
+        # 旧 name/name_digits 模式已并入 custom,预设统一 {letters:7}{digits:6}(约 8e15 种,taken≈0)。
         resolved_format = resolve_format_fn(mode, custom)
-
-        # 名字库仅 30×21=630 组合,Outlook 常见英文名几乎全被占,裸名 {first}_{last} 必 taken,
-        # 每次重试浪费 3-5s。name 模式初始邮箱就带 4 位随机数字(630 万种),把 taken 概率压到极低。
-        # 姓名页仍用干净 first/last(独立 generate_name),不受影响。
-        if str(mode).lower() == "name":
-
-            resolved_format = "{first}_{last}{digits:4}"
 
     elif custom and str(mode).lower() == "custom":
 
         resolved_format = str(custom)
-
-    elif str(mode).lower() == "name":
-
-        resolved_format = "{first}_{last}{digits:4}"
-
-    elif str(mode).lower() == "name_digits":
-
-        resolved_format = "{first}_{last}{digits:3}"
 
     elif str(mode).lower() == "random":
 
@@ -11656,13 +11640,13 @@ def main():
 
             os.environ.get("OUTLOOK_ACCOUNT_FORMAT_MODE")
 
-            or ("custom" if os.environ.get("OUTLOOK_ACCOUNT_FORMAT") else "name")
+            or "custom"
 
         ),
 
-        choices=["random", "name", "name_digits", "custom"],
+        choices=["random", "custom"],
 
-        help="账号格式：random/name/name_digits/custom",
+        help="账号格式：random=纯随机,custom=用 --account-format 模板",
 
     )
 
@@ -11670,9 +11654,9 @@ def main():
 
         "--account-format",
 
-        default=os.environ.get("OUTLOOK_ACCOUNT_FORMAT", ""),
+        default=os.environ.get("OUTLOOK_ACCOUNT_FORMAT", "") or "{letters:7}{digits:6}",
 
-        help="指定格式模板，如 {first}.{last}{digits:3}；mode=custom 时生效",
+        help="邮箱前缀模板。{letters:7}{digits:6}=7随机字母+6数字(默认,约8e15种,taken几乎为0);custom 模式下填固定内容(如 myname123)则该内容直接做邮箱前缀不展开模板",
 
     )
 

@@ -28,7 +28,11 @@ from urllib.parse import parse_qs, urlsplit
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
-    sys.stdin.reconfigure(encoding="utf-8")
+    # pytest 下 stdin 是 DontReadFromInput(无 reconfigure),兼容之
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 import requests
 from playwright.async_api import async_playwright
@@ -381,9 +385,14 @@ def _email_suffixes():
 
 def _generate_prefix():
     fmt = getattr(_ACCOUNT_OPTIONS_CONTEXT, "account_format", None)
+    is_literal = getattr(_ACCOUNT_OPTIONS_CONTEXT, "account_format_literal", False)
     if fmt is None:
         fmt = os.environ.get("OUTLOOK_ACCOUNT_FORMAT", "").strip()
+        is_literal = is_literal or os.environ.get("OUTLOOK_ACCOUNT_FORMAT_LITERAL", "").strip() in ("1", "true", "yes", "on")
     if fmt:
+        # custom 指定格式:固定内容,不做 {占位符} 展开(用户填什么邮箱前缀就是什么)。
+        if is_literal:
+            return fmt
         return _expand_random_template(fmt, lambda: "")
     return random.choice(string.ascii_lowercase) + _random_chars(string.ascii_lowercase + string.digits, 11)
 
@@ -484,11 +493,11 @@ def load_account_queue(path):
 
 ACCOUNT_FORMAT_PRESETS = {
     "random": "",
-    # 名字库仅 30x21=630 组合,Outlook 常见英文名几乎全被占,裸 {first}_{last} 必 taken,
-    # 每次重试浪费 3-5s。初始就带 4 位随机数字(630 万种),把 taken 概率压到极低。
-    # 姓名页仍用干净 first/last(独立 generate_name),不受影响。
-    "name": "{first}_{last}{digits:4}",
-    "name_digits": "{first}_{last}{digits:3}",
+    # 名字库仅 30x21=630 组合,Outlook 常见英文名几乎全被占,裸名必 taken 每次重试浪费 3-5s。
+    # name/name_digits 统一用纯随机字母+数字({letters:7}{digits:6}=36^7×10^6≈8e15 种),taken 概率压到 0。
+    # 姓名页仍用干净 first/last(独立 generate_name),不受影响。WebUI 已只暴露 custom。
+    "name": "{letters:7}{digits:6}",
+    "name_digits": "{letters:7}{digits:6}",
 }
 
 
@@ -505,6 +514,14 @@ def apply_account_format_mode(mode, custom_format=""):
         os.environ["OUTLOOK_ACCOUNT_FORMAT"] = value
     else:
         os.environ.pop("OUTLOOK_ACCOUNT_FORMAT", None)
+    # custom + 纯固定内容(不含 {占位符}) → 原样不展开;其它(含模板占位符) → 正常展开
+    mode_lower = str(mode or "").strip().lower()
+    raw_fmt = str(custom_format or "").strip()
+    is_literal = (mode_lower == "custom") and bool(raw_fmt) and ("{" not in raw_fmt)
+    if is_literal:
+        os.environ["OUTLOOK_ACCOUNT_FORMAT_LITERAL"] = "1"
+    else:
+        os.environ.pop("OUTLOOK_ACCOUNT_FORMAT_LITERAL", None)
 
 
 def set_account_generation_options(email_suffixes=None, account_format_mode=None, account_format="", password_format=None):
@@ -516,13 +533,19 @@ def set_account_generation_options(email_suffixes=None, account_format_mode=None
             normalized_suffixes = str(email_suffixes or "").strip()
         normalized_suffixes = normalized_suffixes or None
     setattr(_ACCOUNT_OPTIONS_CONTEXT, "email_suffixes", normalized_suffixes)
+    # custom(指定格式)模式下,account_format 若是纯固定内容(不含 {占位符})则原样做邮箱前缀,不展开;
+    # 若含 {letters:7}{digits:6} 这类占位符则正常展开。其他模式(name 等)走预设模板,正常展开。
+    mode_lower = str(account_format_mode or "").strip().lower()
+    raw_fmt = str(account_format or "").strip()
+    is_literal = (mode_lower == "custom") and bool(raw_fmt) and ("{" not in raw_fmt)
     setattr(_ACCOUNT_OPTIONS_CONTEXT, "account_format", resolve_account_format(account_format_mode, account_format) or "")
+    setattr(_ACCOUNT_OPTIONS_CONTEXT, "account_format_literal", is_literal)
     normalized_password_format = None if password_format is None else str(password_format or "").strip()
     setattr(_ACCOUNT_OPTIONS_CONTEXT, "password_format", normalized_password_format)
 
 
 def clear_account_generation_options():
-    for name in ("email_suffixes", "account_format", "password_format"):
+    for name in ("email_suffixes", "account_format", "account_format_literal", "password_format"):
         if hasattr(_ACCOUNT_OPTIONS_CONTEXT, name):
             delattr(_ACCOUNT_OPTIONS_CONTEXT, name)
 
@@ -2892,12 +2915,12 @@ async def main():
     parser.add_argument("--email-suffixes", type=str, default=os.environ.get("OUTLOOK_ACCOUNT_SUFFIXES", ""),
                         help="Email suffix pool, comma/space separated, e.g. outlook.com,hotmail.com")
     parser.add_argument("--account-format-mode", type=str,
-                        default=(os.environ.get("OUTLOOK_ACCOUNT_FORMAT_MODE")
-                                 or ("custom" if os.environ.get("OUTLOOK_ACCOUNT_FORMAT") else "name")),
-                        choices=["random", "name", "name_digits", "custom"],
-                        help="Account format preset: random/name/name_digits/custom")
-    parser.add_argument("--account-format", type=str, default=os.environ.get("OUTLOOK_ACCOUNT_FORMAT", ""),
-                        help="Generated local-part template, e.g. {first}.{last}{digits:3}; empty uses default random")
+                        default=(os.environ.get("OUTLOOK_ACCOUNT_FORMAT_MODE") or "custom"),
+                        choices=["random", "custom"],
+                        help="Account format preset: random=fully random, custom=use --account-format template")
+    parser.add_argument("--account-format", type=str,
+                        default=os.environ.get("OUTLOOK_ACCOUNT_FORMAT", "") or "{letters:7}{digits:6}",
+                        help="Local-part template. {letters:7}{digits:6}=7 random letters+6 digits (default, ~8e15 combos, ~0 taken). custom mode with a fixed string (e.g. myname123) uses it verbatim as the prefix without template expansion")
     parser.add_argument("--password-format", type=str, default=os.environ.get("OUTLOOK_PASSWORD_FORMAT", ""),
                         help="Generated password template, e.g. Aa1!{rand:12}; empty uses default random")
     parser.add_argument("--no-proxy", action="store_true", default=False, help="No proxy")
