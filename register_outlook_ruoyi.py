@@ -259,6 +259,10 @@ SUBMIT_RESULT_TIMEOUT = 15
 # 判定卡死(代理抖动/出口IP风控导致提交无响应),fail 换号换代理,不死等到 REGISTER_TIMEOUT。
 SUBMIT_STUCK_NOCHANGE_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_SUBMIT_STUCK_TIMEOUT", "25") or "25")
 
+# captcha 主循环无进展总超时:进入注册后等待/按压期间,连续 N 秒既没成功按压、没跳转、也没出 captcha 进展,
+# 判死循环卡死(覆盖 submit 后 loading 不结束、点不中 submit 静默空转等所有场景),早退 fail 换号换代理。
+NO_PROGRESS_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_NO_PROGRESS_TIMEOUT", "60") or "60")
+
 # 邮箱页 stuck 换号上限:连续 stuck 换到第 N 个号仍过不去就早退 fail,避免 5 轮 × 8s 累加到 60s。
 EMAIL_STUCK_MAX_ROTATE = int(os.environ.get("OUTLOOK_RUOYI_EMAIL_STUCK_MAX_ROTATE", "2") or "2")
 
@@ -10040,6 +10044,11 @@ def register_outlook(opts, proxy_pool, idx):
         submit_first_click_at = None
         submit_first_click_url = None
 
+        # 无进展总超时:任何有意义进展(按压、captcha 出现、URL 变化)更新此时间戳,
+        # 超过 NO_PROGRESS_TIMEOUT 无进展判死循环卡死,早退 fail(覆盖 submit 后 loading 不结束等场景)。
+        last_progress_at = time.time()
+        last_progress_url = page.url.lower()
+
         while time.time() < deadline:
 
             _apply_ruoyi_headless_page_patches(
@@ -10057,6 +10066,18 @@ def register_outlook(opts, proxy_pool, idx):
             body = _body_text(page)
 
             low = body.lower()
+
+            # 无进展超时:URL 变化(任何跳转/loading)算进展重新计时;否则累计无进展,
+            # 超过 NO_PROGRESS_TIMEOUT 判死循环卡死(覆盖 submit 后 loading 不结束、点不中 submit 空转等)。
+            if current_url != last_progress_url:
+                last_progress_url = current_url
+                last_progress_at = time.time()
+            else:
+                no_progress = time.time() - last_progress_at
+                if no_progress >= NO_PROGRESS_TIMEOUT and not had_captcha:
+                    log(f"  {tag} no progress for {int(no_progress)}s on signup, give up", "WARN")
+                    _shot(page, "no_progress_timeout", idx)
+                    return _finish(reason="timeout")
 
 
 
@@ -10420,6 +10441,8 @@ def register_outlook(opts, proxy_pool, idx):
 
                 had_captcha = True
 
+                last_progress_at = time.time()  # captcha 出现算进展
+
                 gone_rounds = 0
 
                 if press_count < max_press:
@@ -10493,6 +10516,8 @@ def register_outlook(opts, proxy_pool, idx):
                             post_press_saw_gap = False
 
                             post_press_started_at = time.time()
+
+                            last_progress_at = time.time()  # 成功按压算进展
 
                             if press_count >= max_press:
 
