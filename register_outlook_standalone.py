@@ -745,12 +745,17 @@ GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://grap
 GRAPH_DIRECT_FALLBACK_ATTEMPTS = 3
 
 
-def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None):
+def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None, bind_secondary=None):
     """Extract Graph refresh_token through the shared pure-HTTP OAuth flow.
 
     proxy_str 为空 -> 直连（proxies=None + trust_env=False），重试 attempts 次。
     proxy_str 非空 -> 走该代理重试 attempts 次；全部失败后回退直连再重试
     GRAPH_DIRECT_FALLBACK_ATTEMPTS 次（短退避），避免代理故障导致拿不到 token。
+
+    bind_secondary: 传入则 proofs/Add 真绑 cf 辅助邮箱(而非 Skip),
+      结构见 extract_graph_tokens.get_graph_token 的 bind_secondary。
+      8月起微软对新号收紧,无辅助邮箱一律 access_denied,注册后授权必须传这个。
+    不传则保持原 Skip 行为(向后兼容)。
     """
     try:
         from extract_graph_tokens import get_graph_token
@@ -769,7 +774,7 @@ def extract_graph_token_http(email, password, idx=0, attempts=3, proxy_str=None)
             try:
                 print(f"  [#{idx}] [graph] attempt {attempt + 1}/{count} proxy={label}")
                 # trust_env=False 已在 get_graph_token 内保证；proxies=None 即直连。
-                res = get_graph_token(email, password, idx, proxies=current_proxies)
+                res = get_graph_token(email, password, idx, proxies=current_proxies, bind_secondary=bind_secondary)
             except Exception as exc:
                 print(f"  [#{idx}] [graph] attempt {attempt + 1}/{count} error: {exc}")
                 res = None

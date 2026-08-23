@@ -10911,6 +10911,36 @@ def _resolve_graph_auth_proxy(args_or_opts, reg_proxy, tag):
 
 
 
+def _build_bind_secondary(email, idx, tag, reg_proxy=None):
+    """注册后授权前,给微软号建 cf 辅助邮箱,构造透传给 get_graph_token 的 bind_secondary。
+    8月起微软对新号收紧:无辅助邮箱 Graph 授权一律 access_denied,必须先绑。
+    复用 bind_secondary_email_http 的逻辑:create_or_get_address 建每个号专属 cf 邮箱
+    (ms-<前缀>@<CF_MAIL_DOMAIN>),cf worker 走 CF_MAIL_PROXY 代理收信(MS 端点仍直连)。
+    失败返回 None(降级走原 Skip 路径,不阻断授权,记 no_graph 让上层分类)。"""
+    try:
+        from common import cloudflare_mail as cm
+    except Exception as e:
+        log(f"  {tag} bind_secondary: import cloudflare_mail 失败: {type(e).__name__}: {e}", "WARN")
+        return None
+    try:
+        cf_proxy = os.environ.get("CF_MAIL_PROXY") or None
+        cm.set_proxy(cf_proxy)
+        d = cm.create_or_get_address(email)
+        bs = {
+            "cf_address": d["address"],
+            "cf_jwt": d.get("jwt"),
+            "use_admin": d.get("use_admin", False),
+            "cm": cm,
+        }
+        log(f"  {tag} bind_secondary: cf 辅助邮箱就绪 {d['address']} (use_admin={d.get('use_admin', False)})")
+        return bs
+    except Exception as e:
+        log(f"  {tag} bind_secondary: 建 cf 辅助邮箱失败: {type(e).__name__}: {e}", "WARN")
+        return None
+
+
+
+
 async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lock, started, px_metrics, graph=None, reg_proxy=None):
 
     tag = f"#{idx}"
@@ -10951,7 +10981,14 @@ async def _finish_direct_graph_auth(args, helpers, email, password, idx, save_lo
 
             log(f"{tag} graph proxy -> direct", "INFO")
 
-        graph = await asyncio.to_thread(helpers.extract_graph_token_http, email, password, idx, 3, auth_proxy_str)
+        # 8月起微软对新号收紧:无辅助邮箱一律 access_denied。注册后授权必须先绑 cf 辅助邮箱。
+        # 这里复用 bind_secondary_email_http 的逻辑:create_or_get_address 建每个号专属 cf 邮箱,
+        # 透传给 extract_graph_token_http -> get_graph_token 的 bind_secondary,proofs/Add 真绑再拿 RT。
+        bind_secondary = _build_bind_secondary(email, idx, tag, reg_proxy)
+
+        graph = await asyncio.to_thread(
+            helpers.extract_graph_token_http, email, password, idx, 3, auth_proxy_str, bind_secondary
+        )
 
     if not graph or not graph.get("refresh_token"):
 
