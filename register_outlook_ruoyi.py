@@ -8033,29 +8033,25 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
 
     if mkt is not None:
 
-        # marketingOptIn 取消勾选(Fluent UI Checkbox,真实 BiDi 点击实证):
-        # 1) 真实勾选态以 input.checked 为准(ruyipage is_checked() 对 Fluent 读不到,作废)
-        # 2) 真实 BiDi 鼠标点 <label> 或 <input> 能 toggle 翻转(合成 JS click 无效);
-        #    点 indicator/span 无效。优先点 label(可视可点区域大,最可靠)。
-        # 3) 默认 input.checked=false(没勾);仅在已勾(true)时点一次翻回 false,没勾时绝不点(点反勾上)。
+        # marketingOptIn 取消勾选(Fluent UI Checkbox,真实 HTML 实证):
+        # 用户给的两态 HTML 对比证明:<input> 在勾选/未勾选时完全一样(都无 checked、无 aria-checked 属性),
+        # input.checked 不反映真实勾选态!唯一可靠信号是 .fui-Checkbox__indicator 内有没有 <svg> 勾选图标:
+        #   未勾选 -> indicator 空 div;勾选 -> indicator 内有 <svg><path/></svg>。
+        # 所以读 input.checked 恒 False(误判没勾->不点取消->提交时仍勾着)。改读 indicator 内 svg。
+        # 点击:真实 BiDi click_self 点 <label>/<input> 能 toggle 翻转(合成 JS click 无效),indicator/span 无效。
+        # toggle 语义:仅在判定已勾(svg 存在)时点一次翻回未勾;未勾时绝不点。
         def _mkt_is_checked():
-            # 调试实证:Fluent UI Checkbox 的 input.checked 与真实勾选态同步可靠
-            # (真实 BiDi 点击 label/input 后 inputChecked 会 false->true 翻转)。
-            # ruyipage is_checked() 对 Fluent 读不到恒 False,作废。这里只读权威 React 态:
-            # input.checked 为主,容器 aria-checked=true 兜底。不用图标判定(陈旧渲染会误判,
-            # 且点击是 toggle 语义,误判已勾会导致把未勾点成勾)。
             try:
 
                 return bool(mkt.run_js(r"""function(){
   const inp = this;
   if (!inp) return false;
-  if (inp.checked) return true;
   const box = inp.closest('.fui-Checkbox') || inp.parentElement;
-  if (box) {
-    const ac = box.getAttribute('aria-checked');
-    if (ac === 'true' || ac === 'mixed') return true;
-  }
-  return false;
+  if (!box) return false;
+  const ind = box.querySelector('.fui-Checkbox__indicator');
+  if (!ind) return false;
+  // 勾选态:indicator 内渲染了 svg 勾选图标;未勾选时 indicator 为空 div
+  return !!ind.querySelector('svg, path, [data-icon]');
 }"""))
 
             except Exception:
@@ -8084,25 +8080,17 @@ def _fill_name_and_terms(page, first, last, prefix, tag, idx):
 
             return False
 
-        if _mkt_is_checked():
-
-            _click_mkt_real()
-
-            time.sleep(0.4)
-
-            if _mkt_is_checked():
-
-                _click_mkt_real()
-
-                time.sleep(0.3)
-
-            log(f"  {tag} unchecked marketingOptIn(ensured false before submit)")
-
+        # 确保未勾:最多点 3 次。每次真实点击后等 svg 重新渲染再读,
+        # 只要读到未勾(indicator 无 svg)就停;点不翻或元素丢失则停,避免空转。
         _final_checked = _mkt_is_checked()
-        if _final_checked:
-            _click_mkt_real()
-            time.sleep(0.3)
+        for _attempt in range(3):
+            if not _final_checked:
+                break
+            if not _click_mkt_real():
+                break
+            time.sleep(0.5)  # 等 React 重渲染 indicator(svg 增删)
             _final_checked = _mkt_is_checked()
+            log(f"  {tag} marketingOptIn attempt{_attempt+1}: after click checked={_final_checked}")
         log(f"  {tag} marketingOptIn submit state: checked={_final_checked}")
 
     _click_next(page, tag, wait_before=False, wait_after=False)
