@@ -255,6 +255,13 @@ SIGNUP_ENTRY_TIMEOUT = 20
 
 SUBMIT_RESULT_TIMEOUT = 15
 
+# submit 卡死硬超时:持续点中 submit 按钮(页面没跳 captcha/loading/blocked)但 N 秒内 URL 仍无变化,
+# 判定卡死(代理抖动/出口IP风控导致提交无响应),fail 换号换代理,不死等到 REGISTER_TIMEOUT。
+SUBMIT_STUCK_NOCHANGE_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_SUBMIT_STUCK_TIMEOUT", "25") or "25")
+
+# 邮箱页 stuck 换号上限:连续 stuck 换到第 N 个号仍过不去就早退 fail,避免 5 轮 × 8s 累加到 60s。
+EMAIL_STUCK_MAX_ROTATE = int(os.environ.get("OUTLOOK_RUOYI_EMAIL_STUCK_MAX_ROTATE", "2") or "2")
+
 PROXY_PRECHECK_TIMEOUT = 30
 
 PROXY_IDENTITY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_TIMEOUT", "12") or "12")
@@ -6295,6 +6302,8 @@ def _fill_email(page, email, prefix, tag, idx):
 
     taken_retry_count = 0
 
+    stuck_rotate_count = 0  # 真 stuck(邮箱页提交无响应,代理抖动/出口IP风控)换号计数,超限早退
+
     for attempt in range(12):
 
         try:
@@ -6740,6 +6749,15 @@ function(v) {
             log(f"  {tag} still on email page after submit (outcome={outcome or 'empty'}), retry", "WARN")
 
             _shot(page, "email_stuck", idx)
+
+            stuck_rotate_count += 1
+
+            # 邮箱页连续 stuck 换号超限:多半代理抖动/出口IP风控导致提交无响应,
+            # 再换号也是一样卡,早退 fail 让上层换代理,别 5 轮 ×8s 累加到 60s。
+            if stuck_rotate_count > EMAIL_STUCK_MAX_ROTATE:
+                log(f"  {tag} email page stuck {stuck_rotate_count}x rotate, give up (proxy jitter)", "WARN")
+                _shot(page, "email_stuck_giveup", idx)
+                return None
 
             taken_retry_count += 1
 
@@ -9249,6 +9267,12 @@ def _loading_timeout_graph_fallback(helpers, opts, email, password, idx, tag, re
 
         return False
 
+    # 尊重"只注册不授权"开关:勾了就不拉 Graph token(用户只想要号,不要授权),
+    # Loading 超时直接走正常超时 fail,不兜底授权。
+    if getattr(opts, "skip_graph_auth", False):
+        log(f"  {tag} loading timeout fallback skipped: skip_graph_auth on")
+        return False
+
     extract_graph = getattr(helpers, "extract_graph_token_http", None)
 
     if not callable(extract_graph):
@@ -10010,6 +10034,12 @@ def register_outlook(opts, proxy_pool, idx):
 
         captcha_started = time.perf_counter()
 
+        # submit 卡死追踪:记录"开始能点 submit 后页面仍无进展"的起点与当时 URL。
+        # 若持续点中 submit 但 SUBMIT_STUCK_NOCHANGE_TIMEOUT 内 URL 仍未变、且未出 captcha/loading,
+        # 判定卡死(代理抖动/出口IP风控致提交无响应),早退 fail 换号,不死等到 deadline。
+        submit_first_click_at = None
+        submit_first_click_url = None
+
         while time.time() < deadline:
 
             _apply_ruoyi_headless_page_patches(
@@ -10126,6 +10156,8 @@ def register_outlook(opts, proxy_pool, idx):
 
                 submit_wait_started = None
                 last_submit_click_hit = None
+                submit_first_click_at = None
+                submit_first_click_url = None
 
                 continue
 
@@ -10133,6 +10165,8 @@ def register_outlook(opts, proxy_pool, idx):
 
                 submit_wait_started = None
                 last_submit_click_hit = None
+                submit_first_click_at = None
+                submit_first_click_url = None
 
                 _click_post_signup(page, tag)
 
@@ -10601,6 +10635,24 @@ def register_outlook(opts, proxy_pool, idx):
                     now=time.time(),
 
                 )
+
+                # submit 卡死硬超时:点中 submit 后页面一直无进展(URL 没变、没出 captcha/loading/blocked),
+                # 超过 SUBMIT_STUCK_NOCHANGE_TIMEOUT 就判卡死,早退 fail 换号。
+                # URL 变化以新 URL 重新计时(防止页面在 signup 内中途跳转后卡死漏判)。
+                # 注:若 URL 变成跳出 signup/loading,会先被上面状态分支 break 接住,这里只兜底卡死态。
+                if submitted:
+                    if submit_first_click_at is None or submit_first_click_url != current_url:
+                        submit_first_click_at = time.time()
+                        submit_first_click_url = current_url
+                    elif not visible and not loading_page and not validating:
+                        submit_nochange = time.time() - submit_first_click_at
+                        if submit_nochange >= SUBMIT_STUCK_NOCHANGE_TIMEOUT:
+                            log(f"  {tag} submit stuck for {int(submit_nochange)}s with no URL/captcha change, give up", "WARN")
+                            _shot(page, "submit_stuck_nochange", idx)
+                            return _finish(reason="submit_timeout")
+                else:
+                    submit_first_click_at = None
+                    submit_first_click_url = None
 
 
 
