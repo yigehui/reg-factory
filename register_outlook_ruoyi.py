@@ -3709,11 +3709,9 @@ def _apply_ruoyi_quiet_prefs(tb, tag=""):
     """有头/无头都关掉会弹窗的 firefox 行为:会话恢复、崩溃报告、退出警告、默认浏览器检查。
 
     XPCOM 启动失败由进程树清理治本,这里灭其他边缘弹窗(恢复会话/crash reporter/默认浏览器)。
-    另含降内存 pref(针对 1G/并发偏高):限制 content 进程数、关磁盘/内存缓存、砍图片解码缓存上限、
-    关网络预测/预取/DNS 预取、关 back/forward 会话历史快照、压 JS 堆上限到 80MB+降 GC 水位。
-    预期单实例省 80-300MB(实测为主)。注册/PX 不依赖这些子系统:注册单域单 page,PX 是行为
-    遥测靠按压/鼠标轨迹不靠缓存/预取;bfcache 只影响 back/forward 不影响前进跳转。JS 堆 80MB
-    若致 PX/填表卡顿,调大 javascript.options.mem.max 到 120-150MB。"""
+    另含降资源 pref:限制 content 进程数 + 关磁盘缓存(临时 profile 一次性,缓存无意义且增 IO),
+    多并发下每个 Firefox 实例少起若干子进程/少写盘,显著降内存与磁盘开销,对注册/PX 流程零影响
+    (注册单域单 page,PX 是行为遥测不依赖多进程/缓存)。"""
 
     prefs = {
 
@@ -3742,30 +3740,6 @@ def _apply_ruoyi_quiet_prefs(tb, tag=""):
 
         # 关插件检查/下载提示等后台轮询,减一点空闲开销。
         "plugins.update.notifyUser": False,
-
-        # ---- 内存缓存:关 HTTP 内存缓存(默认无上限,白占几十 MB) ----
-        "browser.cache.memory.enable": False,
-        "browser.cache.memory.max_entry_size": 0,
-
-        # ---- 图片:砍解码缓存上限 + 关预解码(注册页 banner/logo 解码后驻留内存) ----
-        "image.cache.size": 10240,                   # 默认 5242880,砍到 1/500
-        "image.mem.decode_on_draw.enabled": False,
-
-        # ---- 网络:关预测/预取/预连接/DNS 预取(后台白攒内存与连接) ----
-        "network.predictor.enabled": False,
-        "network.predictor.enable-prefetch": False,
-        "network.prefetch-next": False,
-        "network.dns.disablePrefetch": True,
-        "network.http.speculative-parallel-limit": 0,
-
-        # ---- 会话历史:关 back/forward 缓存(注册多步跳转没必要留快照) ----
-        "browser.sessionhistory.max_total_viewers": 0,
-
-        # ---- JS 堆:压上限 + 降 GC 水位(默认无上限,PX+注册页 JS 能涨到几百 MB) ----
-        # 80MB 偏紧;若 PX 按压/填表出现卡顿,调大到 120-150MB。
-        "javascript.options.mem.max": 81920,
-        "javascript.options.mem.high_water_mark": 40,
-        "javascript.options.mem.gc_on_memory_pressure": True,
 
     }
 
