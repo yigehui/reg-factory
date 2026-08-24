@@ -3708,7 +3708,10 @@ def _apply_ruoyi_quiet_prefs(tb, tag=""):
 
     """有头/无头都关掉会弹窗的 firefox 行为:会话恢复、崩溃报告、退出警告、默认浏览器检查。
 
-    XPCOM 启动失败由进程树清理治本,这里灭其他边缘弹窗(恢复会话/crash reporter/默认浏览器)。"""
+    XPCOM 启动失败由进程树清理治本,这里灭其他边缘弹窗(恢复会话/crash reporter/默认浏览器)。
+    另含降资源 pref:限制 content 进程数 + 关磁盘缓存(临时 profile 一次性,缓存无意义且增 IO),
+    多并发下每个 Firefox 实例少起若干子进程/少写盘,显著降内存与磁盘开销,对注册/PX 流程零影响
+    (注册单域单 page,PX 是行为遥测不依赖多进程/缓存)。"""
 
     prefs = {
 
@@ -3723,6 +3726,20 @@ def _apply_ruoyi_quiet_prefs(tb, tag=""):
         "toolkit.crashreporter.enabled": False,
 
         "dom.ipc.crashreporter.enabled": False,
+
+        # ---- 降资源(5 并发下每个实例少起子进程/少写盘) ----
+        # 限制 content 进程数为 1:默认每域起独立 content 进程,5 实例×多域会起一堆;
+        # 注册单域单 page,单 content 进程足够,省每个进程几十~上百 MB 内存。
+        "dom.ipc.processCount": 1,
+
+        # 关磁盘缓存:临时 profile 用完即删,缓存无复用价值反而增磁盘 IO 与空间。
+        "browser.cache.disk.enable": False,
+
+        # 关 media 硬件解码与 WebRTC:注册流程不播放音视频/不视频通话,省解码线程与 GPU 开销。
+        "media.hardware-video-decoding.enabled": False,
+
+        # 关插件检查/下载提示等后台轮询,减一点空闲开销。
+        "plugins.update.notifyUser": False,
 
     }
 
@@ -5695,6 +5712,11 @@ def _start_ruoyi_resource_blocking(page, tag=None):
 
     def _handler(req):
 
+        # 整体包 try/except: fail()/continue_request() 对"已不存在"的请求会抛
+        # no such request(浏览器内部已取消/重定向的请求),被 ruyipage 拦截层
+        # 捕获后会打 "拦截回调异常" warning。这类异常无害(请求本就要丢弃/已结束),
+        # 静默吞掉,避免刷屏且不阻断其他请求的处理。
+
         try:
 
             if _ruoyi_should_block_resource_request(req):
@@ -5703,11 +5725,11 @@ def _start_ruoyi_resource_blocking(page, tag=None):
 
                 return
 
+            req.continue_request()
+
         except Exception:
 
             pass
-
-        req.continue_request()
 
     try:
 
