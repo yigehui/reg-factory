@@ -71,5 +71,4 @@ email_reg.txt.lock
 unlock_results/
 selected_accounts_*.txt
 
-# PX 环境对拍报告(机器本地快照,不进库)
-px_env_report.json
+screenshots_unlock/

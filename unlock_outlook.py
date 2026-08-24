@@ -53,6 +53,9 @@ _spec.loader.exec_module(_ruoyi)
 
 from ruyipage import FirefoxOptions, FirefoxPage
 
+# 公共 ruyi 浏览器启动栈(UA/quiet_prefs/headless_options/直接启动 + 启动后反检测注入 + 资源拦截)
+from common.ruyi_browser import build_browser_options, after_launch
+
 # ── Config ───────────────────────────────────────────────────────────
 OUTPUT_DIR      = "unlock_results"
 SCREENSHOT_DIR  = "screenshots_unlock"
@@ -82,8 +85,6 @@ _force_kill_ruoyi_firefox     = _ruoyi._force_kill_ruoyi_firefox
 _pick_user_agent              = _ruoyi._pick_user_agent
 _browser_model_name           = _ruoyi._browser_model_name
 _ruoyi_profile_dir            = _ruoyi._ruoyi_profile_dir
-_apply_ruoyi_browser_ua       = _ruoyi._apply_ruoyi_browser_ua
-_apply_ruoyi_headless_options = _ruoyi._apply_ruoyi_headless_options
 _log_current_ip               = _ruoyi._log_current_ip
 _probe_proxy_before_browser   = _ruoyi._probe_proxy_before_browser
 
@@ -166,6 +167,14 @@ _RETRY_SELECTORS = [
     'text:重试', 'text:再试一次', 'text:再试',
 ]
 
+# "Verify your email" 页(绑了辅助邮箱时,微软默认往辅助邮箱发验证码)的
+# "改用密码登录"链接选择器。中英文文案变体 + MS proof 页 decline 锚点 #proofDecline。
+_USE_PASSWORD_SELECTORS = [
+    'text:Use your password', 'text:Sign in with password',
+    'text:Use password instead', 'text:使用密码登录', 'text:用密码登录',
+    'css:a#proofDecline',
+]
+
 
 # ── Page state classifier (套原 classify 文案到 ruyipage)─────────────
 def classify(page):
@@ -202,6 +211,9 @@ def classify(page):
                               "locked for your protection", "帐户已锁定"]): return "locked"
     if any(x in t for x in ["enter the code", "we texted", "we sent", "verification code",
                               "验证码", "短信"]): return "sms_verify"
+    # 绑了辅助邮箱的账号输入邮箱后默认走"verify your email"(往辅助邮箱发码),需点"使用密码登录"
+    # 放在 email_form(含 "sign in" 文案,会被抢先匹配)之前
+    if any(x in t for x in ["verify your email", "验证你的电子邮件", "验证邮箱"]): return "verify_email"
     if any(x in t for x in ["verify your identity", "unusual activity"]): return "verify_needed"
     if "something went wrong" in t: return "error_page"
     if "chrome-error://" in u or "about:neterror" in u: return "net_error"
@@ -235,9 +247,41 @@ def clear_live_cookies(page):
         pass
 
 
+def _fill_login_email_js(page, email, tag):
+    """JS 直填邮箱:run_js querySelector 找 input + React 兼容 setter 设值 +
+    派发 input/change 事件,不等 page.ele 可交互(省 ~4s)。返回 True=填成功。
+
+    登录页 input 早就在 DOM,但 ruyipage page.ele 等可交互要 ~4s。run_js 只查 DOM
+    存在即填。React 受控 input 用原生 setter + dispatchEvent('input') 能触发 onChange
+    (同 register _safe_input 的 JS 回退做法)。失败回退到 _fill_login_email。"""
+    js = """
+function(v) {
+  var text = String(v || '');
+  var el = document.querySelector('input[name="loginfmt"]') || document.querySelector('input[type="email"]');
+  if (!el) return false;
+  el.focus();
+  var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+  if (setter) setter.call(el, ''); else el.value = '';
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  if (setter) setter.call(el, text); else el.value = text;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return el.value === text;
+}
+"""
+    for ctx in _ruoyi._all_contexts(page):
+        try:
+            fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
+            if fn(js, email):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _fill_login_email(page, email, tag):
     try:
-        el = _ele(page, 'css:input[name="loginfmt"]', timeout=8) \
+        el = _ele(page, 'css:input[name="loginfmt"]', timeout=4) \
              or _ele(page, 'css:input[type="email"]', timeout=2)
         if el:
             _safe_input(el, email)
@@ -268,6 +312,32 @@ def _page_go_back(page):
         page.run_js_loaded("history.back();")
     except Exception:
         pass
+
+
+def _click_try_again_if_present(page):
+    """跨所有 context(main+iframe)快速 JS 扫 'Try again' 按钮并点击。找到返回 True。
+
+    不用 _ele 轮询(6 选择器 × timeout 会累计数秒拖慢主循环);JS 扫无匹配时 <50ms 返回。
+    用 run_js(非 run_js_loaded)不等 doc_loaded —— something went wrong 页常不触发 loaded,
+    等会卡。任何页出现 try again 都能用此自动恢复。button / a / input[type=submit] 都扫,
+    input 取 value(MS 的 Try again 常是 <input type=submit value="Try again">)。"""
+    for ctx in _ruoyi._all_contexts(page):
+        try:
+            fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
+            found = fn(
+                "var btns=Array.from(document.querySelectorAll('button,a,input[type=submit],input[type=button]'));"
+                "var pats=['try again','重试','再试一次','再试'];"
+                "for(var i=0;i<btns.length;i++){"
+                "var tx=(btns[i].innerText||btns[i].value||btns[i].getAttribute('aria-label')||'').trim().toLowerCase();"
+                "if(!tx)continue;"
+                "for(var j=0;j<pats.length;j++){if(tx.indexOf(pats[j])>=0){btns[i].click();return true;}}}"
+                "return false;"
+            )
+            if found:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 # ── per-tab 代理归一化 ─────────────────────────────────────────────
@@ -324,10 +394,9 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
     else:
         print(f"  {tag} 没挂代理 -- 直接本机出口", file=sys.stderr)
 
-    _apply_ruoyi_browser_ua(tb, tag, user_agent)
-    if headless:
-        _apply_ruoyi_headless_options(tb, tag, user_agent=user_agent)
-        tb.headless(True)
+    # 公共启动栈:UA + quiet_prefs + (无头)headless_options + set_argument(LOGIN_URL) 直接启动到登录页
+    build_browser_options(tb, tag=tag, user_agent=user_agent,
+                          is_headless=headless, direct_url=LOGIN_URL)
 
     print(f"  {tag} 启动 ruyipage Firefox: model={_browser_model_name(RUOYI_FIREFOX_PATH)} "
           f"headless={headless} ua={user_agent[:60]}...")
@@ -340,6 +409,12 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
         page.close_other_tabs(page)
     except Exception:
         pass
+
+    # 启动后:资源拦截(PX 白名单已在 _ruoyi_should_block_resource_request 放行)+ 反检测注入
+    # 反检测含 hardwareConcurrency=16(PX 按压放行关键,本机 20 线程会被 px-cloud 二次审查不放行)
+    # wait_loaded=False:patch 只 define 属性,直接 run_js 立即注入,不等 doc_loaded
+    # (登录页 doc_loaded 会卡 ~10s 阻塞输入邮箱)
+    after_launch(page, tag=tag, user_agent=user_agent, block_resources=True, wait_loaded=False)
 
     if proxy_pool:
         try: _log_current_ip(proxy_pool, tag)
@@ -392,13 +467,26 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
 
     # ── Step 1: Login ────────────────────────────────────────────────
     net_err_count = 0
-    if not _load_login_page(page):
-        net_err_count += 1
-    time.sleep(2)
+    email_filled = False
+    # launch_firefox 已 set_argument(LOGIN_URL) 直接启动到登录页,首屏不再二次 page.get。
+    # 不再 fastpath 轮询:after_launch 后页面还在渲染,轮询必 miss(实测 6 轮 6.65s 纯浪费)。
+    # 直接进主循环,L00 snap 会等页面渲染好并 classify 出 email_form,再填邮箱。
+    try:
+        cur = page.url
+    except Exception:
+        cur = ""
+    if not cur or str(cur).startswith("about:"):
+        if not _load_login_page(page):
+            net_err_count += 1
 
     for i in range(20):
         if time.time() > deadline: return "timeout"
         state = snap(page, tag, f"L{i:02d}", idx)
+        # 任意页 something went wrong:先扫 Try again 按钮并点(px_challenge/loading 跳过)
+        if state not in ("px_challenge", "loading"):
+            if _click_try_again_if_present(page):
+                print(f"    [{tag}] Try-again clicked (state={state})")
+                time.sleep(3); continue
         if state == "abuse":
             _click_any(page, _CONTINUE_SELECTORS, timeout=2)
             time.sleep(3); continue
@@ -421,8 +509,17 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
                 _page_go_back(page)
             time.sleep(5 if tried else 3)
             continue
+        if state == "verify_email":
+            # 绑了辅助邮箱:默认走 verify your email,点"使用密码登录"进密码表单
+            _click_any(page, _USE_PASSWORD_SELECTORS, timeout=2)
+            time.sleep(3); continue
         if state == "email_form":
-            _fill_login_email(page, email, tag)
+            if not email_filled:
+                if _fill_login_email_js(page, email, tag):
+                    _click_next(page, tag)
+                else:
+                    _fill_login_email(page, email, tag)
+                email_filled = True
             time.sleep(3); continue
         if state == "login_form":
             _fill_login_password(page, password, tag)
@@ -454,6 +551,12 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
         if state != "loading" and loading_wait_started is not None:
             loading_wait_started = None
 
+        # 任意页 something went wrong:先扫 Try again 按钮并点(px_challenge/loading 跳过)
+        if state not in ("px_challenge", "loading"):
+            if _click_try_again_if_present(page):
+                print(f"    [{tag}] Try-again clicked (state={state})")
+                time.sleep(3); continue
+
         if state == "loading":
             # 微软 Loading 转圈页(PX 按压后等解锁结果):等它转完出 unblocked/跳转
             # 参考注册 _update_loading_wait_state + loading_timed_out -> return timeout
@@ -484,6 +587,10 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
                 _page_go_back(page)
             time.sleep(5 if tried else 3)
             continue
+        if state == "verify_email":
+            # 绑了辅助邮箱:默认走 verify your email,点"使用密码登录"进密码表单
+            _click_any(page, _USE_PASSWORD_SELECTORS, timeout=2)
+            time.sleep(3); continue
         if state == "net_error":
             net_err_count += 1
             if net_err_count >= 5: return "proxy_dead"
