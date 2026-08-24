@@ -5,7 +5,7 @@ webui/server.py — reg-factory 本地 Web 面板后端(FastAPI)。
 只绑 127.0.0.1(含 .env 密钥编辑，绝不监听公网)。职责：
   - 提供脚本 schema / .env 配置 给前端渲染表单
   - 把表单提交拼成命令行，subprocess 后台跑，SSE 实时推 stdout
-  - 探测 BitBrowser / Clash 在线状态 + 当前节点
+  - 探测 BitBrowser 在线状态
 
 启动：  python -m uvicorn webui.server:app --port 8799   (或用 start.bat)
 """
@@ -16,8 +16,10 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,14 +37,42 @@ import scripts as schema  # noqa: E402
 from process_utils import child_creationflags  # noqa: E402
 
 
+def _egress_proxy():
+    """取一条出口代理(非消费式复用注册代理池):从 OUTLOOK_PROXY_* 构造池,borrow_reuse()
+    弹一条 socks5,不删池项、无需 release。空池/未配置返回 ""(直连)。
+
+    webui 后端调接码(sms-man/firefox) / token 上传(SUB2API/CPA)等公网 API 的 Python requests
+    出口走这条。localhost(BitBrowser/指纹浏览器 API)靠 NO_PROXY 直连,不受影响。"""
+    global _EGRESS_POOL, _EGRESS_PROXY
+    if _EGRESS_PROXY:
+        return _EGRESS_PROXY
+    try:
+        from register_outlook_ruoyi import ConsumableProxyPool
+        from types import SimpleNamespace
+        args = SimpleNamespace(
+            proxy_file=_read_config_val("OUTLOOK_PROXY_FILE", ""),
+            proxy_source=_read_config_val("OUTLOOK_RUOYI_PROXY_SOURCE", ""),
+            proxy_url=_read_config_val("OUTLOOK_PROXY_URL", ""),
+        )
+        if not _EGRESS_POOL:
+            _EGRESS_POOL = ConsumableProxyPool.from_args(args)
+            _EGRESS_POOL.start()
+        got = _EGRESS_POOL.borrow_reuse()  # [proxy] 或 []
+        if got:
+            _EGRESS_PROXY = got[0]
+    except Exception as e:
+        print(f"[egress] 取出口代理失败(将直连):{str(e)[:120]}")
+    return _EGRESS_PROXY
+
+
 def _ensure_proxy_env():
-    """接码等公网服务直连不通(sms-man 直连超时)，必须经 Clash。把 CLASH_PROXY 注进本进程
-    环境，让 common.sms 的 requests(trust_env) 自动走代理；localhost API 直连(NO_PROXY)。"""
+    """接码等公网服务直连不通(sms-man 直连超时),把出口代理(注册代理池取一条 socks5)注进
+    本进程环境,让 common.sms 的 requests(trust_env) 自动走代理;localhost API 直连(NO_PROXY)。"""
     proxy = ""
     try:
-        proxy = _read_config_val("CLASH_PROXY", "http://127.0.0.1:7897")
+        proxy = _egress_proxy()
     except Exception:
-        proxy = "http://127.0.0.1:7897"
+        proxy = ""
     if proxy and not os.environ.get("HTTPS_PROXY"):
         os.environ["HTTP_PROXY"] = os.environ["HTTPS_PROXY"] = proxy
         os.environ["http_proxy"] = os.environ["https_proxy"] = proxy
@@ -58,6 +88,10 @@ _run_seq = [0]
 # 接码助手：内存记录当前租用的 sms-man 号  pkey -> {phone, rented_at, codes:[], service}
 SMS_RENTS = {}
 SMS_RENT_TTL = 1200  # 20 分钟租期(秒)
+
+# webui 后端 Python 出网用的出口代理(复用注册代理池,取一条 socks5,非消费式)。
+_EGRESS_POOL = None
+_EGRESS_PROXY = ""
 
 
 def _append_run_line(rec, line):
@@ -253,42 +287,13 @@ def _write_env_file(path, updates):
 
 # ============================================================ 连通测试
 def _direct_get(url, headers=None, timeout=8):
-    """直连 GET(显式绕过代理——Clash 控制器/BitBrowser 都是 localhost)。
+    """直连 GET(显式绕过代理——BitBrowser/指纹浏览器 都是 localhost)。
     返回 (status_code, body_text)。连不上抛异常。"""
     handler = urllib.request.ProxyHandler({})  # 空 = 不走任何代理
     opener = urllib.request.build_opener(handler)
     req = urllib.request.Request(url, headers=headers or {})
     with opener.open(req, timeout=timeout) as r:
         return r.status, r.read(8192).decode("utf-8", "replace")
-
-
-def _test_clash():
-    """测 Clash 控制器：GET /version 带 Bearer secret。区分 连不上 / 密码错 / OK。"""
-    api = _read_config_val("CLASH_API", "http://127.0.0.1:9097").rstrip("/")
-    secret = _read_config_val("CLASH_SECRET", "")
-    headers = {"Authorization": f"Bearer {secret}"} if secret else {}
-    try:
-        code, body = _direct_get(api + "/version", headers=headers, timeout=6)
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            return False, "密码(secret)错误或未设置 —— 检查 CLASH_SECRET"
-        return False, f"控制器返回 HTTP {e.code}"
-    except Exception as e:
-        return False, f"连不上控制器({api})：{str(e)[:60]}。确认 Clash Verge 已开 External Controller"
-    ver = ""
-    try:
-        import json as _j
-        ver = _j.loads(body).get("version", "")
-    except Exception:
-        pass
-    # 顺带报当前节点
-    node = ""
-    try:
-        from common import proxy_switch as ps
-        node = ps.current_node() or ""
-    except Exception:
-        pass
-    return True, f"控制器连通 ✓ 内核版本 {ver}" + (f"，当前节点 {node}" if node else "")
 
 
 def _fingerprint_provider():
@@ -322,13 +327,13 @@ def _test_bitbrowser():
 
 
 def _proxied_get(url, timeout=20):
-    """经 Clash 代理 GET(sms-man/firefox 等公网接码服务直连不通，必须走代理)。
+    """经出口代理 GET(sms-man/firefox 等公网接码服务直连不通,走注册代理池取的 socks5)。
+    requests 支持 socks5(PySocks+urllib3 socks contrib),urllib 的 ProxyHandler 不支持故改 requests。
     返回 (status, body_text)。"""
-    proxy = _read_config_val("CLASH_PROXY", "http://127.0.0.1:7897")
-    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler({})
-    opener = urllib.request.build_opener(handler)
-    with opener.open(url, timeout=timeout) as r:
-        return r.status, r.read(4096).decode("utf-8", "replace")
+    proxy = _egress_proxy()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    r = requests.get(url, proxies=proxies, timeout=timeout)
+    return r.status_code, r.text[:4096]
 
 
 def _test_smsman():
@@ -357,7 +362,7 @@ def _test_smsman():
             if isinstance(d, dict) and (d.get("error_code") or d.get("error_msg")):
                 return False, f"sms-man token 无效：{d.get('error_msg') or d.get('error_code')}"
         except Exception as e:
-            last = f"sms-man 请求失败(经代理)：{str(e)[:70]}。确认 Clash 在线"
+            last = f"sms-man 请求失败(经代理)：{str(e)[:70]}。确认代理池可用"
     return False, last or "sms-man 无有效响应(平台可能故障,稍后再试)"
 
 
@@ -388,7 +393,6 @@ def _test_tg():
 
 
 _TESTERS = {
-    "clash": _test_clash,
     "bitbrowser": _test_bitbrowser,
     "smsman": _test_smsman,
     "firefox": _test_firefox,
@@ -720,18 +724,9 @@ def api_status():
     else:
         bb = _read_config_val("BITBROWSER_API", "http://127.0.0.1:54345")
         provider_label = "bitbrowser"
-    clash = _read_config_val("CLASH_API", "http://127.0.0.1:9097")
-    node = None
-    try:
-        from common import proxy_switch as ps
-        node = ps.current_node()
-    except Exception:
-        node = None
     return {
         "bitbrowser": _http_alive(bb),
         "browser_provider": provider_label,
-        "clash": _http_alive(clash),
-        "node": node,
         "running": sum(1 for r in RUNS.values() if not r["done"]),
     }
 
@@ -841,9 +836,10 @@ _OUTLOOK_WEBUI_SCRIPTS = {
 
 
 def _child_env(script_id=""):
-    """子进程环境：注入 PYTHONUNBUFFERED + 代理(对齐 run_full_flow.build_child_env)。
-    proxy 走 .env 的 CLASH_PROXY；localhost API 直连(NO_PROXY)。
-    同时把 .env 里未进入进程环境的 key 补进子进程。"""
+    """子进程环境：注入 PYTHONUNBUFFERED + .env 未入进程的 key。
+    出口代理:非 outlook 脚本继承本进程已设的 HTTP_PROXY/NO_PROXY(_ensure_proxy_env 注入的
+    注册代理池 socks5);outlook 脚本走 BitBrowser 池代理,剥离进程 HTTP_PROXY。
+    localhost API 直连(NO_PROXY)。"""
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -858,15 +854,13 @@ def _child_env(script_id=""):
     if script_id in _OUTLOOK_WEBUI_SCRIPTS:
         for key in (
             "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-            "CLASH_API", "CLASH_SECRET", "CLASH_GROUP", "CLASH_PROXY",
         ):
             env.pop(key, None)
         return env
-    proxy = _read_config_val("CLASH_PROXY", "http://127.0.0.1:7897")
-    if proxy:
-        env["HTTP_PROXY"] = env["HTTPS_PROXY"] = proxy
-        env["http_proxy"] = env["https_proxy"] = proxy
-        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost,::1"
+    # 非 outlook 脚本:继承本进程的 HTTP_PROXY(socks5 出口) + NO_PROXY(localhost 直连)
+    if os.environ.get("HTTPS_PROXY"):
+        env.setdefault("NO_PROXY", "127.0.0.1,localhost,::1")
+        env.setdefault("no_proxy", "127.0.0.1,localhost,::1")
     return env
 
 

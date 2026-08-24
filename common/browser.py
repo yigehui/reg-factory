@@ -23,6 +23,8 @@ import os
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bitbrowser import BitBrowser
+# apply_bitbrowser_proxy: 把 socks5://user:pass@host:port 塞进 BitBrowser /browser/update body
+from outlook_reg_loop import apply_bitbrowser_proxy
 
 # 与 register.py 完全一致的反检测脚本
 STEALTH_JS = r"""
@@ -162,14 +164,24 @@ def create_browser_with_retry(bb, name, retries=3):
     return None
 
 
-async def open_and_connect(name, p=None):
+async def open_and_connect(name, p=None, proxy_str=None):
     """创建并打开 BitBrowser 窗口，连接 Playwright 并注入 stealth。
     返回 (bb, profile_id, browser, context, page)。
-    注意：调用方需自行管理 async_playwright 生命周期，或传入 p。"""
+    注意：调用方需自行管理 async_playwright 生命周期，或传入 p。
+    proxy_str: 若给出(socks5://user:pass@host:port 等)，在 create 之后 open 之前
+               通过 /browser/update 挂到 BitBrowser 窗口；None 则保持窗口原样。"""
     bb = BitBrowser()
     pid = create_browser_with_retry(bb, name)
     if not pid:
         raise RuntimeError("create browser failed after retries")
+    # 挂代理池取的 socks5(在 open 之前设，让首屏请求就走出代理)
+    if proxy_str:
+        update_body = {"id": pid, "name": name, "proxyMethod": 2}
+        apply_bitbrowser_proxy(update_body, proxy_str)
+        try:
+            bb._post("/browser/update", update_body)
+        except Exception as e:
+            print(f"  apply proxy failed: {str(e)[:80]}")
     # open 也可能遇到 BitBrowser TLS 抖动，多重试几次（BitBrowser API 不稳）
     data = None
     max_open = 10

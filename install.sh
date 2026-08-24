@@ -95,7 +95,7 @@ fi
 
 echo ""
 echo "============================================================"
-echo "  安装完成! 确保 BitBrowser/AdsPower 和 Clash Verge 已打开,"
+echo "  安装完成! 确保 BitBrowser/AdsPower 已打开,"
 echo "  然后运行: ./start.sh  打开控制面板"
 echo "  Outlook ruoyi 后端依赖 ruyipage Firefox（步骤 5）"
 echo "  下载代理: $REG_FACTORY_PROXY  (REG_FACTORY_PROXY=off 可关闭)"

@@ -10,8 +10,8 @@ run_full_flow.py — 端到端全流程编排（含邮箱注册）
 Stage A 本身是个常驻循环，这里把它当子进程拉起、盯着 emails.txt，**一旦冒出
 一个新的可用号就立刻杀掉循环**进入 Stage B，所以是"注册到一个邮箱就往下走"。
 
-前置：BitBrowser(54345) 在线、Clash Verge(控制器 9097 / 混合端口 7897) 在线。
-默认自动注入 HTTP(S)_PROXY 与 CLASH_API/SECRET/GROUP，让邮箱注册能换节点绕 MS 风控。
+前置：BitBrowser(54345) 在线、OUTLOOK_PROXY_* 代理池(文件或 url)就绪。
+注册浏览器出口走代理池 socks5(挂 BitBrowser);子进程继承父进程 HTTP_PROXY(代理池取一条)。
 
 用法：
   python run_full_flow.py                          # 注册1个邮箱 -> 在 claude 上注册
@@ -42,16 +42,15 @@ if sys.platform == "win32":
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EMAILS_FILE = os.path.join(ROOT, "emails.txt")
 
-# 导入 config 以触发 .env 加载（CLASH_SECRET 等环境变量来自 .env / 真实环境）。
+# 导入 config 以触发 .env 加载（接码/上传等环境变量来自 .env / 真实环境）。
 try:
     import config  # noqa: F401
 except Exception:
     pass
 
-# 默认基建端点（密钥走环境变量，端点可被环境变量覆盖）。
-CLASH_API_DEFAULT = os.environ.get("CLASH_API", "http://127.0.0.1:9097")
-CLASH_SECRET_DEFAULT = os.environ.get("CLASH_SECRET", "")
-PROXY_DEFAULT = os.environ.get("CLASH_PROXY", "http://127.0.0.1:7897")
+# --proxy 给子进程显式注入 HTTP_PROXY；默认空串=不注入(子进程继承父进程 env,
+# 父进程由 webui/_ensure_proxy_env 设好代理池 socks5 出口)。注册浏览器走 BitBrowser 池代理。
+PROXY_DEFAULT = ""
 
 
 LOG_LEVELS = {
@@ -145,14 +144,17 @@ def build_child_env(args):
     if args.proxy:
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = args.proxy
         env["http_proxy"] = env["https_proxy"] = args.proxy
-        # 关键：localhost API(BitBrowser 54345 / Clash 控制器 9097) 必须直连，
-        # 否则 urllib 把它们也塞进 7897 代理 -> 502 Bad Gateway。
+        # 关键：localhost API(BitBrowser 54345) 必须直连，否则 urllib 把它也塞进代理 -> 502。
         no_proxy = "127.0.0.1,localhost,::1"
         env["NO_PROXY"] = env["no_proxy"] = no_proxy
-    # 让 outlook_reg_loop 的 _clash_verge 能连控制器换节点
-    env.setdefault("CLASH_API", args.clash_api)
-    env.setdefault("CLASH_SECRET", args.clash_secret)
-    env.setdefault("CLASH_GROUP", args.clash_group)
+    # 三个 register 子进程(Claude/ChatGPT/Grok)统一走 ruyi 代理池:
+    # 与 Stage A 同源(proxies_outlook.txt 或 http url),子进程 argparse 默认读这些 env。
+    if args.outlook_proxy_file:
+        env["OUTLOOK_PROXY_FILE"] = args.outlook_proxy_file
+    if args.outlook_proxy_source:
+        env["OUTLOOK_RUOYI_PROXY_SOURCE"] = args.outlook_proxy_source
+    if args.outlook_proxy_url:
+        env["OUTLOOK_PROXY_URL"] = args.outlook_proxy_url
     env["OUTLOOK_LOG_LEVEL"] = args.log_level
     return env
 
@@ -161,7 +163,6 @@ def build_stage_a_env(env):
     stage_env = dict(env)
     for key in (
         "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
-        "CLASH_API", "CLASH_SECRET", "CLASH_GROUP", "CLASH_PROXY",
     ):
         stage_env.pop(key, None)
     return stage_env
@@ -251,7 +252,6 @@ def stage_platforms(args, env, email, password, token="", client_id=""):
         "--password", password or "",
         "--token", (token or "fresh"),
         "--platforms", *args.platforms,
-        "--node", args.node,
         "--timeout", str(args.platform_timeout),
         "--broker", args.broker,
     ]
@@ -338,7 +338,6 @@ def main():
     # Stage B
     ap.add_argument("--platforms", nargs="+", choices=["claude", "chatgpt", "grok"],
                     default=["claude"], help="默认只跑 claude（最稳）；grok 已知死结")
-    ap.add_argument("--node", default="auto", help="claude/grok 走的 Clash 节点")
     ap.add_argument("--platform-timeout", type=int, default=600)
     ap.add_argument("--broker", default="", help="共享取码服务URL；默认空=各脚本自行开 Outlook 取码")
     ap.add_argument("--keep-on-fail", action="store_true")
@@ -352,11 +351,6 @@ def main():
                     help="Codex add-phone 手动模式：不接码，自己在浏览器填号收码（透传）")
     # 基建
     ap.add_argument("--proxy", default=PROXY_DEFAULT, help="HTTP(S)_PROXY；传空串禁用")
-    ap.add_argument("--clash-api", default=CLASH_API_DEFAULT)
-    ap.add_argument("--clash-secret", default=CLASH_SECRET_DEFAULT)
-    ap.add_argument("--clash-group", default="GLOBAL",
-                    help="Clash 组名（proxy_switch 探节点用）；global 模式下出口由 GLOBAL 决定，"
-                         "传 'auto' 会 404。claude/grok 的节点选择模式见 --node")
     ap.add_argument("--log-level", default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
                     choices=["DEBUG", "INFO", "WARN", "PROD", "ERR"],
                     help="Outlook/Graph 日志等级")
@@ -374,7 +368,7 @@ def main():
     mode = "无限" if args.rounds == 0 else f"{args.rounds} 轮"
     log(
         f"全流程开始（循环 {mode}）  outlook={args.outlook_engine}  "
-        f"proxy={args.proxy or 'OFF'}  clash={args.clash_api}"
+        f"proxy={args.proxy or 'OFF'}  代理池={args.outlook_proxy_file}"
     )
     print("=" * 64)
 

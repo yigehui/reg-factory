@@ -60,7 +60,7 @@ class AdsPower:
         self.api_base = (api_base or ADSPOWER_API or "http://127.0.0.1:50325").rstrip("/")
         self.api_key = ADSPOWER_API_KEY or os.environ.get("ADSPOWER_API_KEY", "")
         self.session = requests.Session()
-        # Local browser APIs must not be sent through Clash/system proxy.
+        # Local browser APIs must not be sent through any HTTP/SOCKS proxy.
         self.session.trust_env = False
 
     def _headers(self):

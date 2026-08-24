@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 Grok (x.ai) 自动注册
-关键: grok.com 有 Cloudflare 全页拦截，必须走 Clash 干净节点(换节点绕过)。
+关键: grok.com 有 Cloudflare 全页拦截，代理出口必须能过 grok CF。
 
-流程: 切Clash节点 -> BitBrowser走代理 -> grok.com -> 新規登録 -> accounts.x.ai
+流程: 代理池取一条socks5 -> BitBrowser走代理 -> grok.com -> 新規登録 -> accounts.x.ai
        -> メールで登録 -> 填邮箱 -> 邮件验证码(浏览器登录Outlook) -> 保存 cookie
 
 界面是日文(节点地区导致)，按钮文本用 日文+英文 双匹配。
 
 用法:
     python register_grok.py --count 1
-    python register_grok.py --count 5 --node "美国 02"
+    python register_grok.py --count 5 --proxy-file proxies_outlook.txt
+    python register_grok.py --proxy-source http --proxy-url http://host/pool.txt
 """
 
 import argparse
 import asyncio
+import os
 import random
 import string
 import sys
@@ -33,7 +35,9 @@ from common.browser import inject_stealth, create_browser_with_retry, human_type
 from common.mailbox import get_code_outlook_pw, prelogin_outlook
 from common.cookies import save_platform_cookies
 from common import emails as email_pool
-from common import proxy_switch
+# 代理统一走 ruyi 代理池(文件/url,取一条) → BitBrowser /browser/update 挂 socks5
+from register_outlook_ruoyi import ConsumableProxyPool, select_proxy_for_account, release_proxy_for_account
+from outlook_reg_loop import apply_bitbrowser_proxy, mask_proxy
 
 # 打码平台 key（解 Cloudflare Turnstile）。config 顶部会加载 .env，真实环境变量优先。
 try:
@@ -45,8 +49,6 @@ except Exception:
 
 PLATFORM = "grok"
 GROK_URL = "https://grok.com/"
-CLASH_PROXY_HOST = "127.0.0.1"
-CLASH_PROXY_PORT = "7897"
 # 登录态关键 cookie（运行时确认，先放候选）
 KEY_COOKIES = ["sso", "sso-rw", "__Secure-next-auth.session-token", "auth_token"]
 REGISTER_TIMEOUT = 600
@@ -572,7 +574,7 @@ async def get_code_via_direct_browser(email, email_pw, p, pre=None):
                 pass
 
 
-async def register_one(index, total, p, node):
+async def register_one(index, total, p, proxy_str):
     start = time.time()
 
     def check_timeout():
@@ -595,19 +597,25 @@ async def register_one(index, total, p, node):
     pid = None
     success = False
     try:
-        # BitBrowser 走 Clash 代理
+        # BitBrowser 走代理池取的 socks5
         pid = create_browser_with_retry(
             bb, name,
         )
         if not pid:
             print("  create browser failed")
             return None
-        # 重新用代理配置更新窗口
-        bb._post("/browser/update", {
-            "id": pid, "name": name, "proxyMethod": 2, "proxyType": "http",
-            "host": CLASH_PROXY_HOST, "port": CLASH_PROXY_PORT,
+        # 重新用代理配置更新窗口(代理池取的 socks5,无代理则 noproxy)
+        update_body = {
+            "id": pid, "name": name, "proxyMethod": 2,
             "browserFingerPrint": {"coreVersion": "130"},
-        })
+        }
+        if proxy_str:
+            apply_bitbrowser_proxy(update_body, proxy_str)
+            print(f"  proxy -> {mask_proxy(proxy_str)}")
+        else:
+            update_body["proxyType"] = "noproxy"
+            print("  proxy -> noproxy (池空)")
+        bb._post("/browser/update", update_body)
         data = None
         for _ in range(8):
             try:
@@ -630,7 +638,7 @@ async def register_one(index, total, p, node):
             print(f"  turnstile hook inject failed: {str(e)[:60]}")
 
         # Step 1: 打开 grok.com，等渲染
-        print("  [1] goto grok.com (via proxy node)")
+        print("  [1] goto grok.com (via proxy)")
         for attempt in range(3):
             try:
                 await page.goto(GROK_URL, timeout=60000, wait_until="domcontentloaded")
@@ -884,7 +892,15 @@ async def main():
     parser.add_argument("--count", "-n", type=int, default=1)
     parser.add_argument("--concurrency", "-c", type=int, default=1)
     parser.add_argument("--timeout", "-t", type=int, default=600)
-    parser.add_argument("--node", default="auto", help="Clash 出口节点(过grok CF)")
+    parser.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+        help="代理列表文件(每行 user:pass@host:port 或 socks5://...)")
+    parser.add_argument("--proxy-source",
+        default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
+        choices=["file", "http"],
+        help="file=本地代理文件;http=HTTP GET 拉 txt 列表(配合 --proxy-url)")
+    parser.add_argument("--proxy-url",
+        default=os.environ.get("OUTLOOK_PROXY_URL", ""),
+        help="HTTP GET 代理列表地址(配合 --proxy-source=http)")
     parser.add_argument("--keep-on-fail", action="store_true")
     parser.add_argument("--email", default=None, help="指定邮箱(绕过邮箱池)")
     parser.add_argument("--password", default=None, help="指定邮箱密码")
@@ -896,26 +912,12 @@ async def main():
     FIXED_EMAIL = args.email
     FIXED_PASSWORD = args.password
 
+    # 代理池:每个账号 take() 一条 socks5,挂 BitBrowser;成功 release/失败 discard
+    pool = ConsumableProxyPool.from_args(args).start()
+    st = pool.stats() if hasattr(pool, "stats") else {}
     print("=" * 50)
-    print(f"  Grok Auto Register  count={args.count} node={args.node}")
+    print(f"  Grok Auto Register  count={args.count} pool source={st.get('source', args.proxy_source)} size={st.get('remaining', '?')}")
     print("=" * 50)
-
-    # 选节点过 grok CF：--node 指定则用它，否则自动探测能过的节点
-    try:
-        if args.node and args.node.lower() != "auto":
-            proxy_switch.set_node(args.node)
-            time.sleep(2)
-            print(f"  使用指定节点 -> {proxy_switch.current_node()}")
-        else:
-            print("  自动探测能过 grok CF 的节点...")
-            node = proxy_switch.find_working_node(test_url="https://grok.com/")
-            if not node:
-                print("  没找到能过 grok CF 的节点(可能 CF 高防护时段，稍后重试)")
-                return
-            print(f"  选用节点: {node}")
-    except Exception as e:
-        print(f"  切节点失败(确认 Clash 在跑): {e}")
-        return
 
     sem = asyncio.Semaphore(args.concurrency)
     results = []
@@ -924,13 +926,21 @@ async def main():
         async with sem:
             if i > 1:
                 await asyncio.sleep(random.uniform(3, 8) * (i - 1))
+            selected = select_proxy_for_account(pool)
+            proxy_str = selected[0] if selected else ""
             async with async_playwright() as p:
+                sk = None
                 try:
-                    sk = await register_one(i, args.count, p, args.node)
-                    results.append(sk)
+                    sk = await register_one(i, args.count, p, proxy_str)
                 except Exception as e:
                     print(f"  #{i} fatal: {e}")
-                    results.append(None)
+                finally:
+                    if proxy_str:
+                        if sk:
+                            release_proxy_for_account(proxy_str, pool)
+                        else:
+                            pool.discard(proxy_str)
+                results.append(sk)
 
     await asyncio.gather(*[run_one(i) for i in range(1, args.count + 1)])
 

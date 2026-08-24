@@ -122,7 +122,7 @@ GEMMA_API_KEY = _env("GEMMA_API_KEY", "")
 # ---------------------------------------------------------------- Telegram 通知
 # 配置后 common/notify.send_tg_message 会把消息发到该 chat；留空则不发。
 # 任意注册/导出/循环流程均可复用（ruoyi 循环养号每批汇总即走此通道）。
-# TG 走的 HTTP 代理(国内网络必填，否则 api.telegram.org 直连不通)，如 Clash 的 http://127.0.0.1:7897
+# TG 走的 HTTP 代理(国内网络必填，否则 api.telegram.org 直连不通)，如本机科学上网 http://127.0.0.1:7897
 TG_BOT_TOKEN = _env("TG_BOT_TOKEN", "")
 TG_CHAT_ID = _env("TG_CHAT_ID", "")
 TG_PROXY = _env("TG_PROXY", "")

@@ -39,7 +39,6 @@ def build_command(platform, args, account):
             "--timeout", timeout,
             "--email", email,
             "--password", password or "",
-            "--node", args.node,          # claude.com 区域封锁，走 Clash 节点绕过
         ]
         if token:
             cmd += ["--token", token]
@@ -76,7 +75,6 @@ def build_command(platform, args, account):
             "--count", "1",
             "--concurrency", "1",
             "--timeout", timeout,
-            "--node", args.node,
             "--email", email,
             "--password", password or "",
         ]
@@ -153,11 +151,19 @@ def broker_release(broker_url, email):
 
 
 def child_env_for(args):
-    """子进程环境：注入 MAILBOX_BROKER 让三脚本走共享取码（不再各自开 Outlook）。"""
+    """子进程环境：注入 MAILBOX_BROKER 让三脚本走共享取码（不再各自开 Outlook）。
+    代理统一走 ruyi 代理池：把 --proxy-file/--proxy-source/--proxy-url 注入 env，
+    三个 register 子进程的 argparse 默认读这些 env 构建 ConsumableProxyPool。"""
     env = dict(os.environ)
     if args.broker:
         env["MAILBOX_BROKER"] = args.broker
         env["GROK_BROKER_TIMEOUT"] = str(args.grok_timeout)
+    if getattr(args, "proxy_file", None):
+        env["OUTLOOK_PROXY_FILE"] = args.proxy_file
+    if getattr(args, "proxy_source", None):
+        env["OUTLOOK_RUOYI_PROXY_SOURCE"] = args.proxy_source
+    if getattr(args, "proxy_url", None):
+        env["OUTLOOK_PROXY_URL"] = args.proxy_url
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
@@ -194,7 +200,13 @@ async def main():
     parser.add_argument("--platforms", nargs="+", choices=["claude", "chatgpt", "grok"], default=["claude", "chatgpt", "grok"])
     parser.add_argument("--parallel", action="store_true", help="run platforms in parallel; default is sequential")
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--node", default="auto", help="Grok Clash node")
+    parser.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+                        help="代理列表文件(每行 user:pass@host:port 或 socks5://...)")
+    parser.add_argument("--proxy-source", default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
+                        choices=["file", "http"],
+                        help="file=本地代理文件;http=HTTP GET 拉 txt 列表(配合 --proxy-url)")
+    parser.add_argument("--proxy-url", default=os.environ.get("OUTLOOK_PROXY_URL", ""),
+                        help="HTTP GET 代理列表地址(配合 --proxy-source=http)")
     parser.add_argument("--keep-on-fail", action="store_true")
     parser.add_argument("--import-c2a", action="store_true",
                         help="chatgpt 注册成功后即时把 token 导入 chatgpt2api（透传给 register_chatgpt.py）")

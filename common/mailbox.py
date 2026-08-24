@@ -24,7 +24,7 @@ DEFAULT_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 GRAPH_FOLDERS = ["inbox", "junkemail"]
 
 # Microsoft 端点(login.microsoftonline.com / graph.microsoft.com)不像 ChatGPT 受地域封锁，
-# 不需要走代理；而 Clash 出口节点对 MS 的 TLS 握手常 SSLEOFError(冷连接闪断)。故取码/换 token
+# 不需要走代理；而出口代理节点对 MS 的 TLS 握手常 SSLEOFError(冷连接闪断)。故取码/换 token
 # 一律【直连】(显式禁用代理 + trust_env=False，绕开 HTTP(S)_PROXY 环境变量)，浏览器仍走代理。
 # 实测：直连打 MS 端点干净(HTTP 400 即可达)，经代理则首发 SSLEOFError。
 _MS_NO_PROXY = {"http": None, "https": None}

@@ -25,10 +25,9 @@ import requests
 from playwright.async_api import async_playwright
 
 from bitbrowser import BitBrowser
-try:
-    from common import proxy_switch
-except Exception:
-    proxy_switch = None
+# 代理统一走 ruyi 代理池(文件/url,取一条) → BitBrowser /browser/update 挂 socks5
+from register_outlook_ruoyi import ConsumableProxyPool, select_proxy_for_account, release_proxy_for_account
+from outlook_reg_loop import apply_bitbrowser_proxy, mask_proxy
 try:
     from check_outlook_status import check_account_api
 except Exception:
@@ -56,53 +55,10 @@ from config import (
 # single registration timeout (seconds)
 REGISTER_TIMEOUT = 600
 
-# Clash 代理：claude.com 对本机 IP 区域封锁(app-unavailable-in-region)，走干净节点绕过。
-# None/"none" = 不走代理(默认，向后兼容)；"auto" = 自动探测能进 claude 的节点；其它 = 指定节点名。
-CLAUDE_PROXY_NODE = None
-CLAUDE_PROXY_HOST = "127.0.0.1"
-CLAUDE_PROXY_PORT = "7897"
-# 节点轮换：同一节点 IP 连续注册 1-2 个新 Claude 号就会被风控打 /restricted，
-# 故记录最近用过的节点、auto 选号时避开，雨露均沾分散 IP 信誉。
-CLAUDE_NODE_USAGE_FILE = "claude_node_usage.txt"
-CLAUDE_NODE_AVOID_RECENT = 3  # 避开最近 N 次用过的节点
-
-
-def _recent_claude_nodes(limit=CLAUDE_NODE_AVOID_RECENT):
-    try:
-        with open(CLAUDE_NODE_USAGE_FILE, encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-        return lines[-limit:]
-    except Exception:
-        return []
-
-
-def _record_claude_node(node):
-    try:
-        with open(CLAUDE_NODE_USAGE_FILE, "a", encoding="utf-8") as f:
-            f.write(node + "\n")
-    except Exception:
-        pass
-
-
-def _pick_claude_node():
-    """auto 选节点：避开最近用过的节点找一个能过 claude CF 的；找不到再放开全量。返回节点名或 None。"""
-    markers = ("app-unavailable-in-region", "unavailable in your",
-               "just a moment", "performing security")
-    try:
-        alln = proxy_switch.concrete_nodes()
-    except Exception as e:
-        print(f"  [proxy] 取节点列表失败: {e}")
-        return None
-    recent = set(_recent_claude_nodes())
-    fresh = [n for n in alln if n not in recent] or alln
-    print(f"  [proxy] 避开最近节点 {sorted(recent)}; 在 {len(fresh)}/{len(alln)} 个候选里探测...")
-    node = proxy_switch.find_working_node(
-        test_url="https://claude.ai/login", challenge_markers=markers, candidates=fresh)
-    if not node and fresh is not alln:
-        print("  [proxy] 新鲜节点都不通，放开全量重探...")
-        node = proxy_switch.find_working_node(
-            test_url="https://claude.ai/login", challenge_markers=markers, candidates=alln)
-    return node
+# 代理走 ruyi 代理池:每个账号 take() 一条 socks5 挂 BitBrowser,绕 claude.com 区域封锁。
+# 池空(无代理)则 noproxy 直连(大概率被区域封锁,但保持向后兼容)。
+CLAUDE_PROXY_HOST = "127.0.0.1"  # 保留仅向后兼容引用,实际已不使用
+CLAUDE_PROXY_PORT = "7897"        # 同上
 
 # web2api 验证服务地址
 WEB2API_BASE = "http://127.0.0.1:9000"
@@ -3886,41 +3842,28 @@ async def main():
     parser.add_argument("--email", type=str, help="single fixed outlook email for debug")
     parser.add_argument("--password", type=str, default="", help="password for --email")
     parser.add_argument("--token", type=str, default="", help="refresh token for --email")
-    parser.add_argument("--node", type=str, default="none",
-                        help="Clash 出口节点绕 claude 区域封锁：none=不走代理 / auto=自动探测 / 具体节点名")
-    parser.add_argument("--proxy-port", type=str, default="7897", help="Clash mixed-port 代理端口")
+    parser.add_argument("--proxy-file", default=os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+        help="代理列表文件(每行 user:pass@host:port 或 socks5://...)。池空则直连(大概率被区域封锁)")
+    parser.add_argument("--proxy-source",
+        default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
+        choices=["file", "http"],
+        help="file=本地代理文件;http=HTTP GET 拉 txt 列表(配合 --proxy-url)")
+    parser.add_argument("--proxy-url",
+        default=os.environ.get("OUTLOOK_PROXY_URL", ""),
+        help="HTTP GET 代理列表地址(配合 --proxy-source=http)")
     args = parser.parse_args()
 
-    global REGISTER_TIMEOUT, CLAUDE_PROXY_NODE, CLAUDE_PROXY_PORT
+    global REGISTER_TIMEOUT
     REGISTER_TIMEOUT = args.timeout
-    CLAUDE_PROXY_PORT = args.proxy_port
 
-    # 选 Clash 节点过 claude 区域封锁（app-unavailable-in-region）
-    if args.node and args.node.lower() != "none":
-        if proxy_switch is None:
-            print("  [proxy] proxy_switch 不可用，跳过节点选择（claude 可能被区域封锁）")
-        else:
-            try:
-                if args.node.lower() == "auto":
-                    print("  [proxy] 自动探测能进 claude 的节点(轮换避开最近用过的)...")
-                    node = _pick_claude_node()
-                    if not node:
-                        print("  [proxy] 没找到能进 claude 的节点，仍按无代理继续(大概率失败)")
-                    else:
-                        CLAUDE_PROXY_NODE = node
-                        _record_claude_node(node)
-                        print(f"  [proxy] 选用节点: {node}")
-                else:
-                    proxy_switch.set_node(args.node)
-                    time.sleep(2)
-                    CLAUDE_PROXY_NODE = args.node
-                    print(f"  [proxy] 使用指定节点 -> {proxy_switch.current_node()}")
-            except Exception as e:
-                print(f"  [proxy] 切节点失败(确认 Clash 在跑): {e}")
+    # 代理池:每个账号 take() 一条 socks5,挂 BitBrowser;池空则直连
+    pool = ConsumableProxyPool.from_args(args).start()
+    st = pool.stats() if hasattr(pool, "stats") else {}
 
     print("=" * 50)
     print("  Claude.ai Auto Register")
     print(f"  count={args.count}  concurrency={args.concurrency}  timeout={args.timeout}s")
+    print(f"  pool source={st.get('source', args.proxy_source)}  size={st.get('remaining', '?')}")
     print("=" * 50)
 
     # 读取邮箱文件
@@ -3993,23 +3936,39 @@ async def main():
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
                 return
-            # 走 Clash 节点：更新窗口为 http 代理（绕 claude 区域封锁）
-            if CLAUDE_PROXY_NODE:
-                try:
-                    bb._post("/browser/update", {
-                        "id": profile_id, "name": name, "proxyMethod": 2, "proxyType": "http",
-                        "host": CLAUDE_PROXY_HOST, "port": CLAUDE_PROXY_PORT,
-                        "browserFingerPrint": {"coreVersion": "130"},
-                    })
-                    print(f"  [proxy] window via {CLAUDE_PROXY_HOST}:{CLAUDE_PROXY_PORT} (node={CLAUDE_PROXY_NODE})")
-                except Exception as e:
-                    print(f"  [proxy] window update failed: {e}")
+            # 代理池取一条 socks5 挂 BitBrowser(池空则 noproxy 直连)
+            selected = select_proxy_for_account(pool)
+            proxy_str = selected[0] if selected else ""
+            update_body = {
+                "id": profile_id, "name": name, "proxyMethod": 2,
+                "browserFingerPrint": {"coreVersion": "130"},
+            }
+            if proxy_str:
+                apply_bitbrowser_proxy(update_body, proxy_str)
+                print(f"  [proxy] window via {mask_proxy(proxy_str)}")
+            else:
+                update_body["proxyType"] = "noproxy"
+                print("  [proxy] window noproxy (池空,直连)")
+            try:
+                bb._post("/browser/update", update_body)
+            except Exception as e:
+                print(f"  [proxy] window update failed: {e}")
             try:
                 sk = await register(profile_id, email, email_password, email_token)
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "OK" if sk else "FAIL", "sk": sk})
+                if proxy_str:
+                    if sk:
+                        release_proxy_for_account(proxy_str, pool)
+                    else:
+                        pool.discard(proxy_str)
             except Exception as e:
                 print(f"  FATAL: {e}")
+                if proxy_str:
+                    try:
+                        pool.discard(proxy_str)
+                    except Exception:
+                        pass
                 async with results_lock:
                     results.append({"index": i, "profile": name, "status": "ERROR", "sk": None})
 

@@ -7,7 +7,7 @@ echo   reg-factory installer (Python venv + deps + browser core)
 echo ============================================================
 echo.
 
-REM ---- 0. local proxy for pip / GitHub downloads (Clash/V2Ray etc.) ----
+REM ---- 0. local proxy for pip / GitHub downloads (V2Ray etc.) ----
 REM Override: set REG_FACTORY_PROXY=http://127.0.0.1:7897 before running
 REM Disable:  set REG_FACTORY_PROXY=off
 if not defined REG_FACTORY_PROXY set "REG_FACTORY_PROXY=http://127.0.0.1:10808"
@@ -111,7 +111,7 @@ if defined RUOYI_FIREFOX_PATH (
 echo.
 echo ============================================================
 echo   Install done!
-echo   - Start BitBrowser/AdsPower and Clash Verge clients
+echo   - Start BitBrowser/AdsPower client (and your proxy for pip/GitHub if needed)
 echo   - Double-click start.bat to open the control panel
 echo   - Outlook ruoyi backend needs ruyipage Firefox (step 5)
 echo   - Proxy used: %REG_FACTORY_PROXY%  (set REG_FACTORY_PROXY=off to disable)

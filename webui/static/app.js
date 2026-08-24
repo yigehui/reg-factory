@@ -61,8 +61,6 @@ async function pollStatus(){
     $('#dot-bb').classList.toggle('on', s.bitbrowser);
     const label = s.browser_provider === 'adspower' ? 'AdsPower' : 'BitBrowser';
     $('#browser-label').textContent = label;
-    $('#dot-clash').classList.toggle('on', s.clash);
-    $('#node').textContent = '节点 ' + (s.node || '--');
     $('#running').textContent = s.running ? `● ${s.running} 个任务运行中` : '';
   }catch(e){}
 }

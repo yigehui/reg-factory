@@ -5,7 +5,7 @@ Outlook Account Batch Unlock Script  --  ruyipage Firefox edition
 业务逻辑(状态机 / 登录 / PX 按压 / 解锁流程 / 并发 / 文件 IO)照搬原 unlock_outlook.py,
 浏览器层从 BitBrowser + Playwright 换成 ruyipage Firefox BiDi,复用 register_outlook_ruoyi 的:
   - 浏览器启动栈(FirefoxOptions + set_per_tab_proxies + FirefoxPage)
-  - 代理池(ConsumableProxyPool: file / http / aimili-list / aimili-random,per-tab socks5)
+  - 代理池(ConsumableProxyPool: file / http,per-tab socks5)
   - PX press-and-hold(_find_hold_context + _perform_hold_with_px_screenshots,ctx.actions 链)
   - 页面 helper(_safe_input / _click_next / _body_text / _maybe_skip_passkey / ...)
 
@@ -15,7 +15,8 @@ ruyi 内部归一化为 host:port:user:pwd 喂给 ruyipage set_per_tab_proxies(�
 Usage:
   python unlock_outlook.py --input outlook_accounts/accounts_xxx.txt
   python unlock_outlook.py --input emails_locked.txt --concurrency 2
-  python unlock_outlook.py --proxy-file proxies_outlook.txt --proxy-source aimili-list --aimili-url http://host:8787 --aimili-token XXX
+  python unlock_outlook.py --proxy-file proxies_outlook.txt
+  python unlock_outlook.py --proxy-source http --proxy-url http://host/pool.txt
   python unlock_outlook.py                         (auto-scan all accounts, skip unlocked)
 
 Input file format (---- separated, one per line):
@@ -67,6 +68,12 @@ PX_APP_ID       = "PXzC5j78di"
 DEFAULT_MAX_PRESS = 5
 LOADING_WAIT_TIMEOUT = 60   # PX 挑战后微软 Loading 转圈页等待上限(秒),超时 give up
 MAX_PROXY_RETRY = 3   # 代理无法访问微软时,换节点重开浏览器重试上限
+
+# 是否保存屏幕快照(screenshots_unlock/)。默认关 -- 符合"保存网页默认关"约定,
+# 调试时用 --save-debug 或 env OUTLOOK_UNLOCK_SAVE_DEBUG=1 开启。
+# snap() 仅在此为 True 时才调 page.screenshot;否则只 classify + 打印 state,省磁盘/IO。
+SAVE_DEBUG = _ruoyi._env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False)
+
 
 # ── 从 ruyi 复用的符号 ────────────────────────────────────────────────
 RUOYI_FIREFOX_PATH            = _ruoyi.RUOYI_FIREFOX_PATH
@@ -161,10 +168,11 @@ _CONTINUE_SELECTORS = [
     'css:#idSIButton9', 'css:button[type="submit"]', 'css:input[type="submit"]',
 ]
 
-# Something went wrong 等错误页的"重试"按钮选择器(大小写/中英文变体)
+# Something went wrong 等错误页的"重试"按钮文案参考(实际点击走 _click_try_again_if_present
+# 跨 context JS 扫,这里仅作文案清单存档;page.ele('text:..') 不跨 iframe 故不再用它点)
 _RETRY_SELECTORS = [
     'text:Try again', 'text:Try Again', 'text:try again',
-    'text:重试', 'text:再试一次', 'text:再试',
+    'text:Retry', 'text:重试', 'text:再试一次', 'text:再试',
 ]
 
 # "Verify your email" 页(绑了辅助邮箱时,微软默认往辅助邮箱发验证码)的
@@ -223,11 +231,14 @@ def classify(page):
 
 
 def snap(page, tag, name, idx):
-    try:
-        path = f"{SCREENSHOT_DIR}/{tag}_{name}.png"
-        page.screenshot(path=path, full_page=True)
-    except Exception:
-        pass
+    # 默认不存快照(SAVE_DEBUG=False);只在 --save-debug 时截图,省磁盘/IO 且符合
+    # "保存网页默认关"约定。state 判定 + 打印不受影响,主循环照常推进。
+    if SAVE_DEBUG:
+        try:
+            path = f"{SCREENSHOT_DIR}/{tag}_{name}.png"
+            page.screenshot(path=path, full_page=True)
+        except Exception:
+            pass
     state = classify(page)
     print(f"    [{name}] {state}  {(page.url or '')[:60]}")
     return state
@@ -314,29 +325,43 @@ def _page_go_back(page):
         pass
 
 
-def _click_try_again_if_present(page):
-    """跨所有 context(main+iframe)快速 JS 扫 'Try again' 按钮并点击。找到返回 True。
+def _try_again_button_scan(ctx):
+    """在单个 context 上 JS 扫 'Try again' 等重试按钮并点击。找到返回 True。
 
-    不用 _ele 轮询(6 选择器 × timeout 会累计数秒拖慢主循环);JS 扫无匹配时 <50ms 返回。
-    用 run_js(非 run_js_loaded)不等 doc_loaded —— something went wrong 页常不触发 loaded,
-    等会卡。任何页出现 try again 都能用此自动恢复。button / a / input[type=submit] 都扫,
-    input 取 value(MS 的 Try again 常是 <input type=submit value="Try again">)。"""
-    for ctx in _ruoyi._all_contexts(page):
-        try:
-            fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
-            found = fn(
-                "var btns=Array.from(document.querySelectorAll('button,a,input[type=submit],input[type=button]'));"
-                "var pats=['try again','重试','再试一次','再试'];"
-                "for(var i=0;i<btns.length;i++){"
-                "var tx=(btns[i].innerText||btns[i].value||btns[i].getAttribute('aria-label')||'').trim().toLowerCase();"
-                "if(!tx)continue;"
-                "for(var j=0;j<pats.length;j++){if(tx.indexOf(pats[j])>=0){btns[i].click();return true;}}}"
-                "return false;"
-            )
-            if found:
+    button/a/input[submit|button] 都扫;取文本用 textContent(含深层子节点文本,
+    innerText 取不到子 span 里的字),兜底 value/aria-label。
+    pats 含 try again/retry/again/重试/再试 等中英文变体。"""
+    try:
+        fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
+        return bool(fn(
+            "var btns=Array.from(document.querySelectorAll('button,a,input[type=submit],input[type=button]'));"
+            "var pats=['try again','try once more','retry','again','try','重试','再试一次','再试','重试一次'];"
+            "for(var i=0;i<btns.length;i++){"
+            "var tx=(btns[i].textContent||btns[i].innerText||btns[i].value||btns[i].getAttribute('aria-label')||'').trim().toLowerCase();"
+            "if(!tx)continue;"
+            "for(var j=0;j<pats.length;j++){if(tx.indexOf(pats[j])>=0){btns[i].click();return true;}}}"
+            "return false;"
+        ))
+    except Exception:
+        return False
+
+
+def _click_try_again_if_present(page, wait_rounds=1, sleep=0.6):
+    """跨所有 context(main+iframe)扫 'Try again' 等重试按钮并点击。找到返回 True。
+
+    错误页的 Try again 按钮**晚于**"Something went wrong" 文案渲染(几百 ms~数秒),
+    一次 run_js 扫常 miss。wait_rounds>1 时轮询多轮,每轮跨所有 context 扫一遍,
+    任一 context 命中即点。用 run_js(非 run_js_loaded)不等 doc_loaded ——
+    something went wrong 页常不触发 loaded,等会卡。
+
+    顶部兜底(每轮主循环都跑)用默认 wait_rounds=1 单轮快扫(<50ms,无等待);
+    error_page 分支(确定有错误页)传 wait_rounds=3 轮等渲染(最坏 ~1.8s,只此一处值得)。"""
+    for _ in range(max(1, wait_rounds)):
+        for ctx in _ruoyi._all_contexts(page):
+            if _try_again_button_scan(ctx):
                 return True
-        except Exception:
-            pass
+        if wait_rounds > 1:
+            time.sleep(sleep)
     return False
 
 
@@ -462,7 +487,8 @@ def _load_login_page(page):
 
 # ── Core unlock logic (照搬原 unlock_account, 改 ruyipage API)────────
 def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS, timeout=UNLOCK_TIMEOUT):
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    if SAVE_DEBUG:
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     deadline = time.time() + timeout
 
     # ── Step 1: Login ────────────────────────────────────────────────
@@ -504,7 +530,9 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
                 if net_err_count >= 3: return "proxy_dead"
             time.sleep(3); continue
         if state == "error_page":
-            tried = _click_any(page, _RETRY_SELECTORS, timeout=2)
+            # Something went wrong:跨 context 扫 Try again 按钮(按钮可能在 iframe,
+            # 且晚于错误文案渲染,故带轮询)。扫到即点;扫不到才后退回退。
+            tried = _click_try_again_if_present(page, wait_rounds=3)
             if not tried:
                 _page_go_back(page)
             time.sleep(5 if tried else 3)
@@ -582,7 +610,9 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
             _maybe_skip_passkey(page, tag); time.sleep(4)
             return "unlocked"
         if state == "error_page":
-            tried = _click_any(page, _RETRY_SELECTORS, timeout=2)
+            # Something went wrong:跨 context 扫 Try again 按钮(按钮可能在 iframe,
+            # 且晚于错误文案渲染,故带轮询)。扫到即点;扫不到才后退回退。
+            tried = _click_try_again_if_present(page, wait_rounds=3)
             if not tried:
                 _page_go_back(page)
             time.sleep(5 if tried else 3)
@@ -619,7 +649,7 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
                 if target and ctx:
                     press_count += 1
                     held = _perform_hold_with_px_screenshots(
-                        page, ctx, target, idx, press_count, tag, enabled=True)
+                        page, ctx, target, idx, press_count, tag, enabled=SAVE_DEBUG)
                     print(f"    held {held} (#{press_count})")
                     _wait_before_next_captcha_press(tag, reason="unlock press")
                     no_btn_rounds = 0
@@ -830,14 +860,7 @@ def save_results(results, ts):
 
 # ── 代理池构建 (参考 outlook_reg_loop._one_attempt_ruoyi)────────────
 def build_pool(args):
-    source_args = SimpleNamespace(
-        proxy_file=args.proxy_file or "",
-        proxy_source=args.proxy_source,
-        proxy_url=getattr(args, "proxy_url", "") or "",
-        aimili_url=args.aimili_url,
-        aimili_token=args.aimili_token,
-    )
-    pool = ConsumableProxyPool.from_args(source_args).start()
+    pool = ConsumableProxyPool.from_args(args).start()
     set_consumable_proxy_pool(pool)
     st = pool.stats() if hasattr(pool, "stats") else {}
     print(f"[pool] source={st.get('source', args.proxy_source)} size={st.get('remaining', '?')}")
@@ -923,7 +946,7 @@ def main():
 Examples:
   python unlock_outlook.py --input outlook_accounts/accounts_20260414_124527.txt
   python unlock_outlook.py --input emails_locked.txt --concurrency 2
-  python unlock_outlook.py --proxy-file proxies_outlook.txt --proxy-source aimili-list --aimili-url http://host:8787 --aimili-token XXX
+  python unlock_outlook.py --proxy-file proxies_outlook.txt
   python unlock_outlook.py                          (auto-scan all accounts, skip unlocked)
 """)
     parser.add_argument("--input", "-i", default=None,
@@ -934,18 +957,11 @@ Examples:
         help="Proxy list file (one user:pass@host:port per line)")
     parser.add_argument("--proxy-source",
         default=os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
-        choices=["file", "http", "aimili-list", "aimili-random"],
-        help="file/http/aimili-list/aimili-random (file=本地文件;http=HTTP GET 拉 txt 列表)")
+        choices=["file", "http"],
+        help="file=本地代理文件;http=HTTP GET 拉 txt 列表(配合 --proxy-url)")
     parser.add_argument("--proxy-url",
         default=os.environ.get("OUTLOOK_PROXY_URL", ""),
         help="HTTP GET 代理列表地址(返回 txt,每行一条;配合 --proxy-source=http)")
-    parser.add_argument("--aimili-url",
-        default=(os.environ.get("OUTLOOK_AIMILI_POOL_URL")
-                 or os.environ.get("OUTLOOK_AIMILI_POOL_BASE_URL", "")),
-        help="AimiliVPN URL: 根地址或 /api/pool/proxies(/random) 完整地址")
-    parser.add_argument("--aimili-token",
-        default=os.environ.get("OUTLOOK_AIMILI_POOL_TOKEN", ""),
-        help="AimiliVPN 代理池 API Token")
     parser.add_argument("--concurrency", "-c", type=int, default=1,
         help="Parallel workers (default: 1)")
     parser.add_argument("--headless", action="store_true",
@@ -959,14 +975,18 @@ Examples:
         default=os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARN", "PROD", "ERR"],
         help="log verbosity")
+    parser.add_argument("--save-debug", action="store_true",
+        default=_ruoyi._env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False),
+        help="保存屏幕快照到 screenshots_unlock/(默认关闭,调试时开启)")
     args = parser.parse_args()
 
     set_log_level(args.log_level)
     _install_force_shutdown()
+    # --save-debug / env 在 import 期已读默认值,这里按 CLI 显式覆盖全局(供 snap/PX 截图用)
+    global SAVE_DEBUG
+    SAVE_DEBUG = bool(args.save_debug)
     os.environ["OUTLOOK_PROXY_FILE"] = args.proxy_file
     os.environ["OUTLOOK_RUOYI_PROXY_SOURCE"] = args.proxy_source
-    if args.aimili_url:   os.environ["OUTLOOK_AIMILI_POOL_URL"] = args.aimili_url
-    if args.aimili_token: os.environ["OUTLOOK_AIMILI_POOL_TOKEN"] = args.aimili_token
     if getattr(args, "proxy_url", ""): os.environ["OUTLOOK_PROXY_URL"] = args.proxy_url
     os.environ["OUTLOOK_REG_MAX_PRESS"] = str(args.max_press)
 

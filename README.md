@@ -30,7 +30,6 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
   <img src="https://img.shields.io/badge/Playwright-自动化-2EAD33?style=flat-square" alt="Playwright" />
   <img src="https://img.shields.io/badge/BitBrowser%20%2F%20AdsPower-指纹隔离-5A4FCF?style=flat-square" alt="Fingerprint Browser" />
-  <img src="https://img.shields.io/badge/Clash%20Verge-节点切换-1F8FFF?style=flat-square" alt="Clash Verge" />
   <img src="https://img.shields.io/badge/license-educational-lightgrey?style=flat-square" alt="license" />
 </p>
 
@@ -40,7 +39,7 @@
 
 **reg-factory** 是一套全自动注册流水线：先自注册 **Outlook** 邮箱，再用同一邮箱在
 **ChatGPT / Grok / Claude** 上批量注册账号，并导出可直登的 cookie。底层用
-**比特浏览器(BitBrowser) / AdsPower** 做指纹隔离、**Clash Verge** 做节点切换绕区域封锁与 Cloudflare 风控、
+**比特浏览器(BitBrowser) / AdsPower** 做指纹隔离、**代理池**（配文件或 URL，每账号取一条 socks5）做出口绕区域封锁与 Cloudflare 风控、
 接码/打码平台过手机号与验证码。
 
 > 🔜 即将上新：**Gmail 注册机 → Google One 授权 → SUB2API / CPA 导入**完整链路。
@@ -63,13 +62,14 @@
 
 客户端要保持运行——脚本通过本地 API 创建/打开/关闭浏览器窗口。
 
-### ② Clash Verge（开启 API 权限）
-- 安装 Clash Verge 并导入你的机场订阅，选一个节点并开启「系统代理 / Tun 模式」。
-  - 注册 Grok 需要能过 Cloudflare 的干净节点；脚本会在订阅节点里自动逐个试探可用节点。
-- **设置 → External Controller**：开启外部控制器 API，并**设置一个 secret**。
-  - 记下控制面端口（Clash Verge 默认 `9097`，mihomo 内核默认 `9090`）。
-  - 记下混合代理端口（mixed-port，默认 `7897`）。
-- 把 secret 填进 `.env` 的 `CLASH_SECRET`（见下）。
+### ② 代理池（配文件或 URL）
+- 准备一个代理列表，每行一条 `socks5://user:pass@host:port`（或 `user:pass@host:port`）。
+- 两种来源二选一，填进 `.env`：
+  - `OUTLOOK_RUOYI_PROXY_SOURCE=file` + `OUTLOOK_PROXY_FILE=proxies_outlook.txt`（本地文件）
+  - `OUTLOOK_RUOYI_PROXY_SOURCE=http` + `OUTLOOK_PROXY_URL=http://host/pool.txt`（HTTP 拉 txt）
+- 每个账号注册时从池里取一条 socks5 挂 BitBrowser（绕区域封锁/Cloudflare）；
+  webui 后端的接码/TG/上传等 Python 请求也复用同一池取一条作出口。
+- 注册 Grok / ChatGPT 需要能过 Cloudflare 的干净 IP；池代理信誉差会触发 CF，需自备可用代理。
 
 ### ③ Python
 - Python 3.10+。
@@ -91,7 +91,7 @@
 
 ```
 1. 双击 install.bat   ——  自动建虚拟环境、装依赖、装 Playwright Chromium、生成 .env
-2. 打开 BitBrowser/AdsPower 和 Clash Verge 客户端
+2. 打开 BitBrowser/AdsPower 客户端，并备好代理池文件（`proxies_outlook.txt`）
 3. 双击 start.bat     ——  自动启动面板并打开浏览器（http://127.0.0.1:8799）
 ```
 
@@ -104,11 +104,11 @@
 
 **面板能做什么**
 
-- 顶部状态灯：指纹浏览器 / Clash 是否在线 + 当前节点（实时刷新）。
+- 顶部状态灯：指纹浏览器是否在线（实时刷新）。
 - 左侧按分类列出全部脚本（主流程 / 单平台注册 / 养号·邮箱 / 导出·上传），还有「外部工具」入口（如 Gmail 注册）。
 - 点脚本 → 自动生成参数表单（勾选框 / 下拉 / 多选 / 输入框）→ 点「运行」→ 实时日志，可随时「停止」。
 - **⚙️ 配置(.env)** 页：分组填写所有密钥（密码框遮挡），每类带**连通测试按钮**——
-  Clash（验证控制器 + secret）、指纹浏览器、sms-man / firefox.fun 接码平台，一键看通不通。
+  指纹浏览器、sms-man / firefox.fun 接码平台，一键看通不通。
   指纹浏览器 provider 可在页面里用下拉框切换 `bitbrowser` / `adspower`。
 - 仅监听 `127.0.0.1`，含密钥不暴露公网。
 
@@ -140,10 +140,9 @@ cp .env.example .env
 
 | 环境变量 | 说明 | 必填 |
 |---|---|---|
-| `CLASH_SECRET` | Clash Verge External Controller 的 secret | 走节点时必填 |
-| `CLASH_API` | Clash 控制面地址（默认 `http://127.0.0.1:9097`） | 否 |
-| `CLASH_PROXY` | Clash 混合端口代理（默认 `http://127.0.0.1:7897`） | 否 |
-| `CLASH_GROUP` | 切换出口的代理组名（默认 `GLOBAL`） | 否 |
+| `OUTLOOK_RUOYI_PROXY_SOURCE` | 代理池来源：`file` / `http`（默认 `file`） | 是 |
+| `OUTLOOK_PROXY_FILE` | 代理文件路径（source=file 时用，默认 `proxies_outlook.txt`） | 是 |
+| `OUTLOOK_PROXY_URL` | 代理列表 HTTP 地址（source=http 时拉 txt） | source=http 时必填 |
 | `FINGERPRINT_BROWSER` | 指纹浏览器 provider：`bitbrowser` / `adspower`（默认 `bitbrowser`） | 否 |
 | `BITBROWSER_API` | 比特浏览器本地 API（默认 `http://127.0.0.1:54345`） | 否 |
 | `ADSPOWER_API` | AdsPower 本地 API（默认 `http://127.0.0.1:50325`） | 使用 AdsPower 时 |
@@ -184,7 +183,7 @@ python run_full_flow.py --platforms chatgpt --email-confirm-before-register  # O
 python run_full_flow.py --skip-email --email a@outlook.com --password xxx
 python run_full_flow.py --dry-run             # 只打印将执行的命令
 ```
-> 自动注入 `HTTP(S)_PROXY` 与 `CLASH_API/SECRET/GROUP` 给子进程。
+> 子进程继承本进程 `HTTP_PROXY`（代理池取一条 socks5 出口）；注册浏览器走 `OUTLOOK_PROXY_*` 池代理挂 BitBrowser。
 > `--import-c2a` 逐层透传到 `register_chatgpt.py`，只对 chatgpt 平台生效，需先配 `CHATGPT2API_URL/KEY`。
 > `--email-confirm-before-register` 会在 Outlook 注册页打开后自动点击确认/同意类按钮，再开始填写。
 
@@ -296,13 +295,7 @@ python extract_graph_tokens.py outlook_accounts/accounts.txt     # 指定账号�
 python extract_graph_tokens.py --email a@outlook.com --password xxx
 python extract_graph_tokens.py accounts.txt --concurrency 10     # 并发数(默认 5)
 ```
-> 走系统代理（Clash），避免 `account.live.com` 限流；账号文件每行 `email----password----...`。
-
-### Clash 节点自检
-```bash
-python -m common.proxy_switch list             # 列出 GLOBAL 组节点
-python _clash_verge.py ping                    # 控制面连通性
-```
+> 走出口代理（`OUTLOOK_PROXY_*` 池取一条 socks5），避免 `account.live.com` 限流；账号文件每行 `email----password----...`。
 
 ---
 
@@ -529,7 +522,6 @@ python export_chatgpt2api.py --json                                # 导出 {acc
 | `oauth_codex.py` | Codex OAuth 授权驱动、add-phone 处理、SUB2API 调用 |
 | `session_export.py` | 登录态导出成 CPA / SUB2API 标准 token（对齐 FlowPilot） |
 | `uploaders.py` | 上传到 CPA / SUB2API / webchat2api |
-| `proxy_switch.py` | Clash 节点切换 |
 | `agent_captcha.py` | Arkose 验证视觉投票求解器：变体分派 + 多模型并发投票 + 图片增强/拼接 + 复盘标注 |
 
 **通用验证码求解库（`vision_solver/`）**
@@ -569,12 +561,11 @@ python export_chatgpt2api.py --json                                # 导出 {acc
 
 ## 8. 常见问题
 
-- **claude 报 app-unavailable-in-region**：claude.com 对本机 IP 区域封锁，需开 Clash 走干净
-  节点（`run_full_flow` / `register.py` 的 `--node auto`）。
-- **grok 全页 Cloudflare 拦截**：必须切 Clash 节点；`register_grok.py` 会用 curl_cffi 指纹
-  逐个试节点找能过的。
+- **claude 报 app-unavailable-in-region**：claude.com 对代理出口 IP 区域封锁，需在
+  `OUTLOOK_PROXY_*` 池里换能过 claude 的干净 socks5 代理。
+- **grok 全页 Cloudflare 拦截**：代理出口 IP 信誉差触发 CF；换池里更干净的 socks5 代理重试。
 - **三窗口登录同一 outlook 报并发登录**：用 `mailbox_broker.py` 共享取码（每号只登一次）。
-- **缺 secret 连不上 Clash 控制面**：确认 External Controller 已开 API 且 `CLASH_SECRET` 正确。
+- **接码/TG 请求失败**：确认 `OUTLOOK_PROXY_*` 池里有可用 socks5（webui 后端 Python 出网复用此池取一条）。
 
 ---
 

@@ -2052,7 +2052,7 @@ def fetch_proxy_list_http(proxy_url, timeout=12):
     })
 
     # 强制直连拉列表:urllib 默认会吃 HTTP_PROXY/HTTPS_PROXY/WinIE 系统代理,
-    # 把这次拉代理的请求也送进本机代理(Clash/V2Ray/公司代理),端口拒绝就 WinError 10061。
+    # 把这次拉代理的请求也送进本机代理(V2Ray/公司代理),端口拒绝就 WinError 10061。
     # 这里用空 ProxyHandler 显式禁用代理,确保直连到代理池 API。
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 

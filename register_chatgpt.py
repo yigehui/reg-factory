@@ -3,11 +3,13 @@
 ChatGPT (OpenAI) 自动注册
 复用 common/ 基建: BitBrowser + stealth + Outlook 取验证码 + cookie 保存
 
-流程: chatgpt.com/auth/login -> 填邮箱 -> Continue -> 验证码/密码 -> Arkose -> onboarding -> 保存 cookie
+流程: 代理池取一条socks5 -> BitBrowser走代理 -> chatgpt.com/auth/login
+      -> 填邮箱 -> Continue -> 验证码/密码 -> Arkose -> onboarding -> 保存 cookie
 
 用法:
     python register_chatgpt.py --count 1
-    python register_chatgpt.py --count 10 --concurrency 2
+    python register_chatgpt.py --count 10 --concurrency 2 --proxy-file proxies_outlook.txt
+    python register_chatgpt.py --proxy-source http --proxy-url http://host/pool.txt
 """
 
 import argparse
@@ -60,14 +62,10 @@ CODEX_MANUAL_PHONE = False  # add-phone 手动模式（不接码，自己在浏�
 CODEX_TIMEOUT = 120  # Codex 授权捕获超时秒
 
 
-# CF 友好节点池：ChatGPT 注册页对宿主出口 IP 敏感，AWS 机房 + 部分中转 IP(如 216.195.209.x)
-# 会被 Cloudflare 全页 Turnstile 拦(body 空)。这些 188.253.x 的 NF 节点实测能静默放行。
-# 可经环境变量 CHATGPT_CF_NODES 覆盖(逗号分隔精确节点名)。检测到 CF 拦截就轮换到下一个。
+# 代理统一走 ruyi 代理池(文件/url,取一条) → BitBrowser /browser/update 挂 socks5
 import os as _os
-_DEFAULT_CF_NODES = ["level1-日本01-NF", "level1-日本02-NF", "level1-新加坡01-NF",
-                     "level1-新加坡02-NF", "level1-韩国01", "level1-法国01"]
-CF_NODES = [n.strip() for n in (_os.environ.get("CHATGPT_CF_NODES") or "").split(",") if n.strip()] or _DEFAULT_CF_NODES
-_cf_node_idx = [0]  # 轮换游标
+from register_outlook_ruoyi import ConsumableProxyPool, select_proxy_for_account, release_proxy_for_account
+from outlook_reg_loop import mask_proxy
 
 
 async def _is_cf_blocked(page):
@@ -111,21 +109,8 @@ async def _click_turnstile(page):
 
 
 def _switch_cf_node():
-    """把 Clash GLOBAL 切到下一个 CF 友好节点并断连接换出口。返回切到的节点名或 None。"""
-    try:
-        import _clash_verge as cv
-        api = _os.environ.get("CLASH_API", "http://127.0.0.1:9097")
-        secret = _os.environ.get("CLASH_SECRET", "")
-        group = _os.environ.get("CLASH_GROUP", "GLOBAL") or "GLOBAL"
-        client = cv.ClashClient(api, secret)
-        node = CF_NODES[_cf_node_idx[0] % len(CF_NODES)]
-        _cf_node_idx[0] += 1
-        client.switch(group, node)
-        client.close_connections()
-        return node
-    except Exception as e:
-        print(f"  [cf] 切节点失败: {str(e)[:80]}")
-        return None
+    """已废弃:代理改走 ruyi 代理池,不再切 Clash 节点。保留空函数避免外部调用炸。"""
+    return None
 
 
 # OpenAI 发件人 / 验证码邮件特征
@@ -431,7 +416,7 @@ async def extract_codex(page, email, p=None, ctx=None):
         return False
 
 
-async def register_one(index, total, p):
+async def register_one(index, total, p, proxy_str, pool=None):
     start = time.time()
 
     def check_timeout():
@@ -457,7 +442,9 @@ async def register_one(index, total, p):
     bb = pid = None
     success = False
     try:
-        bb, pid, browser, ctx, page = await open_and_connect(name=name, p=p)
+        if proxy_str:
+            print(f"  proxy -> {mask_proxy(proxy_str)}")
+        bb, pid, browser, ctx, page = await open_and_connect(name=name, p=p, proxy_str=proxy_str)
         await ctx.clear_cookies()
 
         # Step 1: 打开注册页（带重试，应对 ERR_CONNECTION_CLOSED 等偶发）
@@ -493,13 +480,10 @@ async def register_one(index, total, p):
             if await _try_pass_turnstile():
                 print("  [cf] Turnstile 点击后放行 ✅")
             else:
-                # 点不动/死锁 -> 轮换 CF 友好节点重载，每个节点再试点一次
+                # 代理出口固定(池里这一条)，不再切节点。重载再点几次，仍过不了即该出口 IP 被 CF 拦。
                 passed = False
-                for cf_try in range(len(CF_NODES)):
-                    node = _switch_cf_node()
-                    print(f"  [cf] 点击未过，切节点 -> {node or '失败'} 重载({cf_try+1}/{len(CF_NODES)})...")
-                    if not node:
-                        break
+                for cf_try in range(2):
+                    print(f"  [cf] 点击未过，重载重试({cf_try+1}/2, 出口不变)...")
                     await asyncio.sleep(3)
                     try:
                         await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
@@ -507,11 +491,11 @@ async def register_one(index, total, p):
                         pass
                     await asyncio.sleep(5)
                     if await _try_pass_turnstile(rounds=2):
-                        print(f"  [cf] 节点 {node} 放行 ✅")
+                        print("  [cf] 重载后放行 ✅")
                         passed = True
                         break
                 if not passed:
-                    print("  [cf] 点击+换遍节点仍被拦，放弃本号")
+                    print("  [cf] 重载重试仍被拦，该出口 IP 信誉不足，放弃本号")
                     await dump_state(page, "cf-blocked")
                     email_pool.mark_error(PLATFORM, email, email_pw, "cf_blocked")
                     return None
@@ -831,6 +815,15 @@ async def register_one(index, total, p):
             await teardown(bb, pid, delete=not keep)
             if keep:
                 print(f"  [debug] window kept for inspection: {name} (id={pid})")
+        # 代理池回收:成功 release(可复用同出口),失败 discard(换出口避免再撞 CF)
+        if proxy_str and pool is not None:
+            try:
+                if success:
+                    release_proxy_for_account(proxy_str, pool)
+                else:
+                    pool.discard(proxy_str)
+            except Exception:
+                pass
 
 
 async def blur_field(page, selector):
@@ -1146,6 +1139,15 @@ async def main():
     parser.add_argument("--count", "-n", type=int, default=1)
     parser.add_argument("--concurrency", "-c", type=int, default=1)
     parser.add_argument("--timeout", "-t", type=int, default=480)
+    parser.add_argument("--proxy-file", default=_os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt"),
+        help="代理列表文件(每行 user:pass@host:port 或 socks5://...)")
+    parser.add_argument("--proxy-source",
+        default=_os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file"),
+        choices=["file", "http"],
+        help="file=本地代理文件;http=HTTP GET 拉 txt 列表(配合 --proxy-url)")
+    parser.add_argument("--proxy-url",
+        default=_os.environ.get("OUTLOOK_PROXY_URL", ""),
+        help="HTTP GET 代理列表地址(配合 --proxy-source=http)")
     parser.add_argument("--keep-on-fail", action="store_true", help="失败时保留窗口便于排查")
     parser.add_argument("--email", default=None, help="指定邮箱(绕过邮箱池)")
     parser.add_argument("--password", default=None, help="指定邮箱密码")
@@ -1188,8 +1190,11 @@ async def main():
     if EXTRACT_CODEX and not (SUB2API_URL and SUB2API_EMAIL and SUB2API_PASSWORD):
         print("  [codex][WARN] 已开 --codex 但未配置 SUB2API_URL/EMAIL/PASSWORD（.env），Codex 提取会被跳过")
 
+    # 代理池:每个账号 take() 一条 socks5,挂 BitBrowser;成功 release/失败 discard
+    pool = ConsumableProxyPool.from_args(args).start()
+    st = pool.stats() if hasattr(pool, "stats") else {}
     print("=" * 50)
-    print(f"  ChatGPT Auto Register  count={args.count} concurrency={args.concurrency}")
+    print(f"  ChatGPT Auto Register  count={args.count} concurrency={args.concurrency} pool source={st.get('source', args.proxy_source)} size={st.get('remaining', '?')}")
     print("=" * 50)
 
     sem = asyncio.Semaphore(args.concurrency)
@@ -1199,13 +1204,15 @@ async def main():
         async with sem:
             if i > 1:
                 await asyncio.sleep(random.uniform(2, 6) * (i - 1))
+            selected = select_proxy_for_account(pool)
+            proxy_str = selected[0] if selected else ""
             async with async_playwright() as p:
                 try:
-                    sk = await register_one(i, args.count, p)
-                    results.append(sk)
+                    sk = await register_one(i, args.count, p, proxy_str, pool)
                 except Exception as e:
                     print(f"  #{i} fatal: {e}")
-                    results.append(None)
+                    sk = None
+                results.append(sk)
 
     await asyncio.gather(*[run_one(i) for i in range(1, args.count + 1)])
 
