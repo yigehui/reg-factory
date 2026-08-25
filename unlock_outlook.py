@@ -41,8 +41,12 @@ except Exception:
     _EZCAPTCHA_BASE = os.environ.get("EZCAPTCHA_API_BASE", "https://api.ez-captcha.com")
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stdin.reconfigure(encoding="utf-8")
+    # 仅在真实终端下重配置编码;pytest 等会替换 stdin/stdout 为不支持 reconfigure 的对象
+    # (DontReadFromInput),hasattr 守卫避免导入期 AttributeError,不影响脚本运行时行为。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8")
 
 import requests
 
@@ -232,6 +236,12 @@ def classify(page):
     if any(x in t for x in ["verify your identity", "unusual activity"]): return "verify_needed"
     if "something went wrong" in t: return "error_page"
     if "chrome-error://" in u or "about:neterror" in u: return "net_error"
+    # 凭证错误:微软登录页标准文案(账号不存在 / 密码错误),优先于 login_form/email_form
+    # 避免密码错误时反复重填等到超时;放这里在 error_page 之后(error_page 文案不同不冲突)。
+    if any(x in t for x in [
+        "we couldn't find an account",
+        "your account or password is incorrect",
+    ]): return "login_error"
     if "enter your password" in t:  return "login_form"
     if any(x in t for x in ["email or phone", "sign in", "enter your email"]): return "email_form"
     return "unknown"
