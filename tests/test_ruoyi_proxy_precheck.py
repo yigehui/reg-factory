@@ -5,14 +5,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import register_outlook_ruoyi as mod
+from common import ruyi as _ruyi_pkg
 
 
 class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
     def test_proxy_precheck_uses_target_timeout_without_touching_signup(self):
         with (
-            patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
+            patch.object(_ruyi_pkg.probe, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
             patch.object(
-                mod,
+                _ruyi_pkg.probe,
                 "_probe_proxy_targets",
                 return_value={"url": "https://signup.live.com/", "status_code": 302},
             ) as probe_proxy_targets,
@@ -51,8 +52,8 @@ class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
 
     def test_proxy_precheck_fails_when_microsoft_targets_unreachable(self):
         with (
-            patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
-            patch.object(mod, "_probe_proxy_targets", return_value=None),
+            patch.object(_ruyi_pkg.probe, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
+            patch.object(_ruyi_pkg.probe, "_probe_proxy_targets", return_value=None),
         ):
             ok = mod._probe_proxy_before_browser(["127.0.0.1:1080"], "[#1][ruoyi]")
 
@@ -74,8 +75,8 @@ class RuoyiProxyPrecheckTests(unittest.IsolatedAsyncioTestCase):
                 return FakeResponse(403)
 
         with (
-            patch.object(mod, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
-            patch.object(mod.requests, "Session", return_value=FakeSession()),
+            patch.object(_ruyi_pkg.probe, "_proxy_for_ip_lookup", return_value={"http": "socks5h://127.0.0.1:1080"}),
+            patch.object(_ruyi_pkg.probe.requests, "Session", return_value=FakeSession()),
         ):
             result = mod._probe_proxy_targets(["127.0.0.1:1080"], timeout=9)
 

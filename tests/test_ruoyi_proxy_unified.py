@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import register_outlook_ruoyi as mod
+from common import ruyi as _ruyi_pkg
 
 
 class RuoyiProxyUnifiedTests(unittest.TestCase):
@@ -34,8 +35,8 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
             proxy_file="proxies.txt",
         )
         with (
-            patch.object(mod, "parse_proxy_pool") as parse_proxy_pool,
-            patch.object(mod, "fetch_proxy_list_http", return_value=["api1"]) as fetch_proxy_list_http,
+            patch.object(_ruyi_pkg.proxy, "parse_proxy_pool") as parse_proxy_pool,
+            patch.object(_ruyi_pkg.proxy, "fetch_proxy_list_http", return_value=["api1"]) as fetch_proxy_list_http,
         ):
             merged = mod.load_proxy_list(args)
 
@@ -49,8 +50,8 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
             proxy_file="proxies.txt",
         )
         with (
-            patch.object(mod, "parse_proxy_pool", return_value=["file1"]) as parse_proxy_pool,
-            patch.object(mod, "fetch_proxy_list_http") as fetch_proxy_list_http,
+            patch.object(_ruyi_pkg.proxy, "parse_proxy_pool", return_value=["file1"]) as parse_proxy_pool,
+            patch.object(_ruyi_pkg.proxy, "fetch_proxy_list_http") as fetch_proxy_list_http,
         ):
             merged = mod.load_proxy_list(args)
 
@@ -65,8 +66,8 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
             proxy_url="http://127.0.0.1:8787/proxies",
         )
         with (
-            patch.object(mod, "parse_proxy_pool", return_value=[]) as parse_proxy_pool,
-            patch.object(mod, "fetch_proxy_list_http", return_value=["api1"]) as fetch_proxy_list_http,
+            patch.object(_ruyi_pkg.proxy, "parse_proxy_pool", return_value=[]) as parse_proxy_pool,
+            patch.object(_ruyi_pkg.proxy, "fetch_proxy_list_http", return_value=["api1"]) as fetch_proxy_list_http,
         ):
             merged = mod.load_proxy_list(args)
 
@@ -79,7 +80,10 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
             mod.fetch_proxy_list_http("file:///tmp/proxies.txt")
 
     def test_pick_user_agent_stays_unique_for_first_ten_slots(self):
-        with patch.dict(mod.os.environ, {"OUTLOOK_RUOYI_UA_POOL": ""}, clear=False):
+        # 新包 _pick_user_agent 读中性名 RUOYI_UA_POOL;register 兼容层在 import 时
+        # setdefault 把 OUTLOOK_RUOYI_UA_POOL 提升到 RUOYI_UA_POOL(只执行一次)。
+        # 测试必须直接 patch 中性名,否则已提升的旧值会让 UA 池只剩 1 条。
+        with patch.dict(mod.os.environ, {"RUOYI_UA_POOL": ""}, clear=False):
             picked = [mod._pick_user_agent(i) for i in range(1, 11)]
 
         self.assertEqual(len(set(picked)), 10)
@@ -88,8 +92,8 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
         pool = mod.ConsumableProxyPool(SimpleNamespace(proxy_file="", proxy_source="file", proxy_url=""))
 
         with (
-            patch.object(mod, "load_proxy_list", return_value=["a:1:u:p", "b:2:u:p", "c:3:u:p"]),
-            patch.object(mod, "_proxy_exit_key", side_effect=["ip:1.1.1.1", "ip:1.1.1.1", "ip:2.2.2.2"]),
+            patch.object(_ruyi_pkg.proxy, "load_proxy_list", return_value=["a:1:u:p", "b:2:u:p", "c:3:u:p"]),
+            patch.object(_ruyi_pkg.proxy, "_proxy_exit_key", side_effect=["ip:1.1.1.1", "ip:1.1.1.1", "ip:2.2.2.2"]),
         ):
             pool.start()
 
@@ -104,8 +108,8 @@ class RuoyiProxyUnifiedTests(unittest.TestCase):
             return {"proxy1": "ip:1.1.1.1", "proxy2": "ip:1.1.1.1", "proxy3": "ip:2.2.2.2"}[proxy]
 
         with (
-            patch.object(mod, "_proxy_exit_key", side_effect=fake_exit_key),
-            patch.object(mod.random, "randrange", side_effect=[0, 0, 0, 0]),
+            patch.object(_ruyi_pkg.proxy, "_proxy_exit_key", side_effect=fake_exit_key),
+            patch.object(_ruyi_pkg.proxy.random, "randrange", side_effect=[0, 0, 0, 0]),
         ):
             first = pool.take()
             second = pool.take()

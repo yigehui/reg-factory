@@ -29,7 +29,7 @@ Output (unlock_results/):
   failed_*.txt            failed / timeout
 """
 
-import argparse, asyncio, importlib.util, os, signal, sys, time
+import argparse, asyncio, os, signal, sys, time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -46,16 +46,58 @@ if sys.platform == "win32":
 
 import requests
 
-# ── 复用 ruyi 模块(register_outlook_ruoyi)─────────────────────────────
-_RUOYI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "register_outlook_ruoyi.py")
-_spec = importlib.util.spec_from_file_location("_unlock_ruoyi", _RUOYI_PATH)
-_ruoyi = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_ruoyi)
-
 from ruyipage import FirefoxOptions, FirefoxPage
 
-# 公共 ruyi 浏览器启动栈(UA/quiet_prefs/headless_options/直接启动 + 启动后反检测注入 + 资源拦截)
-from common.ruyi_browser import build_browser_options, after_launch
+# ── 复用 ruyi 公共能力:通用层走自包含独立包 common.ruyi ──────────────
+# (代理池 / profile 目录与销毁 / 进程树 kill / 启动栈 / UA 池 / IP 探测),
+# 业务层(PX 按压 / 页面 helper)走 register_outlook_ruoyi 正常 import。
+# 原 importlib 动态加载 register 已删 —— 直接 import,符号名不变。
+from common.ruyi import (
+    _env_bool,
+    _all_contexts,
+    _parse_ruoyi_proxy,
+    set_log_level,
+    RUOYI_FIREFOX_PATH,
+    ConsumableProxyPool,
+    select_proxy_for_account,
+    release_proxy_for_account,
+    set_consumable_proxy_pool,
+    mask_ruoyi_proxy,
+    _install_shutdown_handlers,
+    _track_browser_page,
+    _untrack_browser_page,
+    _quit_browser_page,
+    _force_kill_ruoyi_firefox,
+    _kill_ruoyi_firefox_by_profile,
+    _cleanup_ruoyi_run_profile_dir,
+    RUOYI_FIREFOX_EXIT_WAIT,
+    _pick_user_agent,
+    _browser_model_name,
+    _ruoyi_profile_dir,
+    _log_current_ip,
+    _probe_proxy_before_browser,
+    build_browser_options,
+    after_launch,
+)
+from common.ruyi import _state as _ruyi_state
+
+# PX 按压 + 页面 helper(业务,留在 register,正常 import 非 importlib)
+from register_outlook_ruoyi import (
+    _find_hold_context,
+    _perform_hold_with_px_screenshots,
+    _new_ruoyi_px_motion_profile,
+    _wait_before_next_captcha_press,
+    _maybe_skip_passkey,
+    _body_text,
+    _safe_input,
+    _click_any,
+    _click_next,
+    _ele,
+    _context_text,
+    _microsoft_loading_page,
+    _find_hold_target,
+    _target_quality,
+)
 
 # ── Config ───────────────────────────────────────────────────────────
 OUTPUT_DIR      = "unlock_results"
@@ -72,42 +114,7 @@ MAX_PROXY_RETRY = 3   # 代理无法访问微软时,换节点重开浏览器重�
 # 是否保存屏幕快照(screenshots_unlock/)。默认关 -- 符合"保存网页默认关"约定,
 # 调试时用 --save-debug 或 env OUTLOOK_UNLOCK_SAVE_DEBUG=1 开启。
 # snap() 仅在此为 True 时才调 page.screenshot;否则只 classify + 打印 state,省磁盘/IO。
-SAVE_DEBUG = _ruoyi._env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False)
-
-
-# ── 从 ruyi 复用的符号 ────────────────────────────────────────────────
-RUOYI_FIREFOX_PATH            = _ruoyi.RUOYI_FIREFOX_PATH
-ConsumableProxyPool           = _ruoyi.ConsumableProxyPool
-select_proxy_for_account      = _ruoyi.select_proxy_for_account
-release_proxy_for_account     = _ruoyi.release_proxy_for_account
-set_consumable_proxy_pool     = _ruoyi.set_consumable_proxy_pool
-mask_ruoyi_proxy              = _ruoyi.mask_ruoyi_proxy
-set_log_level                 = _ruoyi.set_log_level
-
-_install_shutdown_handlers    = _ruoyi._install_shutdown_handlers
-_track_browser_page           = _ruoyi._track_browser_page
-_untrack_browser_page         = _ruoyi._untrack_browser_page
-_quit_browser_page            = _ruoyi._quit_browser_page
-_force_kill_ruoyi_firefox     = _ruoyi._force_kill_ruoyi_firefox
-_pick_user_agent              = _ruoyi._pick_user_agent
-_browser_model_name           = _ruoyi._browser_model_name
-_ruoyi_profile_dir            = _ruoyi._ruoyi_profile_dir
-_log_current_ip               = _ruoyi._log_current_ip
-_probe_proxy_before_browser   = _ruoyi._probe_proxy_before_browser
-
-# PX 按压(直接复用 ruyi 成熟实现)
-_find_hold_context            = _ruoyi._find_hold_context
-_perform_hold_with_px_screenshots = _ruoyi._perform_hold_with_px_screenshots
-_new_ruoyi_px_motion_profile  = _ruoyi._new_ruoyi_px_motion_profile
-_wait_before_next_captcha_press = _ruoyi._wait_before_next_captcha_press
-_maybe_skip_passkey           = _ruoyi._maybe_skip_passkey
-
-# 页面操作 helper
-_body_text                    = _ruoyi._body_text
-_safe_input                   = _ruoyi._safe_input
-_click_any                    = _ruoyi._click_any
-_click_next                   = _ruoyi._click_next
-_ele                          = _ruoyi._ele
+SAVE_DEBUG = _env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False)
 
 
 # ── EZCaptcha PX API (fallback, 与原版一致)──────────────────────────
@@ -191,9 +198,9 @@ def classify(page):
     # 成功文案(Your account has been unblocked)可能在 iframe 里,主文档拿不到
     text_parts = []
     heading_parts = []
-    for ctx in _ruoyi._all_contexts(page):
+    for ctx in _all_contexts(page):
         try:
-            text_parts.append(_ruoyi._context_text(ctx) or "")
+            text_parts.append(_context_text(ctx) or "")
         except Exception:
             pass
         try:
@@ -209,7 +216,7 @@ def classify(page):
     if "account has been unblocked" in t:                  return "logged_in"
     if any(x in t for x in ["stay signed in", "保持登录"]):  return "logged_in"
     # 微软 Loading 转圈页(PX 按压后等解锁结果):第一行 Loading + 页脚,排除 PX 文案
-    if _ruoyi._microsoft_loading_page(page):               return "loading"
+    if _microsoft_loading_page(page):               return "loading"
     if "account.live.com/abuse" in u:                       return "abuse"
     if "account.microsoft.com" in u and "unlock" not in u: return "logged_in"
     if "account.live.com" in u and "proofs" in u:          return "logged_in"
@@ -280,7 +287,7 @@ function(v) {
   return el.value === text;
 }
 """
-    for ctx in _ruoyi._all_contexts(page):
+    for ctx in _all_contexts(page):
         try:
             fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
             if fn(js, email):
@@ -357,7 +364,7 @@ def _click_try_again_if_present(page, wait_rounds=1, sleep=0.6):
     顶部兜底(每轮主循环都跑)用默认 wait_rounds=1 单轮快扫(<50ms,无等待);
     error_page 分支(确定有错误页)传 wait_rounds=3 轮等渲染(最坏 ~1.8s,只此一处值得)。"""
     for _ in range(max(1, wait_rounds)):
-        for ctx in _ruoyi._all_contexts(page):
+        for ctx in _all_contexts(page):
             if _try_again_button_scan(ctx):
                 return True
         if wait_rounds > 1:
@@ -381,7 +388,7 @@ def _per_tab_format(proxy_str):
     # 已是 ruyipage 私有格式 scheme://host:port:user:pass(:// 后无 @) -> 原样
     if "://" in s and "@" not in s.split("://", 1)[1]:
         return s
-    parsed = _ruoyi._parse_ruoyi_proxy(s)
+    parsed = _parse_ruoyi_proxy(s)
     if not parsed or not parsed.get("host") or not parsed.get("port"):
         raise ValueError(f"无法解析代理: {proxy_str}")
     scheme = (parsed.get("scheme") or "socks5").lower()
@@ -402,7 +409,8 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
 
     tb = FirefoxOptions()
     tb.set_browser_path(RUOYI_FIREFOX_PATH)
-    tb.set_profile(_ruoyi_profile_dir(opts, idx))
+    profile_dir = _ruoyi_profile_dir(opts, idx)
+    tb.set_profile(profile_dir)
 
     if proxy_pool:
         per_tab = []
@@ -428,6 +436,7 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
 
     page = FirefoxPage(tb)
     _track_browser_page(page)
+    setattr(page, "_ruoyi_profile_dir", profile_dir)
     setattr(page, "_ruoyi_px_motion_profile", _new_ruoyi_px_motion_profile())
 
     try:
@@ -449,7 +458,7 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
 
 
 def close_firefox(page):
-    """关闭单个账号浏览器:quit(force=True) 真正杀 firefox.exe 进程。
+    """关闭单个账号浏览器:quit(force=True) 真正杀 firefox.exe 进程,再删临时 profile。
 
     ruyipage 的 page.close() 只关当前标签页(源码 _pages/firefox_page.py 注释
     明写"关闭当前标签页"),不杀进程;若用它,每做完一个账号 firefox 窗口残留,
@@ -458,6 +467,11 @@ def close_firefox(page):
     切勿在此调 _force_kill_ruoyi_firefox():它按 RUOYI_FIREFOX_PATH 全局强杀
     所有 ruyi firefox,会误杀同批其他正在运行的 worker 实例。全局强杀只在
     批次边界(所有 worker 空闲)调用,见 run() 末尾。
+
+    销毁后删 profiles_ruoyi_tmp 下本次 run 的临时 profile 目录:ruyipage 的 quit()
+    只 terminate 主进程,子进程树残留会继续占用 XPCOM/profile 文件锁,直接 rmtree 会
+    撞文件锁失败。故先按 profile_dir 精准杀进程树并等退出(与 register 10323-10343
+    同路径),再 rmtree。跑大量账号时不删会逐个堆积把磁盘跑满。
     """
     if page is None:
         return
@@ -466,6 +480,23 @@ def close_firefox(page):
     except Exception:
         pass
     _untrack_browser_page(page)
+
+    # 删本次 run 临时 profile:进程树残留占文件锁,先精准杀+等退出再 rmtree
+    profile_dir = getattr(page, "_ruoyi_profile_dir", None)
+    if profile_dir:
+        try:
+            _kill_ruoyi_firefox_by_profile(
+                profile_dir,
+                timeout=RUOYI_FIREFOX_EXIT_WAIT,
+                log_fn=lambda m, s: print(f"  [unlock] {m}", file=sys.stderr, flush=True) if s == "WARN" else None,
+            )
+        except Exception:
+            pass
+        try:
+            _cleanup_ruoyi_run_profile_dir(profile_dir)
+        except Exception:
+            pass
+
 
 
 def _load_login_page(page):
@@ -638,12 +669,12 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
             if press_count < max_press:
                 # 等待找到真正按压按钮(#px-captcha 等)再按,不用 iframe-box fallback 急按
                 ctx = None; target = None
-                for c in _ruoyi._all_contexts(page):
+                for c in _all_contexts(page):
                     try:
-                        t = _ruoyi._find_hold_target(c)
+                        t = _find_hold_target(c)
                     except Exception:
                         t = None
-                    if t and _ruoyi._target_quality(t) <= 5:
+                    if t and _target_quality(t) <= 5:
                         ctx, target = c, t
                         break
                 if target and ctx:
@@ -923,7 +954,7 @@ def _install_force_shutdown():
     """Ctrl-C 直接强杀:不等浏览器优雅关闭。
     解锁卡在被锁/PX 页时,ruyi 的 _close_tracked_browser_pages 同步关 Firefox 会挂,
     导致优雅 handler 卡死、Ctrl-C 无响应。这里直接 os._exit。"""
-    _ruoyi._SHUTDOWN_HANDLERS_INSTALLED = True  # 阻止 launch_firefox 内 _install_shutdown_handlers 装优雅 handler
+    _ruyi_state._SHUTDOWN_HANDLERS_INSTALLED = True  # 阻止 launch_firefox 内 _install_shutdown_handlers 装优雅 handler
 
     def _handler(signum, _frame):
         print("\n[shutdown] 收到中断,强杀退出(os._exit)", file=sys.stderr)
@@ -976,7 +1007,7 @@ Examples:
         choices=["DEBUG", "INFO", "WARN", "PROD", "ERR"],
         help="log verbosity")
     parser.add_argument("--save-debug", action="store_true",
-        default=_ruoyi._env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False),
+        default=_env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False),
         help="保存屏幕快照到 screenshots_unlock/(默认关闭,调试时开启)")
     args = parser.parse_args()
 

@@ -80,79 +80,42 @@ from config import _load_dotenv
 
 from common.notify import send_tg_message
 
+from common import ruyi as _ruyi_pkg
+
 from common import ruyi_browser as _rb
 
 
 _load_dotenv()
 
+# --- ruyi 公共能力:自包含包 common.ruyi(通用层)。register 做 env 兼容层 + re-export。 ---
+# 新包只认中性 env 名(RUOYI_*),这里把旧名(OUTLOOK_*)提升/回落到中性名,保持本文件行为不变。
+# 业务版 log(_should_keep_prod_log/_should_demote_to_debug)留 register,不 re-export 新包 log。
 
 
-DEFAULT_RUOYI_FIREFOX = (
-
-    r"C:\Users\Administrator\AppData\Local\ruyipage\browsers"
-
-    r"\firefox-151.0a1-151-ruyi-win64\firefox\firefox.exe"
-
-)
 
 
-def _resolve_ruoyi_firefox_path(env_value):
-    """动态解析 ruyipage Firefox 内核路径,不锁定具体版本。
-
-    优先级:
-      1. 环境变量 RUOYI_FIREFOX_PATH(显式指定,优先尊重)
-      2. `ruyipage path` 命令输出(官方管理,装哪个版本指哪个)
-      3. browsers 目录下 glob 到的 firefox-*/firefox/firefox.exe(取最新一个)
-      4. DEFAULT_RUOYI_FIREFOX 硬编码默认(151 回退,兼容旧安装)
-    """
-    candidate = str(env_value or "").strip()
-    if candidate and os.path.isfile(candidate):
-        return candidate
-
-    try:
-        out = subprocess.check_output(
-            [sys.executable, "-m", "ruyipage", "path"],
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-        line = out.decode("utf-8", "ignore").strip().splitlines()
-        if line:
-            p = line[-1].strip()
-            if p and os.path.isfile(p):
-                return p
-    except Exception:
-        pass
-
-    try:
-        root = r"C:\Users\Administrator\AppData\Local\ruyipage\browsers"
-        if os.path.isdir(root):
-            found = []
-            for name in os.listdir(root):
-                exe = os.path.join(root, name, "firefox", "firefox.exe")
-                if os.path.isfile(exe):
-                    found.append(exe)
-            if found:
-                found.sort(reverse=True)
-                return found[0]
-    except Exception:
-        pass
-
-    return DEFAULT_RUOYI_FIREFOX
-
-
-RUOYI_FIREFOX_PATH = _resolve_ruoyi_firefox_path(os.environ.get("RUOYI_FIREFOX_PATH"))
-
+DEFAULT_RUOYI_FIREFOX = _ruyi_pkg.DEFAULT_RUOYI_FIREFOX
+_resolve_ruoyi_firefox_path = _ruyi_pkg._resolve_ruoyi_firefox_path
+get_firefox_path = _ruyi_pkg.get_firefox_path
+# RUOYI_FIREFOX_PATH 延迟求值(新包 PEP 562 __getattr__);保留模块级名字供旧引用读
+RUOYI_FIREFOX_PATH = _ruyi_pkg.RUOYI_FIREFOX_PATH
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 ENGINE_NAME = "ruoyi"
 
-PROXY_FILE = os.environ.get("OUTLOOK_PROXY_FILE", "proxies_outlook.txt")
+# 代理池常量:旧名优先,回落新包中性默认。
+# 同时把旧名值提升到中性名(setdefault),新包 ConsumableProxyPool.from_args 在 args 空时
+# 回落读中性名(RUOYI_PROXY_FILE 等),从而旧名配置仍能被新包池解析到。
+PROXY_FILE = os.environ.get("OUTLOOK_PROXY_FILE", _ruyi_pkg.PROXY_FILE)
+os.environ.setdefault("RUOYI_PROXY_FILE", os.environ.get("OUTLOOK_PROXY_FILE", ""))
 
-RUOYI_PROXY_SOURCE = os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", "file")
+RUOYI_PROXY_SOURCE = os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", _ruyi_pkg.RUOYI_PROXY_SOURCE)
+os.environ.setdefault("RUOYI_PROXY_SOURCE", os.environ.get("OUTLOOK_RUOYI_PROXY_SOURCE", ""))
 
-PROXY_URL = os.environ.get("OUTLOOK_PROXY_URL", "")
+PROXY_URL = os.environ.get("OUTLOOK_PROXY_URL", _ruyi_pkg.PROXY_URL)
+os.environ.setdefault("RUOYI_PROXY_URL", os.environ.get("OUTLOOK_PROXY_URL", ""))
 
 SCREENSHOT_DIR = os.path.join(ROOT, "screenshots_ruoyi")
 
@@ -162,7 +125,12 @@ OUTPUT_DIR = os.path.join(ROOT, "outlook_accounts")
 
 RUOYI_PROFILE_ROOT = os.environ.get("OUTLOOK_RUOYI_PROFILE_ROOT", os.path.join(ROOT, "profiles_ruoyi_tmp"))
 
-RUOYI_PROFILE_STALE_SEC = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_STALE_SEC", "600") or "600")
+# 注入业务 profile root 到新包(围栏 protect_paths 在调用时传 ROOT)
+_ruyi_pkg.set_profile_root(RUOYI_PROFILE_ROOT)
+
+RUOYI_PROFILE_STALE_SEC = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_STALE_SEC", _ruyi_pkg._state.RUOYI_PROFILE_STALE_SEC) or _ruyi_pkg._state.RUOYI_PROFILE_STALE_SEC)
+_ruyi_pkg._state.RUOYI_PROFILE_STALE_SEC = RUOYI_PROFILE_STALE_SEC
+
 
 # no_graph 账号累计文件，与 EMAILS_POOL 同级(ROOT 外层)，保持与成功号桥接 emails.txt 对称
 
@@ -178,54 +146,14 @@ SIGNUP_URL = "https://signup.live.com/signup?lic=1"
 
 
 def _ruoyi_profile_dir(opts, idx):
+    """包装新包 _ruoyi_profile_dir:读本模块 RUOYI_PROFILE_ROOT(profile_root 注入),
+    保留以便测试 patch.object(mod, 'RUOYI_PROFILE_ROOT', ...) 仍生效。"""
+    return _ruyi_pkg._ruoyi_profile_dir(opts, idx, profile_root=RUOYI_PROFILE_ROOT)
 
-    root = os.path.abspath(str(RUOYI_PROFILE_ROOT or "").strip())
-
-    os.makedirs(root, exist_ok=True)
-
-    _cleanup_stale_ruoyi_profile_root(root)
-
-    try:
-        slot = max(1, int(getattr(opts, "ruoyi_slot", None) or 0))
-    except Exception:
-        slot = 0
-    if not slot:
-        try:
-            slots = max(1, int(getattr(opts, "concurrency", 1) or 1))
-        except Exception:
-            slots = 1
-        try:
-            slot = ((max(1, int(idx or 1)) - 1) % slots) + 1
-        except Exception:
-            slot = 1
-
-    slot_root = os.path.join(root, f"slot_{slot:02d}")
-    os.makedirs(slot_root, exist_ok=True)
-
-    try:
-
-        run_idx = max(1, int(idx or 1))
-
-    except Exception:
-
-        run_idx = 1
-
-    profile_dir = tempfile.mkdtemp(prefix=f"run_{run_idx:04d}_", dir=slot_root)
-    with _ACTIVE_RUOYI_PROFILE_DIRS_LOCK:
-        _ACTIVE_RUOYI_PROFILE_DIRS.add(os.path.abspath(profile_dir))
-    return profile_dir
-
-IP_INFO_ENDPOINTS = [
-
-    ("ipwhois", "https://ipwho.is/"),
-
-    ("ipify", "https://api.ipify.org?format=json"),
-
-]
-
-_CURRENT_IP_INFO = {}
-
-_CURRENT_IP_INFO_LOCK = threading.Lock()
+# B 组状态 + IP 端点:迁入新包 _state,re-export 保持模块级名字
+IP_INFO_ENDPOINTS = _ruyi_pkg._state.IP_INFO_ENDPOINTS
+_CURRENT_IP_INFO = _ruyi_pkg._state._CURRENT_IP_INFO
+_CURRENT_IP_INFO_LOCK = _ruyi_pkg._state._CURRENT_IP_INFO_LOCK
 
 LOG_LEVELS = {
 
@@ -268,17 +196,21 @@ NO_PROGRESS_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_NO_PROGRESS_TIMEOUT", 
 # 邮箱页 stuck 换号上限:连续 stuck 换到第 N 个号仍过不去就早退 fail,避免 5 轮 × 8s 累加到 60s。
 EMAIL_STUCK_MAX_ROTATE = int(os.environ.get("OUTLOOK_RUOYI_EMAIL_STUCK_MAX_ROTATE", "2") or "2")
 
-PROXY_PRECHECK_TIMEOUT = 30
+PROXY_PRECHECK_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_PROXY_PRECHECK_TIMEOUT", _ruyi_pkg._state.PROXY_PRECHECK_TIMEOUT) or _ruyi_pkg._state.PROXY_PRECHECK_TIMEOUT)
+_ruyi_pkg._state.PROXY_PRECHECK_TIMEOUT = PROXY_PRECHECK_TIMEOUT
 
-PROXY_IDENTITY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_TIMEOUT", "12") or "12")
+PROXY_IDENTITY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_TIMEOUT", _ruyi_pkg._state.PROXY_IDENTITY_TIMEOUT) or _ruyi_pkg._state.PROXY_IDENTITY_TIMEOUT)
+_ruyi_pkg._state.PROXY_IDENTITY_TIMEOUT = PROXY_IDENTITY_TIMEOUT
 
-PROXY_IDENTITY_CACHE_TTL = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_CACHE_TTL", "1800") or "1800")
+PROXY_IDENTITY_CACHE_TTL = float(os.environ.get("OUTLOOK_RUOYI_PROXY_IDENTITY_CACHE_TTL", _ruyi_pkg._state.PROXY_IDENTITY_CACHE_TTL) or _ruyi_pkg._state.PROXY_IDENTITY_CACHE_TTL)
+_ruyi_pkg._state.PROXY_IDENTITY_CACHE_TTL = PROXY_IDENTITY_CACHE_TTL
 
+# 代理预检业务域名:注入到新包 _state(新包默认空),所有内部探测调用自动生效
 PROXY_PRECHECK_TARGETS = (
     "https://signup.live.com/",
     "https://login.live.com/",
 )
-
+_ruyi_pkg._state.PROXY_PRECHECK_TARGETS = PROXY_PRECHECK_TARGETS
 PROXY_PRECHECK_URL = PROXY_PRECHECK_TARGETS[0]
 
 
@@ -320,11 +252,14 @@ BIRTHDAY_ENTRY_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_ENTRY_TIMEOUT"
 
 BIRTHDAY_SUBMIT_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BDAY_SUBMIT_TIMEOUT", "2.0") or "2.0")
 
-BROWSER_QUIT_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BROWSER_QUIT_TIMEOUT", "5") or "5")
+BROWSER_QUIT_TIMEOUT = float(os.environ.get("OUTLOOK_RUOYI_BROWSER_QUIT_TIMEOUT", _ruyi_pkg._state.BROWSER_QUIT_TIMEOUT) or _ruyi_pkg._state.BROWSER_QUIT_TIMEOUT)
+_ruyi_pkg._state.BROWSER_QUIT_TIMEOUT = BROWSER_QUIT_TIMEOUT
 
-RUOYI_PROFILE_CLEANUP_RETRIES = int(os.environ.get("OUTLOOK_RUOYI_PROFILE_CLEANUP_RETRIES", "5") or "5")
+RUOYI_PROFILE_CLEANUP_RETRIES = int(os.environ.get("OUTLOOK_RUOYI_PROFILE_CLEANUP_RETRIES", _ruyi_pkg._state.RUOYI_PROFILE_CLEANUP_RETRIES) or _ruyi_pkg._state.RUOYI_PROFILE_CLEANUP_RETRIES)
+_ruyi_pkg._state.RUOYI_PROFILE_CLEANUP_RETRIES = RUOYI_PROFILE_CLEANUP_RETRIES
 
-RUOYI_PROFILE_CLEANUP_RETRY_DELAY = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_CLEANUP_RETRY_DELAY", "0.5") or "0.5")
+RUOYI_PROFILE_CLEANUP_RETRY_DELAY = float(os.environ.get("OUTLOOK_RUOYI_PROFILE_CLEANUP_RETRY_DELAY", _ruyi_pkg._state.RUOYI_PROFILE_CLEANUP_RETRY_DELAY) or _ruyi_pkg._state.RUOYI_PROFILE_CLEANUP_RETRY_DELAY)
+_ruyi_pkg._state.RUOYI_PROFILE_CLEANUP_RETRY_DELAY = RUOYI_PROFILE_CLEANUP_RETRY_DELAY
 
 # Retry gap after a failed challenge before the next press.
 
@@ -338,12 +273,15 @@ PAGE_START_DELAY = float(os.environ.get("OUTLOOK_RUOYI_PAGE_START_DELAY", "2") o
 
 SUBMIT_DELAY = float(os.environ.get("OUTLOOK_RUOYI_SUBMIT_DELAY", "0.5") or "0.5")
 
-# HEADLESS_WINDOW_* / HEADLESS_USER_AGENT / _DEFAULT_UA_POOL 已抽到 common/ruyi_browser,
-# 此处 re-export 保持模块级名字(register 其他地方仍按原名用,零改动)。
-
-HEADLESS_WINDOW_WIDTH = _rb.HEADLESS_WINDOW_WIDTH
-
-HEADLESS_WINDOW_HEIGHT = _rb.HEADLESS_WINDOW_HEIGHT
+# UA 池常量 + HEADLESS_*:re-export 自新包(单一来源,中性 env 名通过兼容层提升)
+# 旧 OUTLOOK_RUOYI_HEADLESS_* 提升到中性 RUOYI_HEADLESS_*,新包读中性名时拿到旧值
+os.environ.setdefault("RUOYI_HEADLESS_UA", os.environ.get("OUTLOOK_RUOYI_HEADLESS_UA", ""))
+os.environ.setdefault("RUOYI_HEADLESS_WIDTH", os.environ.get("OUTLOOK_RUOYI_HEADLESS_WIDTH", ""))
+os.environ.setdefault("RUOYI_HEADLESS_HEIGHT", os.environ.get("OUTLOOK_RUOYI_HEADLESS_HEIGHT", ""))
+HEADLESS_WINDOW_WIDTH = _ruyi_pkg.HEADLESS_WINDOW_WIDTH
+HEADLESS_WINDOW_HEIGHT = _ruyi_pkg.HEADLESS_WINDOW_HEIGHT
+_DEFAULT_UA_POOL = _ruyi_pkg._DEFAULT_UA_POOL
+HEADLESS_USER_AGENT = _ruyi_pkg.HEADLESS_USER_AGENT
 
 # 并发启动错峰：同一批拿到 slot 后，相邻两个浏览器启动至少间隔这么多秒。
 
@@ -351,666 +289,67 @@ HEADLESS_WINDOW_HEIGHT = _rb.HEADLESS_WINDOW_HEIGHT
 
 LAUNCH_STAGGER_SECONDS = float(os.environ.get("OUTLOOK_RUOYI_LAUNCH_STAGGER", "10") or "10")
 
-# firefox 退出后,按 profile 杀残留进程树并等待退出的总超时(秒)。
+# firefox 退出/强杀等待超时:读旧名,回落新包中性默认,同步写回 _state
+RUOYI_FIREFOX_EXIT_WAIT = float(os.environ.get("OUTLOOK_RUOYI_FIREFOX_EXIT_WAIT", _ruyi_pkg._state.RUOYI_FIREFOX_EXIT_WAIT) or _ruyi_pkg._state.RUOYI_FIREFOX_EXIT_WAIT)
+_ruyi_pkg._state.RUOYI_FIREFOX_EXIT_WAIT = RUOYI_FIREFOX_EXIT_WAIT
 
-# ruyipage quit() 只 terminate 主进程,子进程树残留占用 XPCOM/profile 文件锁,
+RUOYI_FIREFOX_FORCEKILL_WAIT = float(os.environ.get("OUTLOOK_RUOYI_FIREFOX_FORCEKILL_WAIT", _ruyi_pkg._state.RUOYI_FIREFOX_FORCEKILL_WAIT) or _ruyi_pkg._state.RUOYI_FIREFOX_FORCEKILL_WAIT)
+_ruyi_pkg._state.RUOYI_FIREFOX_FORCEKILL_WAIT = RUOYI_FIREFOX_FORCEKILL_WAIT
 
-# 导致下个 run 启动撞 "Couldn't load XPCOM"。删 profile 前必须清干净。
-
-RUOYI_FIREFOX_EXIT_WAIT = float(os.environ.get("OUTLOOK_RUOYI_FIREFOX_EXIT_WAIT", "8") or "8")
-
-# 批次级 _force_kill_ruoyi_firefox 杀完后,等待 firefox.exe 真正消失(释放文件句柄)的总超时(秒)。
-
-RUOYI_FIREFOX_FORCEKILL_WAIT = float(os.environ.get("OUTLOOK_RUOYI_FIREFOX_FORCEKILL_WAIT", "6") or "6")
-
-# 内置 Firefox UA 池已抽到 common/ruyi_browser,re-export 保持模块级名字。
-
-_DEFAULT_UA_POOL = _rb._DEFAULT_UA_POOL
-
-HEADLESS_USER_AGENT = _rb.HEADLESS_USER_AGENT
-
-_UA_RR_LOCK = threading.Lock()
-
-_UA_RR_IDX = 0
+# UA 池旧名提升到中性名,新包 _load_ua_pool/_pick_user_agent 读中性名
+os.environ.setdefault("RUOYI_UA_POOL", os.environ.get("OUTLOOK_RUOYI_UA_POOL", ""))
 
 _HELPERS = None
 
-_ACTIVE_BROWSER_PAGES = {}
-
-_ACTIVE_BROWSER_LOCK = threading.Lock()
-
-_SHUTDOWN_HANDLERS_INSTALLED = False
-
-_ACTIVE_RUOYI_PROFILE_DIRS = set()
-
-_ACTIVE_RUOYI_PROFILE_DIRS_LOCK = threading.Lock()
-
-
-
-
-
-def _load_ua_pool():
-
-    """UA 池：环境变量 OUTLOOK_RUOYI_UA_POOL 优先，否则内置 10 条 Firefox。"""
-
-    raw = str(os.environ.get("OUTLOOK_RUOYI_UA_POOL", "") or "").strip()
-
-    pool = []
-
-    if raw:
-
-        for part in re.split(r"[\n|]+", raw):
-
-            ua = part.strip()
-
-            if ua:
-
-                pool.append(ua)
-
-    if not pool:
-
-        # 单条 HEADLESS_UA 放队首，再拼内置池去重
-
-        seed = str(HEADLESS_USER_AGENT or "").strip()
-
-        seen = set()
-
-        for ua in (([seed] if seed else []) + list(_DEFAULT_UA_POOL)):
-
-            if ua and ua not in seen:
-
-                seen.add(ua)
-
-                pool.append(ua)
-
-    return pool or list(_DEFAULT_UA_POOL)
-
-
-
-
-
-def _track_browser_page(page):
-
-    if page is None:
-
-        return
-
-    with _ACTIVE_BROWSER_LOCK:
-
-        _ACTIVE_BROWSER_PAGES[id(page)] = page
-
-
-
-
-
-def _untrack_browser_page(page):
-
-    if page is None:
-
-        return
-
-    with _ACTIVE_BROWSER_LOCK:
-
-        _ACTIVE_BROWSER_PAGES.pop(id(page), None)
-
-
-
-
-
-def _close_tracked_browser_pages():
-
-    with _ACTIVE_BROWSER_LOCK:
-
-        pages = list(_ACTIVE_BROWSER_PAGES.values())
-
-        _ACTIVE_BROWSER_PAGES.clear()
-
-    for browser_page in pages:
-
-        try:
-
-            browser_page.quit(timeout=max(2.0, BROWSER_QUIT_TIMEOUT), force=True)
-
-            continue
-
-        except Exception:
-
-            pass
-
-        try:
-
-            browser_page.close()
-
-        except Exception:
-
-            pass
-
-
-
-
-
-def _cleanup_ruoyi_profile_root(profile_root=None):
-
-    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
-
-    if not root or root in {os.path.abspath(ROOT), os.path.abspath(os.sep), os.path.abspath(os.path.join(root, os.pardir))}:
-
-        return 0
-
-    if not os.path.isdir(root):
-
-        return 0
-
-    cleaned = 0
-
-    for name in os.listdir(root):
-
-        path = os.path.join(root, name)
-
-        try:
-
-            if os.path.isdir(path):
-
-                shutil.rmtree(path)
-
-            else:
-
-                os.remove(path)
-
-            cleaned += 1
-
-        except Exception as exc:
-
-            log(f"清理 ruoyi profile 缓存失败: {path}: {type(exc).__name__}: {exc}", "WARN")
-
-    return cleaned
-
-
-def _cleanup_stale_ruoyi_profile_root(profile_root=None, max_age_sec=None):
-
-    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
-
-    if not root or not os.path.isdir(root):
-
-        return 0
-
-    now = time.time()
-
-    stale_sec = float(max_age_sec or RUOYI_PROFILE_STALE_SEC or 0.0)
-
-    cleaned = 0
-
-    paths = []
-    for name in os.listdir(root):
-        path = os.path.join(root, name)
-        if os.path.isdir(path) and name.startswith("run_"):
-            paths.append(path)
-        elif os.path.isdir(path) and name.startswith("slot_"):
-            for child in os.listdir(path):
-                child_path = os.path.join(path, child)
-                if os.path.isdir(child_path) and child.startswith("run_"):
-                    paths.append(child_path)
-
-    for path in paths:
-
-        try:
-
-            with _ACTIVE_RUOYI_PROFILE_DIRS_LOCK:
-                if os.path.abspath(path) in _ACTIVE_RUOYI_PROFILE_DIRS:
-                    continue
-
-            age_sec = max(0.0, now - os.path.getmtime(path))
-
-            if stale_sec > 0 and age_sec < stale_sec:
-
-                continue
-
-            shutil.rmtree(path)
-
-            cleaned += 1
-
-        except Exception as exc:
-
-            log(f"清理过期 ruoyi tmp 失败: {path}: {type(exc).__name__}: {exc}", "WARN")
-
-    return cleaned
-
-
-def _cleanup_ruoyi_slot_root(slot_root, profile_root=None):
-
-    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
-    path = os.path.abspath(str(slot_root or "").strip())
-    if not root or not path or not os.path.isdir(path):
-        return 0
-    try:
-        if os.path.commonpath([root, path]) != root:
-            return 0
-    except Exception:
-        return 0
-    if not os.path.basename(path).startswith("slot_"):
-        return 0
-    cleaned = 0
-    for name in os.listdir(path):
-        child = os.path.join(path, name)
-        try:
-            if os.path.isdir(child):
-                shutil.rmtree(child)
-            else:
-                os.remove(child)
-            cleaned += 1
-        except Exception:
-            pass
-    return cleaned
-
-
-def _cleanup_ruoyi_run_profile_dir(profile_dir, profile_root=None):
-
-    root = os.path.abspath(str(profile_root or RUOYI_PROFILE_ROOT or "").strip())
-
-    path = os.path.abspath(str(profile_dir or "").strip())
-
-    if not root or not path or not os.path.isdir(path):
-
-        return False
-
-    try:
-
-        if os.path.commonpath([root, path]) != root:
-
-            return False
-
-    except Exception:
-
-        return False
-
-    if not os.path.basename(path).startswith("run_"):
-
-        return False
-
-    with _ACTIVE_RUOYI_PROFILE_DIRS_LOCK:
-        _ACTIVE_RUOYI_PROFILE_DIRS.discard(path)
-
-    retries = max(1, int(RUOYI_PROFILE_CLEANUP_RETRIES or 1))
-
-    delay = max(0.0, float(RUOYI_PROFILE_CLEANUP_RETRY_DELAY or 0.0))
-
-    last_exc = None
-
-    for attempt in range(retries):
-
-        try:
-
-            shutil.rmtree(path)
-
-            return True
-
-        except Exception as exc:
-
-            last_exc = exc
-
-            if attempt + 1 >= retries:
-
-                break
-
-            if delay > 0:
-
-                time.sleep(delay)
-
-    if last_exc is not None:
-
-        log(f"清理 ruoyi tmp profile 失败: {path}: {type(last_exc).__name__}: {last_exc}", "WARN")
-
-    return False
-
-
-
-
-def _ruoyi_firefox_running_count_by_path():
-    """按 RUOYI_FIREFOX_PATH 统计当前残留 firefox.exe 进程数(按 ExecutablePath 过滤)。"""
-    if not RUOYI_FIREFOX_PATH or not os.path.isfile(RUOYI_FIREFOX_PATH):
-        return 0
-    norm = os.path.normpath(RUOYI_FIREFOX_PATH)
-    target = norm.replace("'", "''")
-    ps = (
-        "$ErrorActionPreference='SilentlyContinue';"
-        "$t='%s'.ToLower();"
-        "$p=Get-Process firefox -ErrorAction SilentlyContinue;"
-        "if($p){$k=$p|Where-Object{$_.Path -and $_.Path.ToLower() -eq $t};"
-        "@($k).Count}else{0}"
-    ) % target
-    try:
-        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                             capture_output=True, text=True, timeout=10)
-        n = (out.stdout or "").strip()
-        if n.isdigit():
-            return int(n)
-    except Exception:
-        pass
-    return 0
-
-
-def _force_kill_ruoyi_firefox(log_fn=None):
-    """强杀所有以 RUOYI_FIREFOX_PATH 启动的 firefox.exe 进程(quit 超时残留兜底)。
-    按 ExecutablePath 过滤,不影响用户自己的 Firefox。仅在批次间隙(所有 slot 空闲)调用,
-    避免误杀同批正在运行的实例。杀完轮询等待进程真正消失(释放 XPCOM/profile 文件句柄),
-    否则下批次启动 firefox 会撞文件锁 -> "Couldn't load XPCOM"。返回杀掉的进程数。"""
-    if not RUOYI_FIREFOX_PATH or not os.path.isfile(RUOYI_FIREFOX_PATH):
-        return 0
-    lf = log_fn or log
-    norm = os.path.normpath(RUOYI_FIREFOX_PATH)
-    target = norm.replace("'", "''")
-    ps = (
-        "$ErrorActionPreference='SilentlyContinue';"
-        "$t='%s'.ToLower();"
-        "$p=Get-Process firefox -ErrorAction SilentlyContinue;"
-        "if($p){$k=$p|Where-Object{$_.Path -and $_.Path.ToLower() -eq $t};"
-        "if($k){$n=@($k).Count; $k|Stop-Process -Force; Write-Output $n}}"
-    ) % target
-    killed = 0
-    try:
-        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                             capture_output=True, text=True, timeout=15)
-        n = (out.stdout or "").strip()
-        if n and n.isdigit():
-            killed = int(n)
-            lf(f"ruoyi 残留 Firefox 强杀: {killed} 个进程(按路径 {norm})", "OK")
-    except Exception as exc:
-        lf(f"ruoyi 残留 Firefox 强杀失败: {type(exc).__name__}: {exc}", "WARN")
-
-    # Stop-Process 返回后 Windows 不一定立即释放 firefox 的 DLL/XPCOM 文件句柄,
-    # 紧接着启动下批次会撞文件锁。这里轮询等到进程对象真正消失再返回。
-    wait_total = max(0.0, float(RUOYI_FIREFOX_FORCEKILL_WAIT or 0.0))
-    if wait_total > 0:
-        deadline = time.time() + wait_total
-        while time.time() < deadline:
-            if _ruoyi_firefox_running_count_by_path() <= 0:
-                break
-            time.sleep(0.2)
-        still = _ruoyi_firefox_running_count_by_path()
-        if still > 0:
-            lf(f"ruoyi Firefox 强杀后仍有 {still} 个进程未退出(等 {wait_total:.1f}s 超时)", "WARN")
-    return killed
-
-
-def _kill_ruoyi_firefox_by_profile(profile_dir, timeout=8.0, log_fn=None):
-    """按 profile_dir 精准杀 firefox 进程树(主进程 + content/gpu 子进程),并等待全部退出。
-
-    ruyipage 的 quit() 只 terminate() 主进程,不杀子进程树;firefox 多进程子进程变孤儿后
-    继续占用 XPCOM 组件文件和 profile 目录,导致下个 run 启动撞文件锁 -> "Couldn't load XPCOM"。
-    本函数按命令行 --profile <profile_dir> 匹配所有相关 firefox.exe(子进程命令行同样带该参数),
-    taskkill /F 逐个杀,再轮询确认退出。按 profile_dir 唯一匹配(mkdtemp 唯一路径),不误杀其他 slot。
-
-    返回 (killed, all_gone)。"""
-    import json
-
-    lf = log_fn or log
-    path = os.path.abspath(str(profile_dir or "").strip())
-    if not path or not os.path.isabs(path):
-        return 0, True
-    needle = os.path.normpath(path).lower()
-
-    ps_list = (
-        "$ErrorActionPreference='SilentlyContinue';"
-        "Get-CimInstance Win32_Process | "
-        "Where-Object{$_.Name -eq 'firefox.exe'} | "
-        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-    )
-
-    def _match_pids():
-        try:
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_list],
-                                 capture_output=True, text=True, timeout=15)
-            raw = (out.stdout or "").strip()
-        except Exception:
-            return []
-        try:
-            data = json.loads(raw) if raw else []
-        except Exception:
-            return []
-        if isinstance(data, dict):
-            data = [data]
-        pids = []
-        for item in data:
-            try:
-                pid = int(item.get("ProcessId") or 0)
-            except (TypeError, ValueError):
-                pid = 0
-            if pid <= 0:
-                continue
-            cmd = str(item.get("CommandLine") or "").lower()
-            if needle in cmd:
-                pids.append(pid)
-        return pids
-
-    pids = _match_pids()
-    killed = 0
-    for pid in pids:
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-            killed += 1
-        except Exception:
-            pass
-
-    # 轮询等待该 profile 关联的 firefox 全部退出,确保 XPCOM/profile 文件句柄释放。
-    all_gone = True
-    wait_total = max(0.0, float(timeout or 0.0))
-    if wait_total > 0:
-        deadline = time.time() + wait_total
-        while time.time() < deadline:
-            if not _match_pids():
-                break
-            all_gone = False
-            time.sleep(0.2)
-        if _match_pids():
-            all_gone = False
-
-    if killed:
-        lf(f"ruoyi 按 profile 清 firefox 进程树: 杀 {killed} 个(run={os.path.basename(path)})", "OK")
-    if not all_gone:
-        lf(f"ruoyi 按 profile 清 firefox 仍有残留未退出(等 {wait_total:.1f}s 超时)", "WARN")
-    return killed, all_gone
-
-
-def _quit_browser_page(browser_page, tag="", timeout=BROWSER_QUIT_TIMEOUT):
-
-    if browser_page is None:
-
-        return True
-
-    done = threading.Event()
-
-
-
-    def _worker():
-
-        try:
-
-            wait_timeout = max(2.0, float(timeout or 0.0))
-
-            browser_page.quit(timeout=wait_timeout, force=True)
-
-        except Exception:
-
-            pass
-
-        finally:
-
-            done.set()
-
-
-
-    thread = threading.Thread(target=_worker, daemon=True)
-
-    thread.start()
-
-    wait_timeout = max(2.0, float(timeout or 0.0))
-
-    if done.wait(wait_timeout + 0.5):
-
-        return True
-
-    try:
-
-        browser_page.close()
-
-    except Exception:
-
-        pass
-
-    if tag:
-
-        log(f"  {tag} browser quit timed out after {wait_timeout:.1f}s; continue closing", "WARN")
-
-    return False
-
-
-
-
-
-def _install_shutdown_handlers():
-
-    global _SHUTDOWN_HANDLERS_INSTALLED
-
-    if _SHUTDOWN_HANDLERS_INSTALLED:
-
-        return
-
-
-
-    def _handle_shutdown(signum, _frame):
-
-        signame = str(signum)
-
-        try:
-
-            signame = signal.Signals(signum).name
-
-        except Exception:
-
-            pass
-
-        try:
-
-            log(f"收到 {signame}，先关闭 ruyi 浏览器再退出", "WARN")
-
-        except Exception:
-
-            pass
-
-        _close_tracked_browser_pages()
-
-        raise SystemExit(0)
-
-
-
-    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
-
-        sig = getattr(signal, sig_name, None)
-
-        if sig is None:
-
-            continue
-
-        try:
-
-            signal.signal(sig, _handle_shutdown)
-
-        except Exception:
-
-            continue
-
-    _SHUTDOWN_HANDLERS_INSTALLED = True
-
-
-
-
-
-def _pick_user_agent(idx=None):
-
-    """按任务序号轮询 UA；idx 为空时线程安全全局自增。"""
-
-    pool = _load_ua_pool()
-
-    if not pool:
-
-        return HEADLESS_USER_AGENT
-
-    if idx is not None:
-
-        try:
-
-            n = int(idx)
-
-        except Exception:
-
-            n = 1
-
-        n = max(1, n)
-
-        ua = pool[(n - 1) % len(pool)]
-
-        if n <= len(pool) or str(os.environ.get("OUTLOOK_RUOYI_UA_POOL", "") or "").strip():
-
-            return ua
-
-        cycle = (n - 1) // len(pool)
-
-        m = re.search(r"rv:(\d+)\.0\).*Firefox/(\d+)\.0", ua)
-
-        if not m:
-
-            return ua
-
-        ver = max(115, int(m.group(1)) - (cycle * len(pool)))
-
-        ua = re.sub(r"rv:\d+\.0", f"rv:{ver}.0", ua, count=1)
-
-        ua = re.sub(r"Firefox/\d+\.0", f"Firefox/{ver}.0", ua, count=1)
-
-        return ua
-
-    global _UA_RR_IDX
-
-    with _UA_RR_LOCK:
-
-        ua = pool[_UA_RR_IDX % len(pool)]
-
-        _UA_RR_IDX += 1
-
-        return ua
-
-
-
-
-
-def _mask_ua(ua):
-
-    raw = str(ua or "")
-
-    m = re.search(r"Firefox/([\d.]+)", raw)
-
-    ver = m.group(1) if m else "?"
-
-    return f"Firefox/{ver}"
-
-
-
-
-
-def _env_bool(name, default=False):
-
-    value = os.environ.get(name)
-
-    if value is None:
-
-        return bool(default)
-
-    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
-
-
-
-
+# C/F/E 全局状态:re-export 自新包 _state(单一源,跨模块同步)
+_UA_RR_LOCK = _ruyi_pkg._state._UA_RR_LOCK
+_UA_RR_IDX = _ruyi_pkg._state._UA_RR_IDX
+_ACTIVE_BROWSER_PAGES = _ruyi_pkg._state._ACTIVE_BROWSER_PAGES
+_ACTIVE_BROWSER_LOCK = _ruyi_pkg._state._ACTIVE_BROWSER_LOCK
+_SHUTDOWN_HANDLERS_INSTALLED = _ruyi_pkg._state._SHUTDOWN_HANDLERS_INSTALLED
+_ACTIVE_RUOYI_PROFILE_DIRS = _ruyi_pkg._state._ACTIVE_RUOYI_PROFILE_DIRS
+_ACTIVE_RUOYI_PROFILE_DIRS_LOCK = _ruyi_pkg._state._ACTIVE_RUOYI_PROFILE_DIRS_LOCK
+
+
+
+
+
+
+# _load_ua_pool / _track_browser_page / _untrack_browser_page / _close_tracked_browser_pages:
+# re-export 自新包(单一源)。新包 _load_ua_pool 读中性名 RUOYI_UA_POOL,
+# 上方 setdefault 已把 OUTLOOK_RUOYI_UA_POOL 提升到中性名,行为等价。
+_load_ua_pool = _ruyi_pkg._load_ua_pool
+_track_browser_page = _ruyi_pkg._track_browser_page
+_untrack_browser_page = _ruyi_pkg._untrack_browser_page
+_close_tracked_browser_pages = _ruyi_pkg._close_tracked_browser_pages
+
+# E 组 profile 清理:re-export 自新包(单一源,围栏重构去 ROOT 依赖)。
+# 调用方传 profile_root 或走 _state._PROFILE_ROOT(上方 set_profile_root 已注入业务根)。
+# _cleanup_stale_ruoyi_profile_root 的 max_age_sec 默认读 _state.RUOYI_PROFILE_STALE_SEC,
+# 兼容层已把旧名值同步写回 _state,行为等价。
+_cleanup_ruoyi_profile_root = _ruyi_pkg._cleanup_ruoyi_profile_root
+_cleanup_stale_ruoyi_profile_root = _ruyi_pkg._cleanup_stale_ruoyi_profile_root
+_cleanup_ruoyi_slot_root = _ruyi_pkg._cleanup_ruoyi_slot_root
+_cleanup_ruoyi_run_profile_dir = _ruyi_pkg._cleanup_ruoyi_run_profile_dir
+
+# G 组 firefox 进程树 kill:re-export 自新包(单一源,firefox_path 参数化,去 Administrator 硬编码)。
+# _ruoyi_firefox_running_count_by_path / _force_kill_ruoyi_firefox / _kill_ruoyi_firefox_by_profile
+# 默认 firefox_path=get_firefox_path()(PEP 562 延迟求值,读 RUOYI_FIREFOX_PATH)。
+_ruyi_firefox_running_count_by_path = _ruyi_pkg._ruoyi_firefox_running_count_by_path
+_force_kill_ruoyi_firefox = _ruyi_pkg._force_kill_ruoyi_firefox
+_kill_ruoyi_firefox_by_profile = _ruyi_pkg._kill_ruoyi_firefox_by_profile
+
+# F 组 page 生命周期/quit/shutdown + UA 选取:re-export 自新包(单一源)。
+# _quit_browser_page 默认 timeout 读 _state.BROWSER_QUIT_TIMEOUT(兼容层已同步)。
+# _install_shutdown_handlers 写 _state._SHUTDOWN_HANDLERS_INSTALLED(全局态单源)。
+# _pick_user_agent 读中性名 RUOYI_UA_POOL(上方 setdefault 已提升旧名),_UA_RR_IDX/LOCK 走 _state。
+_quit_browser_page = _ruyi_pkg._quit_browser_page
+_install_shutdown_handlers = _ruyi_pkg._install_shutdown_handlers
+_pick_user_agent = _ruyi_pkg._pick_user_agent
+
+# A 组纯函数:re-export 自新包(单一源,零业务依赖)。
+_mask_ua = _ruyi_pkg._mask_ua
+_env_bool = _ruyi_pkg._env_bool
 
 def _normalize_log_level(value, default="INFO"):
 
@@ -1542,23 +881,8 @@ set_log_level(os.environ.get("OUTLOOK_LOG_LEVEL", "INFO"))
 
 
 
-def _browser_model_name(browser_path):
-
-    parts = [p for p in os.path.normpath(str(browser_path or "")).split(os.sep) if p]
-
-    for part in reversed(parts):
-
-        low = part.lower()
-
-        if low.startswith("firefox-") or "ruyi" in low:
-
-            return part
-
-    return os.path.basename(str(browser_path or "")) or "unknown"
-
-
-
-
+# A 组纯函数 _browser_model_name:re-export 自新包(单一源)。
+_browser_model_name = _ruyi_pkg._browser_model_name
 
 def _load_helpers():
 
@@ -1584,955 +908,37 @@ def _load_helpers():
 
 
 
-def _strip_proxy_scheme(value):
-
-    s = str(value or "").strip()
-
-    for pfx in ("socks5h://", "socks5://", "socks4://", "http://", "https://"):
-
-        if s.lower().startswith(pfx):
-
-            return s[len(pfx):]
-
-    return s
-
-
-
-
-
-def _proxy_url_to_ruoyi(value):
-
-    """Normalize proxy URL / user:pass@host:port / host:port to ruyipage format."""
-
-    raw = str(value or "").strip()
-
-    if not raw:
-
-        return ""
-
-    if "://" in raw:
-
-        try:
-
-            parsed = urllib.parse.urlsplit(raw)
-            scheme = str(parsed.scheme or "").strip().lower()
-
-            host = parsed.hostname or ""
-
-            port = parsed.port or 0
-
-            user = urllib.parse.unquote(parsed.username or "")
-
-            pwd = urllib.parse.unquote(parsed.password or "")
-
-            if scheme and host and port:
-
-                auth = f"{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pwd, safe='')}@" if (user or pwd) else ""
-
-                return f"{scheme}://{auth}{host}:{port}"
-
-        except Exception:
-
-            pass
-
-    s = _strip_proxy_scheme(raw).replace(",", "@", 1) if "@" not in raw and "," in raw else _strip_proxy_scheme(raw)
-
-    if "@" in s:
-
-        auth, hostport = s.rsplit("@", 1)
-
-        if ":" in auth and ":" in hostport:
-
-            user, pwd = auth.split(":", 1)
-
-            host, port = hostport.rsplit(":", 1)
-
-            return f"socks5://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pwd, safe='')}@{host}:{port}"
-
-    parts = s.split(":")
-
-    if len(parts) == 4:
-
-        host, port = parts[0], parts[1]
-        user = parts[2]
-        pwd = ":".join(parts[3:])
-        return f"socks5://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(pwd, safe='')}@{host}:{port}"
-
-    if len(parts) == 2 and parts[1].isdigit():
-
-        return f"socks5://{s}"
-
-    return ""
-
-
-
-
-
-def _parse_ruoyi_proxy(proxy_str):
-
-    s = str(proxy_str or "").strip()
-
-    if not s:
-
-        return None
-
-    if "://" in s:
-
-        try:
-
-            parsed = urllib.parse.urlsplit(s)
-            scheme = str(parsed.scheme or "").strip().lower() or "socks5"
-            host = parsed.hostname or ""
-            port = parsed.port or 0
-            user = urllib.parse.unquote(parsed.username or "")
-            pwd = urllib.parse.unquote(parsed.password or "")
-            if host and port:
-                return {"scheme": scheme, "host": host, "port": str(port), "username": user, "password": pwd}
-
-        except Exception:
-
-            pass
-
-    parts = s.split(":")
-
-    if len(parts) >= 4:
-
-        host, port = parts[0], parts[1]
-
-        user = parts[2]
-
-        pwd = ":".join(parts[3:])
-
-        return {"scheme": "socks5", "host": host, "port": port, "username": user, "password": pwd}
-
-    if len(parts) == 2 and parts[1].isdigit():
-
-        return {"scheme": "socks5", "host": parts[0], "port": parts[1], "username": "", "password": ""}
-
-    normalized = _proxy_url_to_ruoyi(s)
-
-    if normalized and normalized != s:
-
-        return _parse_ruoyi_proxy(normalized)
-
-    return None
-
-
-
-
-
-def mask_ruoyi_proxy(proxy_str):
-
-    p = _parse_ruoyi_proxy(proxy_str)
-
-    if not p:
-
-        return "***" if proxy_str else "noproxy"
-
-    auth = f"{p['username'][:8]}...@" if p.get("username") else ""
-
-    return f"{p.get('scheme') or 'http'}://{auth}{p['host']}:{p['port']}"
-
-
-
-
-
-def _proxy_host_port_key(proxy_str):
-
-    parsed = _parse_ruoyi_proxy(proxy_str)
-
-    if parsed and parsed.get("host") and parsed.get("port"):
-
-        return f"{parsed['host']}:{parsed['port']}"
-
-    return str(proxy_str or "").strip()
-
-
-def _proxy_identity_cache_get(proxy_str):
-
-    key = str(proxy_str or "").strip()
-
-    if not key:
-
-        return None
-
-    now = time.time()
-
-    with _CURRENT_IP_INFO_LOCK:
-
-        cached = _CURRENT_IP_INFO.get(key)
-
-        if not isinstance(cached, dict):
-
-            return None
-
-        expires_at = float(cached.get("expires_at") or 0.0)
-
-        if expires_at and expires_at < now:
-
-            _CURRENT_IP_INFO.pop(key, None)
-
-            return None
-
-        return dict(cached)
-
-
-def _proxy_identity_cache_put(proxy_str, identity):
-
-    key = str(proxy_str or "").strip()
-
-    if not key or not isinstance(identity, dict):
-
-        return identity
-
-    cached = dict(identity)
-
-    cached["expires_at"] = time.time() + max(1.0, float(PROXY_IDENTITY_CACHE_TTL or 1.0))
-
-    with _CURRENT_IP_INFO_LOCK:
-
-        _CURRENT_IP_INFO[key] = cached
-
-    return dict(cached)
-
-
-def _coerce_float_or_none(value):
-
-    try:
-
-        if value in (None, ""):
-
-            return None
-
-        return float(value)
-
-    except Exception:
-
-        return None
-
-
-def _geo_timezone_from_payload(payload):
-
-    timezone_value = payload.get("timezone")
-
-    if isinstance(timezone_value, dict):
-
-        timezone_value = (
-
-            timezone_value.get("id")
-
-            or timezone_value.get("name")
-
-            or timezone_value.get("timezone")
-
-            or ""
-
-        )
-
-    timezone_value = timezone_value or payload.get("time_zone") or ""
-
-    return str(timezone_value or "").strip()
-
-
-def _probe_proxy_identity(proxy_or_pool, timeout=PROXY_IDENTITY_TIMEOUT, use_cache=True):
-
-    if isinstance(proxy_or_pool, str):
-
-        proxy_str = str(proxy_or_pool or "").strip()
-
-        proxy_pool = [proxy_str] if proxy_str else []
-
-    else:
-
-        proxy_pool = list(proxy_or_pool or [])
-
-        proxy_str = str(proxy_pool[0] or "").strip() if proxy_pool else ""
-
-    if not proxy_str:
-
-        return None
-
-    if use_cache:
-
-        cached = _proxy_identity_cache_get(proxy_str)
-
-        if cached:
-
-            return cached
-
-    proxies = _proxy_for_ip_lookup(proxy_pool, "[proxy-id]")
-
-    session = requests.Session()
-
-    session.trust_env = False
-
-    request_timeout = max(0.1, float(timeout or PROXY_IDENTITY_TIMEOUT))
-
-    for source_name, ip_endpoint in IP_INFO_ENDPOINTS:
-
-        try:
-
-            resp = session.get(
-
-                ip_endpoint,
-
-                headers={"Accept": "application/json, text/plain;q=0.9, */*;q=0.8"},
-
-                proxies=proxies,
-
-                timeout=request_timeout,
-
-            )
-
-            resp.raise_for_status()
-
-            data = resp.json()
-
-            ip = str(data.get("ip") or data.get("query") or "").strip()
-
-            country = str(
-
-                data.get("country_name")
-
-                or data.get("country")
-
-                or data.get("countryCode")
-
-                or data.get("country_code")
-
-                or ""
-
-            ).strip()
-
-            if not ip:
-
-                continue
-
-            identity = {
-
-                "proxy": proxy_str,
-
-                "ip": ip,
-
-                "country": country,
-
-                "country_code": str(data.get("countryCode") or data.get("country_code") or data.get("country") or "").strip().upper(),
-
-                "timezone": _geo_timezone_from_payload(data),
-
-                "latitude": _coerce_float_or_none(data.get("latitude") or data.get("lat")),
-
-                "longitude": _coerce_float_or_none(data.get("longitude") or data.get("lon")),
-
-                "source": source_name,
-
-                "endpoint": ip_endpoint,
-
-                "exit_key": f"ip:{ip}",
-
-            }
-
-            return _proxy_identity_cache_put(proxy_str, identity) if use_cache else identity
-
-        except Exception:
-
-            continue
-
-    fallback = {
-
-        "proxy": proxy_str,
-
-        "ip": "",
-
-        "country": "",
-
-        "country_code": "",
-
-        "timezone": "",
-
-        "latitude": None,
-
-        "longitude": None,
-
-        "source": "fallback",
-
-        "endpoint": "",
-
-        "exit_key": f"proxy:{_proxy_host_port_key(proxy_str)}",
-
-    }
-
-    return _proxy_identity_cache_put(proxy_str, fallback) if use_cache else fallback
-
-
-def _proxy_exit_key(proxy_str, timeout=PROXY_IDENTITY_TIMEOUT, use_cache=True):
-
-    identity = _probe_proxy_identity(proxy_str, timeout=timeout, use_cache=use_cache)
-
-    if identity and identity.get("exit_key"):
-
-        return str(identity["exit_key"])
-
-    return f"proxy:{_proxy_host_port_key(proxy_str)}"
-
-
-
-
-def _parse_proxy_lines(lines, source_label):
-
-    out = []
-
-    for raw in lines or []:
-
-        ln = str(raw or "").strip().lstrip("\ufeff")
-
-        if not ln or ln.startswith("#"):
-
-            continue
-
-        normalized = _proxy_url_to_ruoyi(ln)
-
-        if not normalized:
-
-            log(f"跳过非法代理行({source_label}): {ln[:80]}", "WARN")
-
-            continue
-
-        out.append(normalized)
-
-    return out
-
-
-
-
-
-def parse_proxy_pool(path):
-
-    """读本地代理文件，支持 URL、user:pass@host:port、host:port。"""
-
-    if not path:
-
-        return []
-
-    if not os.path.isfile(path):
-
-        log(f"代理池文件不存在: {path}", "WARN")
-
-        return []
-
-    with open(path, "r", encoding="utf-8") as f:
-
-        return _parse_proxy_lines(f, path)
-
-
-
-
-
-def fetch_proxy_list_http(proxy_url, timeout=12):
-
-    proxy_url = str(proxy_url or "").strip()
-
-    if not proxy_url:
-
-        raise RuntimeError("OUTLOOK_PROXY_URL/--proxy-url 为空")
-
-    parsed = urllib.parse.urlsplit(proxy_url)
-
-    if str(parsed.scheme or "").lower() not in {"http", "https"} or not parsed.netloc:
-
-        raise RuntimeError(f"代理列表地址仅支持 http/https: {proxy_url}")
-
-    req = urllib.request.Request(proxy_url, headers={
-        "Accept": "text/plain, */*",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/138.0.0.0 Safari/537.36"
-        ),
-    })
-
-    # 强制直连拉列表:urllib 默认会吃 HTTP_PROXY/HTTPS_PROXY/WinIE 系统代理,
-    # 把这次拉代理的请求也送进本机代理(V2Ray/公司代理),端口拒绝就 WinError 10061。
-    # 这里用空 ProxyHandler 显式禁用代理,确保直连到代理池 API。
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    with opener.open(req, timeout=timeout) as resp:
-
-        data = resp.read().decode("utf-8", errors="replace")
-
-    return _parse_proxy_lines(data.splitlines(), proxy_url)
-
-
-
-
-
-def _proxy_source_label(args):
-
-    source = str(getattr(args, "proxy_source", "") or RUOYI_PROXY_SOURCE or "file").strip().lower()
-
-    if source in {"file", "http"}:
-
-        return source
-
-    return "file"
-
-
-
-
-
-def load_proxy_list(args):
-
-    """按当前来源加载代理 list。"""
-
-    source = _proxy_source_label(args)
-    proxy_url = str(getattr(args, "proxy_url", "") or PROXY_URL).strip()
-
-    if source == "http":
-
-        return fetch_proxy_list_http(proxy_url)
-
-    batch = parse_proxy_pool(getattr(args, "proxy_file", "") or PROXY_FILE)
-
-    if batch or not proxy_url:
-
-        return batch
-
-    log("proxy source=file 但本地代理文件为空，回退到 proxy-url HTTP 列表", "WARN")
-
-    return fetch_proxy_list_http(proxy_url)
-
-
-
-
-
-# 兼容旧名
-
-load_proxy_batch = load_proxy_list
-
-
-
-
-
-def build_proxy_source(args):
-
-    """兼容旧调用：返回当前来源的一批代理 list。"""
-
-    return load_proxy_list(args)
-
-
-
-
-
-class ConsumableProxyPool:
-
-    """任务级代理 list（就一个 list，不是消息队列）。
-
-
-
-    启动 load → 注册 pop 一条 → list 空了再 load → 任务停 clear。
-
-    加锁只是为了并发注册不抢同一条。
-
-    """
-
-
-
-    def __init__(self, source_args):
-
-        self.source_args = source_args
-
-        self.source = _proxy_source_label(source_args)
-
-        self._lock = threading.Lock()
-
-        self._list = []
-
-        self._active_exit_keys = set()
-
-        self._active_proxy_keys = {}
-
-
-
-    @classmethod
-
-    def from_args(cls, args):
-
-        source_args = SimpleNamespace(
-
-            proxy_file=getattr(args, "proxy_file", "") or PROXY_FILE,
-
-            proxy_source=getattr(args, "proxy_source", "") or RUOYI_PROXY_SOURCE,
-
-            proxy_url=getattr(args, "proxy_url", "") or PROXY_URL,
-
-        )
-
-        return cls(source_args)
-
-
-
-    def __bool__(self):
-
-        with self._lock:
-
-            return bool(self._list)
-
-
-
-    def remaining(self):
-
-        with self._lock:
-
-            return len(self._list)
-
-
-
-    def stats(self):
-
-        with self._lock:
-
-            return {
-                "remaining": len(self._list),
-                "source": self.source,
-                "active_exit_keys": len(self._active_exit_keys),
-            }
-
-
-
-    def _load_locked(self):
-
-        """文件 load / 接口重调，结果塞进 self._list。"""
-
-        try:
-
-            batch = load_proxy_list(self.source_args) or []
-
-        except Exception as exc:
-
-            log(f"proxy load failed ({self.source}): {type(exc).__name__}: {exc}", "WARN")
-
-            batch = []
-
-        # 启动只做 host:port 去重；出口 IP 延后到 take() 按需探测，避免启动前全量预检。
-
-        seen = set()
-
-        fresh = []
-
-        dup_host = 0
-
-        for p in batch:
-
-            p = str(p or "").strip()
-
-            if not p:
-
-                continue
-
-            parsed = _parse_ruoyi_proxy(p)
-
-            key = f"{parsed['host']}:{parsed['port']}" if parsed and parsed.get("host") and parsed.get("port") else p
-
-            if key in seen:
-
-                dup_host += 1
-
-                continue
-
-            seen.add(key)
-
-            fresh.append(p)
-
-        self._list.extend(fresh)
-
-        log(
-
-            f"proxy load source={self.source} got={len(fresh)} list={len(self._list)} dup_host={dup_host}",
-
-            "INFO" if fresh else "WARN",
-
-        )
-
-        return len(fresh)
-
-
-
-    def start(self):
-
-        """任务启动：初始化 list。"""
-
-        with self._lock:
-
-            self._list = []
-
-            self._load_locked()
-
-            if not self._list:
-
-                log(f"proxy list empty after start (source={self.source})", "WARN")
-
-            return self
-
-
-
-    def reload(self):
-
-        """list 空时重载：文件再读 / 接口再调。"""
-
-        with self._lock:
-
-            return self._load_locked()
-
-
-
-    def take(self):
-
-        """随机取一条未与当前活动出口 IP 冲突的代理并删除。"""
-
-        with self._lock:
-
-            if not self._list:
-
-                self._load_locked()
-
-            if not self._list:
-
-                return []
-
-            deferred = []
-
-            chosen = None
-
-            while self._list:
-
-                idx = random.randrange(len(self._list))
-
-                proxy = self._list.pop(idx)
-
-                exit_key = _proxy_exit_key(proxy)
-
-                if exit_key in self._active_exit_keys:
-
-                    deferred.append(proxy)
-
-                    continue
-
-                self._active_exit_keys.add(exit_key)
-
-                self._active_proxy_keys[proxy] = exit_key
-
-                chosen = proxy
-
-                break
-
-            if deferred:
-
-                self._list.extend(deferred)
-
-            if not chosen:
-
-                log("proxy take blocked: remaining proxies share active exit IPs", "WARN")
-
-                return []
-
-            log(f"proxy take -> {mask_ruoyi_proxy(chosen)} remaining={len(self._list)} active={len(self._active_exit_keys)}", "DEBUG")
-
-            return [chosen]
-
-    def release(self, proxy):
-
-        proxy = str(proxy or "").strip()
-
-        if not proxy:
-
-            return False
-
-        with self._lock:
-
-            exit_key = self._active_proxy_keys.pop(proxy, None) or _proxy_exit_key(proxy)
-
-            released = exit_key in self._active_exit_keys
-
-            self._active_exit_keys.discard(exit_key)
-
-            return released
-
-
-
-    def borrow_reuse(self):
-
-        """代理不足(take 返回 [])时强制复用池里任意一条。
-
-        不删除、不加入 _active_exit_keys、release 无效 -- 仅供并发 worker 数 > 代理数时共享出口 IP。
-
-        返回 [proxy] 或 []。"""
-
-        with self._lock:
-
-            if not self._list:
-
-                self._load_locked()
-
-            if not self._list:
-
-                return []
-
-            return [self._list[random.randrange(len(self._list))]]
-
-
-
-    def discard(self, proxy):
-
-        """永久移除一条代理(失效/不可用),不再分配。take 不会再取到它。"""
-
-        proxy = str(proxy or "").strip()
-
-        if not proxy:
-
-            return False
-
-        with self._lock:
-
-            exit_key = self._active_proxy_keys.pop(proxy, None) or _proxy_exit_key(proxy)
-
-            self._active_exit_keys.discard(exit_key)
-
-            try:
-
-                self._list.remove(proxy)
-
-            except ValueError:
-
-                pass
-
-            return True
-
-
-
-    def stop(self):
-
-        """任务结束：销毁 list。"""
-
-        with self._lock:
-
-            n = len(self._list)
-
-            self._list = []
-
-            self._active_exit_keys.clear()
-
-            self._active_proxy_keys.clear()
-
-            log(f"proxy list destroyed (cleared {n})", "INFO")
-
-
-
-
-
-_PROXY_LIST = None
-
-
-
-
-
-def get_consumable_proxy_pool():
-
-    return _PROXY_LIST
-
-
-
-
-
-def set_consumable_proxy_pool(pool):
-
-    """任务启动绑定 list，结束传 None。"""
-
-    global _PROXY_LIST
-
-    _PROXY_LIST = pool
-
-    return _PROXY_LIST
-
-
-
-
-
-# 兼容旧名
-
-def get_session_proxy_runtime():
-
-    return _PROXY_LIST
-
-
-
-
-
-def set_session_proxy_runtime(runtime):
-
-    return set_consumable_proxy_pool(runtime)
-
-
-
-
-
-SessionProxyRuntime = ConsumableProxyPool
-
-
-
-
-
-def select_proxy_for_account(proxy_pool=None, runtime=None):
-
-    """注册前从 list 取一条（取后删除）。"""
-
-    pool = runtime if runtime is not None else None
-
-    if pool is None and isinstance(proxy_pool, ConsumableProxyPool):
-
-        pool = proxy_pool
-
-    if pool is None:
-
-        pool = _PROXY_LIST
-
-    if isinstance(pool, ConsumableProxyPool):
-
-        return pool.take()
-
-    if not proxy_pool:
-
-        return []
-
-    items = list(proxy_pool)
-
-    if not items:
-
-        return []
-
-    return [items.pop(random.randrange(len(items)))]
-
-
-def release_proxy_for_account(proxy=None, proxy_pool=None, runtime=None):
-
-    pool = runtime if runtime is not None else None
-
-    if pool is None and isinstance(proxy_pool, ConsumableProxyPool):
-
-        pool = proxy_pool
-
-    if pool is None:
-
-        pool = _PROXY_LIST
-
-    if isinstance(pool, ConsumableProxyPool):
-
-        return pool.release(proxy)
-
-    return False
-
-
-
-
+# A/D/B 组代理工具 + 代理池 + IP/代理探测:re-export 自新包(单一源,零业务依赖)。
+# 池单例 _PROXY_LIST 经 _state 读写(get_consumable_proxy_pool/set_consumable_proxy_pool),
+# 兼容旧名 get_session_proxy_runtime/set_session_proxy_runtime 同源。
+# _probe_proxy_identity / _proxy_exit_key 默认 timeout 读 _state.PROXY_IDENTITY_TIMEOUT(已同步)。
+# load_proxy_batch = load_proxy_list 兼容旧名(新包已别名)。
+_strip_proxy_scheme = _ruyi_pkg._strip_proxy_scheme
+_proxy_url_to_ruoyi = _ruyi_pkg._proxy_url_to_ruoyi
+_parse_ruoyi_proxy = _ruyi_pkg._parse_ruoyi_proxy
+mask_ruoyi_proxy = _ruyi_pkg.mask_ruoyi_proxy
+_proxy_host_port_key = _ruyi_pkg._proxy_host_port_key
+_proxy_identity_cache_get = _ruyi_pkg._proxy_identity_cache_get
+_proxy_identity_cache_put = _ruyi_pkg._proxy_identity_cache_put
+_coerce_float_or_none = _ruyi_pkg._coerce_float_or_none
+_geo_timezone_from_payload = _ruyi_pkg._geo_timezone_from_payload
+_probe_proxy_identity = _ruyi_pkg._probe_proxy_identity
+_proxy_exit_key = _ruyi_pkg._proxy_exit_key
+_parse_proxy_lines = _ruyi_pkg._parse_proxy_lines
+parse_proxy_pool = _ruyi_pkg.parse_proxy_pool
+fetch_proxy_list_http = _ruyi_pkg.fetch_proxy_list_http
+_proxy_source_label = _ruyi_pkg._proxy_source_label
+load_proxy_list = _ruyi_pkg.load_proxy_list
+load_proxy_batch = _ruyi_pkg.load_proxy_batch
+build_proxy_source = _ruyi_pkg.build_proxy_source
+ConsumableProxyPool = _ruyi_pkg.ConsumableProxyPool
+get_consumable_proxy_pool = _ruyi_pkg.get_consumable_proxy_pool
+set_consumable_proxy_pool = _ruyi_pkg.set_consumable_proxy_pool
+get_session_proxy_runtime = _ruyi_pkg.get_session_proxy_runtime
+set_session_proxy_runtime = _ruyi_pkg.set_session_proxy_runtime
+SessionProxyRuntime = _ruyi_pkg.SessionProxyRuntime
+select_proxy_for_account = _ruyi_pkg.select_proxy_for_account
+release_proxy_for_account = _ruyi_pkg.release_proxy_for_account
 
 @contextmanager
 
@@ -3657,44 +2063,19 @@ def _context_text(ctx):
 
 
 
-def _try_option_call(obj, names, *args, **kwargs):
+# F 组 _try_option_call:re-export 自新包(单一源,纯函数)。register 内不再直接调用,
+# 仅为 unlock 等历史引用保留模块级名字。
+_try_option_call = _ruyi_pkg._try_option_call
 
-    for name in names:
-
-        fn = getattr(obj, name, None)
-
-        if not callable(fn):
-
-            continue
-
-        try:
-
-            fn(*args, **kwargs)
-
-            return True, name
-
-        except TypeError:
-
-            continue
-
-        except Exception:
-
-            return False, name
-
-    return False, ""
-
-
-
-
-# --- headless/anti-detect launch stack: re-exported from common.ruyi_browser (single source) ---
-_apply_ruoyi_quiet_prefs = _rb._apply_ruoyi_quiet_prefs
-_apply_ruoyi_headless_options = _rb._apply_ruoyi_headless_options
-_apply_ruoyi_browser_ua = _rb._apply_ruoyi_browser_ua
-_apply_ruoyi_headless_emulation = _rb._apply_ruoyi_headless_emulation
-_build_headless_patch_js = _rb._build_headless_patch_js
-RUOYI_HEADLESS_PATCH_JS = _rb.RUOYI_HEADLESS_PATCH_JS
-_ensure_ruoyi_headless_preload = _rb._ensure_ruoyi_headless_preload
-_apply_ruoyi_headless_page_patches = _rb._apply_ruoyi_headless_page_patches
+# --- headless/anti-detect launch stack: re-exported from common.ruyi (single source) ---
+_apply_ruoyi_quiet_prefs = _ruyi_pkg._apply_ruoyi_quiet_prefs
+_apply_ruoyi_headless_options = _ruyi_pkg._apply_ruoyi_headless_options
+_apply_ruoyi_browser_ua = _ruyi_pkg._apply_ruoyi_browser_ua
+_apply_ruoyi_headless_emulation = _ruyi_pkg._apply_ruoyi_headless_emulation
+_build_headless_patch_js = _ruyi_pkg._build_headless_patch_js
+RUOYI_HEADLESS_PATCH_JS = _ruyi_pkg.RUOYI_HEADLESS_PATCH_JS
+_ensure_ruoyi_headless_preload = _ruyi_pkg._ensure_ruoyi_headless_preload
+_apply_ruoyi_headless_page_patches = _ruyi_pkg._apply_ruoyi_headless_page_patches
 
 
 
@@ -5142,33 +3523,16 @@ def _wait_email_submit_outcome(page, timeout=5.0):
 
 
 
-def _all_contexts(page):
+# F 组 _all_contexts:re-export 自新包(单一源)。register 3 处调用仍按原名用。
+_all_contexts = _ruyi_pkg._all_contexts
 
-
-
-    contexts = [page]
-
-    try:
-
-        contexts.extend(page.get_all_frames() or [])
-
-    except Exception:
-
-        pass
-
-    return contexts
-
-
-
-
-
-# --- resource blocking: re-exported from common.ruyi_browser (single source) ---
-_RUOYI_RESOURCE_BLOCK_KINDS = _rb._RUOYI_RESOURCE_BLOCK_KINDS
-_RUOYI_RESOURCE_ALLOW_HOST_HINTS = _rb._RUOYI_RESOURCE_ALLOW_HOST_HINTS
-_RUOYI_TELEMETRY_HOSTS = _rb._RUOYI_TELEMETRY_HOSTS
-_RUOYI_RESOURCE_BLOCK_EXTS = _rb._RUOYI_RESOURCE_BLOCK_EXTS
-_ruoyi_should_block_resource_request = _rb._ruoyi_should_block_resource_request
-_start_ruoyi_resource_blocking = _rb._start_ruoyi_resource_blocking
+# --- resource blocking: re-exported from common.ruyi (single source) ---
+_RUOYI_RESOURCE_BLOCK_KINDS = _ruyi_pkg._RUOYI_RESOURCE_BLOCK_KINDS
+_RUOYI_RESOURCE_ALLOW_HOST_HINTS = _ruyi_pkg._RUOYI_RESOURCE_ALLOW_HOST_HINTS
+_RUOYI_TELEMETRY_HOSTS = _ruyi_pkg._RUOYI_TELEMETRY_HOSTS
+_RUOYI_RESOURCE_BLOCK_EXTS = _ruyi_pkg._RUOYI_RESOURCE_BLOCK_EXTS
+_ruoyi_should_block_resource_request = _ruyi_pkg._ruoyi_should_block_resource_request
+_start_ruoyi_resource_blocking = _ruyi_pkg._start_ruoyi_resource_blocking
 
 
 
@@ -8732,53 +7096,10 @@ def _wait_before_next_captcha_press(tag, reason="challenge failed"):
 
 
 
-def _proxy_for_ip_lookup(proxy_pool, tag):
-
-    if not proxy_pool:
-
-        return None
-
-    proxy_str = str(proxy_pool[0] or "").strip()
-
-    p = _parse_ruoyi_proxy(proxy_str)
-
-    if not p:
-
-        log(f"  {tag} IP probe proxy format invalid: {proxy_str[:80]!r}", "WARN")
-
-        return None
-
-    user = quote(p.get("username") or "", safe="")
-
-    pwd = quote(p.get("password") or "", safe="")
-
-    auth = f"{user}:{pwd}@" if (user or pwd) else ""
-
-    scheme = str(p.get("scheme") or "socks5").strip().lower() or "socks5"
-    if scheme in {"socks", "socks5"}:
-        scheme = "socks5h"
-    proxy_url = f"{scheme}://{auth}{p['host']}:{p['port']}"
-
-    return {"http": proxy_url, "https": proxy_url}
-
-
-
-def _log_current_ip(proxy_pool, tag):
-
-    identity = _probe_proxy_identity(proxy_pool, timeout=15)
-
-    if identity and identity.get("ip"):
-
-        country_text = str(identity.get("country") or "UNKNOWN").strip() or "UNKNOWN"
-
-        log(f"  {tag} current IP: {identity['ip']!r} country: {country_text!r} via {identity.get('source')}")
-
-        return
-
-    log(f"  {tag} current IP/country probe failed", "WARN")
-
-
-
+# B 组 IP/代理探测尾段:re-export 自新包(单一源)。
+# _proxy_for_ip_lookup / _log_current_ip:纯逻辑,日志走新包骨架 log。
+_proxy_for_ip_lookup = _ruyi_pkg._proxy_for_ip_lookup
+_log_current_ip = _ruyi_pkg._log_current_ip
 
 # _apply_ruoyi_proxy_geo_emulation 已移除:ruyipage 155 内核在 privileged scope 拒绝
 # emulation.setTimezoneOverride/setGeolocationOverride,且反复打 IP 查询服务只为设
@@ -8786,95 +7107,11 @@ def _log_current_ip(proxy_pool, tag):
 # 用于出口 IP 记录与去重。
 
 
-def _probe_proxy_before_browser(proxy_pool, tag, timeout=PROXY_PRECHECK_TIMEOUT):
-
-    proxies = _proxy_for_ip_lookup(proxy_pool, tag)
-
-    if not proxies:
-
-        return True
-
-    result = _probe_proxy_targets(proxy_pool, timeout=max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT)))
-
-    if result:
-
-        log(
-
-            f"  {tag} proxy precheck ok: target={result['url']} status={result['status_code']}",
-
-            "INFO",
-
-        )
-
-        return True
-
-    log(f"  {tag} proxy precheck failed: target unreachable via proxy targets={','.join(PROXY_PRECHECK_TARGETS)}", "WARN")
-
-    return False
-
-
-def _probe_proxy_targets(proxy_pool, timeout=PROXY_PRECHECK_TIMEOUT):
-
-    proxies = _proxy_for_ip_lookup(proxy_pool, "[proxy-precheck]")
-
-    if not proxies:
-
-        return None
-
-    session = requests.Session()
-
-    session.trust_env = False
-
-    request_timeout = max(0.1, float(timeout or PROXY_PRECHECK_TIMEOUT))
-
-    for target_url in PROXY_PRECHECK_TARGETS:
-
-        try:
-
-            resp = session.get(
-
-                target_url,
-
-                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-
-                proxies=proxies,
-
-                timeout=request_timeout,
-
-                allow_redirects=False,
-
-                stream=True,
-
-            )
-
-            status_code = int(getattr(resp, "status_code", 0) or 0)
-
-            try:
-
-                resp.close()
-
-            except Exception:
-
-                pass
-
-            if 100 <= status_code < 500:
-
-                return {
-
-                    "url": target_url,
-
-                    "status_code": status_code,
-
-                }
-
-        except Exception:
-
-            continue
-
-    return None
-
-
-
+# B 组代理预检:re-export 自新包(单一源)。targets 默认读 _state.PROXY_PRECHECK_TARGETS,
+# 兼容层已注入业务 signup.live.com targets;空 targets 时新包跳过预检返回 True。
+# timeout 默认读 _state.PROXY_PRECHECK_TIMEOUT(已同步业务值)。
+_probe_proxy_before_browser = _ruyi_pkg._probe_proxy_before_browser
+_probe_proxy_targets = _ruyi_pkg._probe_proxy_targets
 
 def _log_current_ip_async(proxy_pool, tag):
 

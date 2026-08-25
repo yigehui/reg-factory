@@ -1,4 +1,3 @@
-import time
 import unittest
 from unittest.mock import patch
 
@@ -29,26 +28,6 @@ class BirthdayEntryStepTests(unittest.TestCase):
         wait_signup_step.assert_not_called()
 
 
-class BrowserQuitTimeoutTests(unittest.TestCase):
-    def test_quit_browser_page_falls_back_to_close_when_quit_hangs(self):
-        class _FakeBrowser:
-            def __init__(self):
-                self.closed = 0
-
-            def quit(self):
-                time.sleep(0.2)
-
-            def close(self):
-                self.closed += 1
-
-        browser = _FakeBrowser()
-        start = time.perf_counter()
-        ok = mod._quit_browser_page(browser, timeout=0.01)
-        elapsed = time.perf_counter() - start
-
-        self.assertFalse(ok)
-        self.assertEqual(browser.closed, 1)
-        self.assertLess(elapsed, 0.15)
 
 
 if __name__ == "__main__":

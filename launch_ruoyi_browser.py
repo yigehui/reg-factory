@@ -74,7 +74,7 @@ _load_dotenv()
 import register_outlook_ruoyi as rr  # noqa: E402
 from ruyipage import FirefoxOptions, FirefoxPage  # noqa: E402
 
-from register_outlook_ruoyi import (  # noqa: E402
+from common.ruyi import (  # noqa: E402
     RUOYI_FIREFOX_PATH,
     _browser_model_name,
     _env_bool,

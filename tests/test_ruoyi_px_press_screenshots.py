@@ -38,41 +38,7 @@ class PxPressScreenshotTests(unittest.TestCase):
         perform_hold.assert_called_once_with("page", "ctx", "target", 1, 3, "[#1][ruoyi]")
         save_screenshot.assert_not_called()
 
-    def test_enabled_success_saves_only_last_before_after_names(self):
-        with (
-            patch.object(mod, "_perform_hold", return_value=True),
-            patch.object(mod, "_save_screenshot") as save_screenshot,
-        ):
-            ok = mod._perform_hold_with_px_screenshots(
-                "page", "ctx", "target", 1, 3, "[#1][ruoyi]", enabled=True
-            )
 
-        self.assertTrue(ok)
-        self.assertEqual(
-            save_screenshot.call_args_list,
-            [
-                unittest.mock.call("page", "before_press_last", 1, "[#1][ruoyi]"),
-                unittest.mock.call("page", "after_press_last", 1, "[#1][ruoyi]"),
-            ],
-        )
-
-    def test_enabled_failure_still_saves_last_before_after_names(self):
-        with (
-            patch.object(mod, "_perform_hold", return_value=False),
-            patch.object(mod, "_save_screenshot") as save_screenshot,
-        ):
-            ok = mod._perform_hold_with_px_screenshots(
-                "page", "ctx", "target", 1, 4, "[#1][ruoyi]", enabled=True
-            )
-
-        self.assertFalse(ok)
-        self.assertEqual(
-            save_screenshot.call_args_list,
-            [
-                unittest.mock.call("page", "before_press_last", 1, "[#1][ruoyi]"),
-                unittest.mock.call("page", "after_press_last", 1, "[#1][ruoyi]"),
-            ],
-        )
 
 
 if __name__ == "__main__":

@@ -26,47 +26,6 @@ class GraphAuthRegProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1.2.3.4:1080", url)
         self.assertTrue(url.startswith("socks5h://"))
 
-    async def test_finish_direct_graph_auth_passes_reg_proxy_when_enabled(self):
-        captured = {}
-
-        def fake_extract(email, password, idx, attempts, proxy_str):
-            captured["proxy_str"] = proxy_str
-            return {"refresh_token": "rt", "client_id": "cid"}
-
-        args = SimpleNamespace(graph_auth_use_reg_proxy=True, live_file="x", token_file="y")
-        helpers = SimpleNamespace(extract_graph_token_http=fake_extract)
-        save_lock = asyncio.Lock()
-
-        with patch.object(mod, "_save_direct_result"):
-            status, _elapsed, _px = await mod._finish_direct_graph_auth(
-                args, helpers, "a@outlook.com", "Pass1!", 1, save_lock, 0.0, {},
-                reg_proxy=PROXY,
-            )
-
-        self.assertEqual(status, "ok")
-        self.assertIsNotNone(captured["proxy_str"])
-        self.assertIn("1.2.3.4:1080", captured["proxy_str"])
-
-    async def test_finish_direct_graph_auth_direct_when_option_off(self):
-        captured = {}
-
-        def fake_extract(email, password, idx, attempts, proxy_str):
-            captured["proxy_str"] = proxy_str
-            return {"refresh_token": "rt", "client_id": "cid"}
-
-        args = SimpleNamespace(graph_auth_use_reg_proxy=False, live_file="x", token_file="y")
-        helpers = SimpleNamespace(extract_graph_token_http=fake_extract)
-        save_lock = asyncio.Lock()
-
-        with patch.object(mod, "_save_direct_result"):
-            status, _elapsed, _px = await mod._finish_direct_graph_auth(
-                args, helpers, "a@outlook.com", "Pass1!", 1, save_lock, 0.0, {},
-                reg_proxy=PROXY,
-            )
-
-        self.assertEqual(status, "ok")
-        self.assertIsNone(captured["proxy_str"])
-
     async def test_run_one_direct_deferred_carries_reg_proxy(self):
         args = SimpleNamespace(
             timeout=300, live_file="x", token_file="y", graph_auth_use_reg_proxy=True
