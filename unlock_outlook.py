@@ -558,6 +558,9 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
             _click_any(page, _CONTINUE_SELECTORS, timeout=2)
             time.sleep(3); continue
         if state == "logged_in":  return "already_ok"
+        if state == "login_error":
+            print(f"    [{tag}] 凭证错误,跳过(不等超时)", file=sys.stderr)
+            return "bad_credentials"
         if state == "sms_verify": return "needs_phone"
         if state == "fido_setup":
             _maybe_skip_passkey(page, tag); time.sleep(4)

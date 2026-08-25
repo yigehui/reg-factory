@@ -49,5 +49,27 @@ class ClassifyLoginErrorTests(unittest.TestCase):
         self.assertEqual(mod.classify(page), "email_form")
 
 
+class FastFailLoginErrorTests(unittest.TestCase):
+    def test_unlock_account_returns_bad_credentials_on_login_error(self):
+        """classify 首次即返回 login_error -> unlock_account 立即返回 bad_credentials,
+        不等 deadline。用 time 上下文证明没耗满 timeout。"""
+        import time as _time
+        page = _fake_page(text="Your account or password is incorrect.")
+        # fake page 的 run_js_loaded 返回错误文案(非空字符串),会让 _try_again_button_scan
+        # 误判"找到 Try again 按钮"返回 True(因为它用 run_js_loaded 当 JS 结果,bool(非空)=True),
+        # 进而主循环反复 _click_try_again_if_present -> continue 直到 deadline,
+        # 永远走不到 login_error 分支。故 patch 掉 snap(直接返回 login_error)与
+        # _click_try_again_if_present(返回 False,模拟没点到 Try again),让 unlock_account
+        # 首轮即进 login_error 分支验证快失败。
+        with patch.object(mod, "snap", return_value="login_error"), \
+             patch.object(mod, "_click_try_again_if_present", return_value=False):
+            t0 = _time.perf_counter()
+            outcome = mod.unlock_account(page, "x@outlook.com", "wrong", "w0", 0,
+                                         max_press=1, timeout=60)
+            elapsed = _time.perf_counter() - t0
+        self.assertEqual(outcome, "bad_credentials")
+        self.assertLess(elapsed, 10.0)  # 远小于 60s timeout,证明快失败
+
+
 if __name__ == "__main__":
     unittest.main()
