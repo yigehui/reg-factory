@@ -121,6 +121,14 @@ MAX_PROXY_RETRY = 3   # 代理无法访问微软时,换节点重开浏览器重�
 SAVE_DEBUG = _env_bool("OUTLOOK_UNLOCK_SAVE_DEBUG", False)
 
 
+def log(msg, level="INFO"):
+    """对齐 register log:时间戳 + 级别 + 消息,flush=True 让 webui SSE 实时收到。
+    不接业务关键词过滤(register 才有);解锁自建轻量版,单一来源在本文件。"""
+    import time as _t
+    ts = _t.strftime("%H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}", flush=True)
+
+
 # ── EZCaptcha PX API (fallback, 与原版一致)──────────────────────────
 def solve_px(page_url, app_id=PX_APP_ID, max_wait=90):
     try:
