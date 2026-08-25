@@ -1,11 +1,12 @@
 // reg-factory WebUI 前端逻辑（原生 JS，无构建）
 let SCRIPTS = [];
 let EMBEDS = [];
-let curRun = null;     // 当前运行 run_id
-let curSrc = null;     // 当前选中脚本
-let evtSrc = null;     // EventSource
+let curSrc = null;     // 当前选中脚本(表单)
 let smsTimer = null;   // 接码助手倒计时刷新
-let curSavedArgs = {}; // 当前脚本已保存的参数
+let curSavedArgs = {};
+// 每脚本独立日志:{ script_id: { lines: [], run_id: null, done: true, evt: null, cmd: '' } }
+let scriptLogs = {};
+let curLogScript = null;   // 当前日志区展示的脚本 id
 
 const $ = (s, r=document) => r.querySelector(s);
 const $$ = (s, r=document) => [...r.querySelectorAll(s)];
@@ -131,6 +132,21 @@ async function selectScript(id){
   $$('.scriptbtn').forEach(b=>b.classList.toggle('active', b.dataset.id===id));
   curSavedArgs = await loadScriptConfig(id);
   renderForm(curSrc, curSavedArgs);
+  showScriptLog(id);
+}
+
+// 把日志区切到某脚本:渲染该脚本缓存的 lines + 更新 title/cmd/stop 状态
+function showScriptLog(id){
+  curLogScript = id;
+  const log = $('#log');
+  const rec = scriptLogs[id];
+  log.textContent = rec && rec.lines.length ? rec.lines.join('\n') : '';
+  LogAutoScroll.scrollToBottom && LogAutoScroll.scrollToBottom(log);
+  log.scrollTop = log.scrollHeight;
+  const s = SCRIPTS.find(x=>x.id===id);
+  $('#log-title').textContent = `运行日志 — ${s ? s.title : id}`;
+  $('#cmd-preview').textContent = rec && rec.cmd ? '$ ' + rec.cmd : '';
+  $('#btn-stop').disabled = !(rec && rec.run_id && !rec.done);
 }
 
 // ---------------------------------------------------------------- 渲染表单
@@ -357,25 +373,34 @@ async function clearScriptConfig(){
 
 // ---------------------------------------------------------------- 运行 + SSE 日志
 async function runScript(){
-  if(curRun && evtSrc){ evtSrc.close(); }
+  const sid = curSrc.id;
+  // 同脚本若有未完成旧 run,先关旧 SSE(同脚本不并发跑两个)
+  const old = scriptLogs[sid];
+  if(old && old.evt){ old.evt.close(); old.evt = null; }
+  const rec = scriptLogs[sid] = scriptLogs[sid] || { lines: [], run_id: null, done: true, evt: null, cmd: '' };
+  if(rec.lines.length){ rec.lines.push('[webui] ===== 重新运行 ====='); }
   const args = collectArgs(curSrc);
-  const log = $('#log'); log.textContent='';
-  $('#log-title').textContent = `运行日志 — ${curSrc.title}`;
   const r = await (await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({script:curSrc.id, args})})).json();
-  if(r.error){ log.textContent='错误: '+r.error; return; }
-  curRun = r.run_id;
-  $('#cmd-preview').textContent = '$ '+r.cmd;
-  $('#btn-stop').disabled = false;
-  evtSrc = new EventSource(`/api/logs/${curRun}`);
-  evtSrc.onmessage = e=>{ LogAutoScroll.appendLogLineWithAutoScroll(log, e.data); };
-  evtSrc.addEventListener('done', ()=>{ evtSrc.close(); $('#btn-stop').disabled = true; pollStatus(); });
-  evtSrc.onerror = ()=>{ evtSrc.close(); $('#btn-stop').disabled = true; };
+    body:JSON.stringify({script:sid, args})})).json();
+  if(r.error){ rec.lines.push('错误: '+r.error); showScriptLog(sid); return; }
+  rec.run_id = r.run_id; rec.done = false; rec.cmd = r.cmd;
+  showScriptLog(sid);
+  const log = $('#log');
+  rec.evt = new EventSource(`/api/logs/${rec.run_id}`);
+  rec.evt.onmessage = e=>{
+    rec.lines.push(e.data);
+    if(curLogScript === sid){ LogAutoScroll.appendLogLineWithAutoScroll(log, e.data); }
+  };
+  rec.evt.addEventListener('done', ()=>{ rec.evt.close(); rec.evt=null; rec.done=true;
+    if(curLogScript === sid){ $('#btn-stop').disabled = true; } pollStatus(); });
+  rec.evt.onerror = ()=>{ rec.evt.close(); rec.evt=null; rec.done=true;
+    if(curLogScript === sid){ $('#btn-stop').disabled = true; } };
 }
 
 $('#btn-stop').onclick = async ()=>{
-  if(!curRun) return;
-  await fetch(`/api/stop/${curRun}`,{method:'POST'});
+  const rec = curLogScript ? scriptLogs[curLogScript] : null;
+  if(!rec || !rec.run_id) return;
+  await fetch(`/api/stop/${rec.run_id}`,{method:'POST'});
   $('#btn-stop').disabled = true;
 };
 
