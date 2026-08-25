@@ -29,7 +29,7 @@ Output (unlock_results/):
   failed_*.txt            failed / timeout
 """
 
-import argparse, asyncio, os, signal, sys, time
+import argparse, asyncio, atexit, os, signal, sys, threading, time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -127,6 +127,72 @@ def log(msg, level="INFO"):
     import time as _t
     ts = _t.strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
+
+
+class _TeeStdout:
+    """把 stdout 同时写到原 stdout 和一个日志文件(线程安全)。"""
+
+    def __init__(self, original, file_handle):
+        self._original = original
+        self._fh = file_handle
+        self._lock = threading.Lock()
+
+    def write(self, s):
+        with self._lock:
+            try:
+                self._original.write(s)
+            except Exception:
+                pass
+            try:
+                self._fh.write(s)
+            except Exception:
+                pass
+
+    def flush(self):
+        with self._lock:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+            try:
+                self._fh.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return getattr(self._original, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._original.fileno()
+
+    def reconfigure(self, *a, **k):
+        try:
+            self._original.reconfigure(*a, **k)
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _install_run_log_tee():
+    """tee stdout 到 logs/<ts>.log,对齐 register。返回日志路径或 None。"""
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(log_dir, f"{ts}.log")
+        fh = open(path, "w", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStdout(sys.stdout, fh)
+        atexit.register(lambda: fh.close() if not fh.closed else None)
+        sys.stdout.write(f"===== 本次运行日志 {ts} =====\n")
+        return path
+    except Exception as exc:
+        try:
+            print(f"_install_run_log_tee failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+        return None
 
 
 # ── EZCaptcha PX API (fallback, 与原版一致)──────────────────────────
@@ -265,7 +331,7 @@ def snap(page, tag, name, idx):
         except Exception:
             pass
     state = classify(page)
-    print(f"    [{name}] {state}  {(page.url or '')[:60]}")
+    log(f"  [{name}] {state}  {(page.url or '')[:60]}")
     return state
 
 
@@ -539,6 +605,7 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
     if SAVE_DEBUG:
         os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     deadline = time.time() + timeout
+    t_login = time.perf_counter()
 
     # ── Step 1: Login ────────────────────────────────────────────────
     net_err_count = 0
@@ -567,7 +634,7 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
             time.sleep(3); continue
         if state == "logged_in":  return "already_ok"
         if state == "login_error":
-            print(f"    [{tag}] 凭证错误,跳过(不等超时)", file=sys.stderr)
+            log(f"  [{tag}] 凭证错误,跳过(不等超时)", "WARN")
             return "bad_credentials"
         if state == "sms_verify": return "needs_phone"
         if state == "fido_setup":
@@ -609,13 +676,19 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
             time.sleep(2)
 
     state = snap(page, tag, "L_final", idx)
-    if state == "logged_in":  return "already_ok"
-    if state == "sms_verify": return "needs_phone"
+    if state == "logged_in":
+        log(f"  [{tag}] step login: {time.perf_counter()-t_login:.2f}s")
+        return "already_ok"
+    if state == "sms_verify":
+        log(f"  [{tag}] step login: {time.perf_counter()-t_login:.2f}s")
+        return "needs_phone"
     if state == "fido_setup":
+        log(f"  [{tag}] step login: {time.perf_counter()-t_login:.2f}s")
         _maybe_skip_passkey(page, tag); time.sleep(4)
         return "unlocked"
 
     # ── Step 2: PX press-and-hold + unlock flow ──────────────────────
+    t_px = time.perf_counter()
     press_count   = 0
     no_btn_rounds = 0
     px_api_tried  = False
@@ -730,10 +803,15 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
             time.sleep(3)
 
     state = snap(page, tag, "U_final", idx)
-    if state == "logged_in":  return "unlocked"
+    if state == "logged_in":
+        log(f"  [{tag}] step px: {time.perf_counter()-t_px:.2f}s presses={press_count}")
+        return "unlocked"
     if state == "abuse":      return "failed_abuse"
-    if state == "sms_verify": return "needs_phone"
+    if state == "sms_verify":
+        log(f"  [{tag}] step px: {time.perf_counter()-t_px:.2f}s presses={press_count}")
+        return "needs_phone"
     if state == "fido_setup":
+        log(f"  [{tag}] step px: {time.perf_counter()-t_px:.2f}s presses={press_count}")
         _maybe_skip_passkey(page, tag); time.sleep(4)
         return "unlocked"
     return f"failed_{state}"
@@ -755,7 +833,7 @@ async def _attempt_account(pool, worker_id, args, concurrency, tag, email, passw
             reused = bool(selected_pool)
         masked = mask_ruoyi_proxy(selected_pool[0]) if selected_pool else "noproxy"
         rem = pool.remaining() if hasattr(pool, "remaining") else "?"
-        print(f"[worker-{worker_id}] proxy -> {masked} remaining={rem}{' [reused]' if reused else ''}")
+        log(f"[w{worker_id}] proxy -> {masked} remaining={rem}{' [reused]' if reused else ''}")
 
     # 代理预检(开浏览器前):走代理打 login.live.com / signup.live.com,
     # 不通直接 proxy_dead -> 末尾 discard 节点换新重试,不浪费浏览器窗口。
@@ -765,10 +843,10 @@ async def _attempt_account(pool, worker_id, args, concurrency, tag, email, passw
             precheck_ok = await asyncio.to_thread(
                 _probe_proxy_before_browser, selected_pool, f"[{tag}][precheck]")
         except Exception as exc:
-            print(f"[worker-{worker_id}] proxy precheck error: {exc}", file=sys.stderr)
+            log(f"[w{worker_id}] proxy precheck error: {exc}", "WARN")
             precheck_ok = False
         if not precheck_ok:
-            print(f"[worker-{worker_id}] proxy precheck failed (login.live.com 不可达) -> proxy_dead", file=sys.stderr)
+            log(f"[w{worker_id}] proxy precheck failed (login.live.com 不可达) -> proxy_dead", "WARN")
             # discard 废代理(非 reused),让 worker 重试 take 换新节点;reused 不动(共享出口)
             if pool is not None and not reused and hasattr(pool, "discard"):
                 try: pool.discard(selected_pool[0])
@@ -780,7 +858,7 @@ async def _attempt_account(pool, worker_id, args, concurrency, tag, email, passw
         page = await asyncio.to_thread(
             launch_firefox, selected_pool, worker_id, args.headless, concurrency, tag)
     except Exception as e:
-        print(f"[worker-{worker_id}] launch error: {e}")
+        log(f"[w{worker_id}] launch error: {e}", "WARN")
         # launch 失败多半代理问题:discard 失效代理,return proxy_dead 让 worker 换节点重试(不当放弃)
         if pool is not None and selected_pool and not reused:
             if hasattr(pool, "discard"):
@@ -815,16 +893,17 @@ async def _attempt_account(pool, worker_id, args, concurrency, tag, email, passw
 async def worker(accounts, pool, worker_id, results, sem, args, concurrency):
     async with sem:
         tag = f"w{worker_id}"
-        for email, password, raw_line in accounts:
-            print(f"\n[worker-{worker_id}] {email}")
+        for acct_idx, (email, password, raw_line) in enumerate(accounts, 1):
+            t_acct = time.perf_counter()
+            log(f"========== 解锁 #{acct_idx}/{len(accounts)} [w{worker_id}] {email} ==========")
             outcome = await _attempt_account(pool, worker_id, args, concurrency, tag, email, password)
             # 代理无法访问微软 -> discard 失效节点 -> 换新节点重开浏览器重试
             retry = 0
             while outcome == "proxy_dead" and retry < MAX_PROXY_RETRY:
                 retry += 1
-                print(f"[worker-{worker_id}] 代理无法访问微软,换节点重试 {retry}/{MAX_PROXY_RETRY}", file=sys.stderr)
+                log(f"[w{worker_id}] 代理无法访问微软,换节点重试 {retry}/{MAX_PROXY_RETRY}", "WARN")
                 outcome = await _attempt_account(pool, worker_id, args, concurrency, tag, email, password)
-            print(f"[worker-{worker_id}] {email} => {outcome}")
+            log(f"[w{worker_id}] {email} => {outcome}  total={time.perf_counter()-t_acct:.2f}s")
             results.append((email, password, raw_line, outcome))
 
 
@@ -891,16 +970,18 @@ def save_results(results, ts):
                 f.write(f"{raw}----{outcome}\n")
         print(f"  {name:<22s} {len(rows):4d}  -> {p}")
 
-    print(f"\n{'='*55}")
+    log(f"{'='*55}")
     write("unlocked", unlocked)
     write("needs_phone", needs_ph)
     write("failed", failed)
-    print(f"{'─'*55}")
-    print(f"  Total     : {len(results)}")
-    print(f"  Unlocked  : {len(unlocked)}")
-    print(f"  NeedsPhone: {len(needs_ph)}")
-    print(f"  Failed    : {len(failed)}")
-    print(f"{'='*55}")
+    log(f"{'─'*55}")
+    log(f"  Total     : {len(results)}")
+    log(f"  Unlocked  : {len(unlocked)}")
+    log(f"  NeedsPhone: {len(needs_ph)}")
+    log(f"  Failed    : {len(failed)}")
+    log(f"{'='*55}")
+    log(f"SUMMARY: unlocked {len(unlocked)} | needs_phone {len(needs_ph)} | failed {len(failed)} | total {len(results)}")
+    log(f"SUMMARY_TIME: total_elapsed 0.00s")
 
     ok_path = os.path.join(OUTPUT_DIR, f"unlocked_clean_{ts}.txt")
     with open(ok_path, "w", encoding="utf-8") as f:
@@ -915,7 +996,7 @@ def build_pool(args):
     pool = ConsumableProxyPool.from_args(args).start()
     set_consumable_proxy_pool(pool)
     st = pool.stats() if hasattr(pool, "stats") else {}
-    print(f"[pool] source={st.get('source', args.proxy_source)} size={st.get('remaining', '?')}")
+    log(f"[pool] source={st.get('source', args.proxy_source)} size={st.get('remaining', '?')}")
     return pool
 
 
@@ -991,6 +1072,7 @@ def _install_force_shutdown():
 
 
 def main():
+    _install_run_log_tee()
     parser = argparse.ArgumentParser(
         description="Batch Outlook Account Unlock (ruyipage Firefox edition)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
