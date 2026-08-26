@@ -142,11 +142,15 @@ def _extract_run_counts(lines):
         (re.compile(r"exit\s+\(success=(\d+),\s*fail=(\d+)\)", re.I), "success_fail"),
         (re.compile(r"全部结束.*?成功\s+(\d+)\s+失败\s+(\d+)", re.I), "success_fail"),
         (re.compile(r"RESULTS:\s*(\d+)/(\d+)", re.I), "success_total"),
+        # unlock 三分类:unlocked / needs_phone / failed / total
+        (re.compile(r"SUMMARY:\s*unlocked\s+(\d+)\s*\|\s*needs_phone\s+(\d+)\s*\|\s*failed\s+(\d+)\s*\|\s*total\s+(\d+)", re.I), "unlock_three"),
     )
     time_patterns = (
         re.compile(r"汇总耗时:\s*任务总耗时\s*([0-9]+(?:\.[0-9]+)?)s\s*\|\s*成功账号平均耗时\s*([0-9]+(?:\.[0-9]+)?)s", re.I),
         re.compile(r"任务总耗时\s*([0-9]+(?:\.[0-9]+)?)s.*?成功账号平均耗时\s*([0-9]+(?:\.[0-9]+)?)s", re.I),
         re.compile(r"SUMMARY_TIME:\s*total_elapsed\s*([0-9]+(?:\.[0-9]+)?)s\s*\|\s*avg_success_elapsed\s*([0-9]+(?:\.[0-9]+)?)s", re.I),
+        # unlock SUMMARY_TIME 只有 total_elapsed(无 avg_success_elapsed),avg_success_elapsed 可选
+        re.compile(r"SUMMARY_TIME:\s*total_elapsed\s*([0-9]+(?:\.[0-9]+)?)s(?:\s*\|\s*avg_success_elapsed\s*([0-9]+(?:\.[0-9]+)?)s)?", re.I),
     )
     for line in reversed(lines or []):
         raw = str(line or "").strip()
@@ -155,7 +159,9 @@ def _extract_run_counts(lines):
                 time_match = time_regex.search(raw)
                 if time_match:
                     total_elapsed = float(time_match.group(1))
-                    avg_success_elapsed = float(time_match.group(2))
+                    g2 = time_match.group(2)
+                    if g2 is not None:
+                        avg_success_elapsed = float(g2)
                     break
         for regex, kind in patterns:
             match = regex.search(raw)
@@ -174,6 +180,14 @@ def _extract_run_counts(lines):
                 no_graph = int(match.group(3))
                 counts = {"success": success, "fail": fail, "no_graph": no_graph, "total": success + fail + no_graph}
                 break
+            if kind == "unlock_three":
+                # unlocked→success, needs_phone→no_graph(第三桶), failed→fail, total→total
+                success = int(match.group(1))   # unlocked
+                no_graph = int(match.group(2))   # needs_phone
+                fail = int(match.group(3))       # failed
+                total = int(match.group(4))       # total
+                counts = {"success": success, "fail": fail, "no_graph": no_graph, "total": total}
+                break
             if kind == "success_fail":
                 success = int(match.group(1))
                 fail = int(match.group(2))
@@ -185,7 +199,7 @@ def _extract_run_counts(lines):
             fail = int(explicit_fail) if explicit_fail is not None else max(total - success, 0)
             counts = {"success": success, "fail": fail, "no_graph": 0, "total": total}
             break
-        if counts and total_elapsed is not None and avg_success_elapsed is not None:
+        if counts and total_elapsed is not None:
             break
     if counts:
         if total_elapsed is not None:
