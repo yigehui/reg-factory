@@ -312,8 +312,14 @@ def classify(page):
     if "chrome-error://" in u or "about:neterror" in u: return "net_error"
     # 凭证错误:微软登录页标准文案(账号不存在 / 密码错误),优先于 login_form/email_form
     # 避免密码错误时反复重填等到超时;放这里在 error_page 之后(error_page 文案不同不冲突)。
+    # 文案以实测为准(2026-08):密码错误页 body.innerText 含 "That password is incorrect
+    # for your Microsoft account.";多次错误后微软回 "You've tried to sign in too many
+    # times with an incorrect account or password."。原 "your account or password is
+    # incorrect" 与微软实际文案不一致,故从未命中 -> 落 login_form 反复重填到超时。
     if any(x in t for x in [
         "we couldn't find an account",
+        "that password is incorrect",
+        "tried to sign in too many times",
         "your account or password is incorrect",
     ]): return "login_error"
     if "enter your password" in t:  return "login_form"

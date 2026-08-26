@@ -41,7 +41,16 @@ class ClassifyLoginErrorTests(unittest.TestCase):
         self.assertEqual(mod.classify(page), "login_error")
 
     def test_classify_login_error_wrong_password(self):
-        page = _fake_page(text="Your account or password is incorrect.")
+        # 微软密码错误页实测文案(2026-08):body.innerText 含该句,原 "your account or
+        # password is incorrect" 从未在真实页面出现,故不命中 -> 旧测试用例过但线上
+        # 仍反复重填到超时。现对齐实测文案。
+        page = _fake_page(text="That password is incorrect for your Microsoft account.")
+        self.assertEqual(mod.classify(page), "login_error")
+
+    def test_classify_login_error_throttled(self):
+        # 多次错误密码后微软回限流文案,同样应判 login_error 快失败,不反复重填。
+        page = _fake_page(text="You've tried to sign in too many times with an "
+                               "incorrect account or password.")
         self.assertEqual(mod.classify(page), "login_error")
 
     def test_classify_email_form_still_works(self):
@@ -54,7 +63,7 @@ class FastFailLoginErrorTests(unittest.TestCase):
         """classify 首次即返回 login_error -> unlock_account 立即返回 bad_credentials,
         不等 deadline。用 time 上下文证明没耗满 timeout。"""
         import time as _time
-        page = _fake_page(text="Your account or password is incorrect.")
+        page = _fake_page(text="That password is incorrect for your Microsoft account.")
         # fake page 的 run_js_loaded 返回错误文案(非空字符串),会让 _try_again_button_scan
         # 误判"找到 Try again 按钮"返回 True(因为它用 run_js_loaded 当 JS 结果,bool(非空)=True),
         # 进而主循环反复 _click_try_again_if_present -> continue 直到 deadline,
