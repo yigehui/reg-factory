@@ -137,6 +137,16 @@ from .launch import (
     _RUOYI_RESOURCE_BLOCK_EXTS,
 )
 
+# ── warmup:H 组首屏预热 + 挑战 cookie 种子池 ──
+from .warmup import (
+    CHALLENGE_COOKIE_ALLOWLIST,
+    SEED_TTL_SEC,
+    SEED_MAX_ENTRIES,
+    load_seed,
+    save_seed,
+    warmup,
+)
+
 # ── 可调常量(re-export 自 _state,便于 from common.ruyi import RUOYI_FIREFOX_EXIT_WAIT) ──
 from ._state import (
     IP_INFO_ENDPOINTS,
@@ -202,4 +212,7 @@ __all__ = [
     "_start_ruoyi_resource_blocking", "after_launch",
     "_RUOYI_RESOURCE_BLOCK_KINDS", "_RUOYI_RESOURCE_ALLOW_HOST_HINTS",
     "_RUOYI_TELEMETRY_HOSTS", "_RUOYI_RESOURCE_BLOCK_EXTS",
+    # warmup
+    "CHALLENGE_COOKIE_ALLOWLIST", "SEED_TTL_SEC", "SEED_MAX_ENTRIES",
+    "load_seed", "save_seed", "warmup",
 ]

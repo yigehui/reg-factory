@@ -144,6 +144,9 @@ EMAIL_REG = os.path.join(ROOT, "email_reg.txt")
 
 SIGNUP_URL = "https://signup.live.com/signup?lic=1"
 
+# warmup 首页:与 signup 同 eTLD+1(login.live.com),落地即种 PX/MS 挑战 cookie
+WARMUP_HOME_URL = "https://login.live.com/"
+
 
 def _ruoyi_profile_dir(opts, idx):
     """包装新包 _ruoyi_profile_dir:读本模块 RUOYI_PROFILE_ROOT(profile_root 注入),
@@ -7385,17 +7388,34 @@ def register_outlook(opts, proxy_pool, idx):
     # 默认开启;OUTLOOK_RUOYI_DIRECT_SIGNUP=0 关闭走原 about:blank 启动+导航流程。
     _direct_signup = _env_bool("OUTLOOK_RUOYI_DIRECT_SIGNUP", True)
 
-    if _direct_signup:
+    # 首屏 warmup:先落地 login.live.com 首页种下第一方挑战 cookie 再进注册页,
+    # 免"零 cookie 新浏览器直达注册页"触发挑战拦截。OUTLOOK_RUOYI_WARMUP=0 关闭。
+    _warmup_enabled = _env_bool("OUTLOOK_RUOYI_WARMUP", True)
+
+    _warmup_seed_enabled = _env_bool("OUTLOOK_RUOYI_WARMUP_SEED", True)
+
+    _launch_url = SIGNUP_URL if _direct_signup else ""
+
+    if _warmup_enabled:
+
+        # warmup 时启动 URL 换成首页(注册页导航延后到 warmup 之后)
+        _launch_url = WARMUP_HOME_URL
+
+    if _launch_url:
 
         try:
 
-            tb.set_argument(SIGNUP_URL)
+            tb.set_argument(_launch_url)
 
         except Exception as _e:
 
-            log(f"  {tag} set_argument(SIGNUP_URL) 失败,回退空白页启动: {_e}", "WARN")
+            log(f"  {tag} set_argument({_launch_url}) 失败,回退空白页启动: {_e}", "WARN")
 
             _direct_signup = False
+
+            _launch_url = ""
+
+            _warmup_enabled = False
 
 
 
@@ -7529,9 +7549,10 @@ def register_outlook(opts, proxy_pool, idx):
 
             log(f"  {tag} 使用当前打开页面承载注册页，不再新建 container tab")
 
-        if _direct_signup:
+        if _direct_signup and not _warmup_enabled:
 
             # 直接以 SIGNUP_URL 启动:Firefox 启动即注册页,跳过关空白页+page.get 导航
+            # warmup 模式启动 URL 是首页,注册页导航延后,warmup 之后走 open_signup
 
             signup_opened = True
 
@@ -7556,6 +7577,29 @@ def register_outlook(opts, proxy_pool, idx):
         _apply_ruoyi_headless_page_patches(page, tag, log_once=True, user_agent=user_agent)
 
         headless_patch_logged = True
+
+        if _warmup_enabled:
+
+            # 首屏预热:首页停留种第一方 cookie + 回灌同代理同UA种子(挑战 cookie 复用)
+            _warmup_seed_list = []
+
+            if _warmup_seed_enabled and selected_browser_proxy:
+
+                _warmup_seed_list = _ruyi_pkg.load_seed(
+                    "outlook", selected_browser_proxy, user_agent
+                )
+
+                if _warmup_seed_list:
+
+                    log(f"  {tag} 命中种子池: {len(_warmup_seed_list)} 条挑战 cookie 待回灌")
+                else:
+
+                    log(f"  {tag} 种子池未命中(新代理/UA 或已过期),本轮当探路")
+
+            _, step_timings["warmup"] = _timed_step(
+                tag, "warmup", _ruyi_pkg.warmup, page, tag,
+                home_url=WARMUP_HOME_URL, seed_cookies=_warmup_seed_list,
+            )
 
         if capture_har:
 
@@ -8534,6 +8578,20 @@ def register_outlook(opts, proxy_pool, idx):
             else:
 
                 har_collector.stop()
+
+        # 注册成功才入种子池:挑战 cookie 是"放行态"的凭证,失败实例的种子多半已烧穿,
+        # 灌给下轮只会带指纹矛盾。成功 = PX 已放行,此时采集最干净。
+        if success and page is not None and _warmup_seed_enabled:
+
+            try:
+
+                _ruyi_pkg.save_seed(
+                    page, "outlook", selected_browser_proxy, user_agent, tag
+                )
+
+            except Exception as exc:
+
+                log(f"  {tag} 种子入池失败: {type(exc).__name__}: {exc}", "WARN")
 
         if page is not None and browser_page is not None and page is not browser_page:
 
