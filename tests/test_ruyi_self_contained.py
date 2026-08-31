@@ -19,6 +19,8 @@ _ALLOWED_PREFIXES = (
     "os", "sys", "re", "json", "time", "threading", "signal", "shutil",
     "tempfile", "subprocess", "urllib", "datetime", "types",
     "ast", "unittest", "msvcrt", "random",
+    # chain.py(前置代理链中继)用到的标准库
+    "asyncio", "base64", "functools", "socket", "struct",
     # 第三方
     "ruyipage", "requests",
     # 包内自身

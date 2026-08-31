@@ -147,6 +147,16 @@ from .warmup import (
     warmup,
 )
 
+# ── chain:I 组前置代理链中继 ──
+from .chain import (
+    FRONT_PROXY_ENV,
+    ChainRelayHub,
+    ensure_front_relay,
+    front_proxy_raw,
+    front_relay_url,
+    parse_front_proxy,
+)
+
 # ── 可调常量(re-export 自 _state,便于 from common.ruyi import RUOYI_FIREFOX_EXIT_WAIT) ──
 from ._state import (
     IP_INFO_ENDPOINTS,
@@ -215,4 +225,7 @@ __all__ = [
     # warmup
     "CHALLENGE_COOKIE_ALLOWLIST", "SEED_TTL_SEC", "SEED_MAX_ENTRIES",
     "load_seed", "save_seed", "warmup",
+    # chain
+    "FRONT_PROXY_ENV", "ChainRelayHub", "ensure_front_relay",
+    "front_proxy_raw", "front_relay_url", "parse_front_proxy",
 ]

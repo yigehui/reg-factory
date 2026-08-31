@@ -233,6 +233,8 @@ SCRIPTS = [
              ],
              "help": "代理来源：file=本地文件随机取；http=HTTP GET 拉取 txt 列表后随机取"},
             {"flag": "--proxy-file", "type": "str", "default": "proxies_outlook.txt", "help": "代理池文件(每行一个 user:pass@host:port)"},
+            {"flag": "--front-proxy", "type": "str", "default": "",
+             "help": "前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。上游代理需外网 IP 才能连时用它链一跳；留空读 .env LAUNCH_FRONT_PROXY"},
             {"flag": "--timeout", "type": "int", "default": 300, "help": "单号超时(秒)"},
             {"flag": "--max-press", "type": "str", "default": "5", "help": "验证码按住次数上限"},
             {"flag": "--headless", "type": "bool", "default": False, "help": "无头模式"},
@@ -294,6 +296,8 @@ SCRIPTS = [
             {"flag": "--proxy-url", "type": "str", "default": "",
              "visible_if": {"flag": "--proxy-source", "equals": "http"},
              "help": "HTTP GET 代理列表地址(返回 txt,每行一条 user:pass@host:port)；仅 HTTP 列表 来源时使用"},
+            {"flag": "--front-proxy", "type": "str", "default": "",
+             "help": "前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。上游代理需外网 IP 才能连时用它链一跳；留空读 .env LAUNCH_FRONT_PROXY"},
             {"flag": "--concurrency", "type": "int", "default": 1, "help": "并发处理账号数"},
             {"flag": "--headless", "type": "bool", "default": False, "help": "无头模式启动 Firefox"},
             {"flag": "--max-press", "type": "int", "default": 5, "help": "单账号 PX 按住尝试次数上限"},
@@ -553,7 +557,7 @@ ENV_SCHEMA = [
         {"key": "LAUNCH_UPSTREAM_PROXY",
          "help": "上游代理(整浏览器走它)：http://user:pass@host:port 或 socks5://user:pass@host:port。WebUI「唤起 ruoyi 浏览器」/ CLI 不带 --proxy 时读这里"},
         {"key": "LAUNCH_FRONT_PROXY",
-         "help": "前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。上游代理需外网 IP 才能连时用它链一跳"},
+         "help": "前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。上游代理需外网 IP 才能连时用它链一跳；唤起浏览器/Outlook 自注册(ruoyi)/解锁(ruoyi) 三处通用"},
     ]},
 ]
 

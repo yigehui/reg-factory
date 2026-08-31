@@ -78,6 +78,8 @@ from common.ruyi import (
     _probe_proxy_before_browser,
     build_browser_options,
     after_launch,
+    front_relay_url,
+    front_proxy_raw,
 )
 from common.ruyi import _state as _ruyi_state
 
@@ -402,7 +404,7 @@ def _per_tab_format(proxy_str):
 
 
 # ── 浏览器启动 (参考 ruyi register_outlook :8844-8985, 精简)─────────
-def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
+def launch_firefox(proxy_pool, idx, headless, concurrency, tag, front_proxy=""):
     _install_shutdown_handlers()
     user_agent = _pick_user_agent(idx)
     opts = SimpleNamespace(concurrency=concurrency, ruoyi_slot=None)
@@ -413,18 +415,29 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
     tb.set_profile(profile_dir)
 
     if proxy_pool:
+        # 前置代理(代理链):上游需外网 IP 才能连时,本地起 SOCKS5 中继链一跳,
+        # 映射成 socks5://127.0.0.1:{port}:u:p(中继对任意账号放行,launch 同款)。
+        # front 空 → 走 _per_tab_format 原路径,行为不变。
         per_tab = []
         for p in proxy_pool:
-            try:
-                per_tab.append(_per_tab_format(p))
-            except ValueError as exc:
-                print(f"  {tag} 跳过不合规 per-tab 代理: {exc}", file=sys.stderr)
+            if front_proxy:
+                try:
+                    per_tab.append(front_relay_url(p, front=front_proxy, per_tab=True, tag=tag))
+                except ValueError as exc:
+                    print(f"  {tag} 跳过不合规 per-tab 代理: {exc}", file=sys.stderr)
+            else:
+                try:
+                    per_tab.append(_per_tab_format(p))
+                except ValueError as exc:
+                    print(f"  {tag} 跳过不合规 per-tab 代理: {exc}", file=sys.stderr)
         if per_tab:
             tb.set_per_tab_proxies(per_tab, exhausted="wrap")
             print(f"  {tag} 挂载 {len(per_tab)}/{len(proxy_pool)} 条代理到 per-tab 池(wrap)")
         else:
             print(f"  {tag} 代理池归一化后为空 -- 本机直连", file=sys.stderr)
     else:
+        if front_proxy:
+            print(f"  {tag} 前置代理已配但无上游代理,忽略前置", file=sys.stderr)
         print(f"  {tag} 没挂代理 -- 直接本机出口", file=sys.stderr)
 
     # 公共启动栈:UA + quiet_prefs + (无头)headless_options + set_argument(LOGIN_URL) 直接启动到登录页
@@ -451,7 +464,11 @@ def launch_firefox(proxy_pool, idx, headless, concurrency, tag):
     after_launch(page, tag=tag, user_agent=user_agent, block_resources=True, wait_loaded=False)
 
     if proxy_pool:
-        try: _log_current_ip(proxy_pool, tag)
+        try:
+            # front 开着时直连上游本就不通(白名单),IP 探测走中继链路
+            ip_pool = [front_relay_url(p, front=front_proxy, tag=tag) for p in proxy_pool] \
+                if front_proxy else proxy_pool
+            _log_current_ip(ip_pool, tag)
         except Exception: pass
 
     return page
@@ -757,7 +774,8 @@ async def _attempt_account(pool, worker_id, args, concurrency, tag, email, passw
     page = None
     try:
         page = await asyncio.to_thread(
-            launch_firefox, selected_pool, worker_id, args.headless, concurrency, tag)
+            launch_firefox, selected_pool, worker_id, args.headless, concurrency, tag,
+            front_proxy=front_proxy_raw(getattr(args, "front_proxy", "")))
     except Exception as e:
         print(f"[worker-{worker_id}] launch error: {e}")
         # launch 失败多半代理问题:discard 失效代理,return proxy_dead 让 worker 换节点重试(不当放弃)
@@ -993,6 +1011,10 @@ Examples:
     parser.add_argument("--proxy-url",
         default=os.environ.get("OUTLOOK_PROXY_URL", ""),
         help="HTTP GET 代理列表地址(返回 txt,每行一条;配合 --proxy-source=http)")
+    parser.add_argument("--front-proxy",
+        default=os.environ.get("LAUNCH_FRONT_PROXY", ""),
+        help="前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。"
+             "上游代理需外网 IP 才能连时用它链一跳；留空读 .env LAUNCH_FRONT_PROXY")
     parser.add_argument("--concurrency", "-c", type=int, default=1,
         help="Parallel workers (default: 1)")
     parser.add_argument("--headless", action="store_true",
@@ -1013,6 +1035,14 @@ Examples:
 
     set_log_level(args.log_level)
     _install_force_shutdown()
+    # 前置代理校验:非法直接退出(对齐 launch_ruoyi_browser / register 行为)
+    if str(getattr(args, "front_proxy", "") or "").strip():
+        from common.ruyi import parse_front_proxy
+        try:
+            parse_front_proxy(args.front_proxy)
+        except ValueError as exc:
+            print(f"[error] 非法 --front-proxy: {exc}", file=sys.stderr)
+            sys.exit(1)
     # --save-debug / env 在 import 期已读默认值,这里按 CLI 显式覆盖全局(供 snap/PX 截图用)
     global SAVE_DEBUG
     SAVE_DEBUG = bool(args.save_debug)

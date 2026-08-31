@@ -7116,11 +7116,19 @@ _log_current_ip = _ruyi_pkg._log_current_ip
 _probe_proxy_before_browser = _ruyi_pkg._probe_proxy_before_browser
 _probe_proxy_targets = _ruyi_pkg._probe_proxy_targets
 
-def _log_current_ip_async(proxy_pool, tag):
+def _log_current_ip_async(proxy_pool, tag, front_proxy=""):
 
     pool_snapshot = list(proxy_pool or [])
 
-
+    # 前置代理开着时把 pool 映射成本地中继 URL 再探测:
+    # 直连上游(白名单代理)本就不通,探测要走完整链路才知道真实出口。
+    if front_proxy:
+        try:
+            pool_snapshot = [
+                _ruyi_pkg.front_relay_url(p, front=front_proxy, tag=tag) for p in pool_snapshot
+            ]
+        except ValueError as exc:
+            log(f"  {tag} IP 探测前置链映射失败: {exc}", "WARN")
 
     def _worker():
 
@@ -7362,9 +7370,17 @@ def register_outlook(opts, proxy_pool, idx):
 
     selected_browser_proxy = str(proxy_pool[0] or "").strip() if proxy_pool else ""
 
+    # 前置代理(代理链):上游需外网 IP 才能连时,本地起 SOCKS5 中继链一跳。
+    # selected_browser_proxy 保持上游原形——种子池 key 与 reg_proxy 都按它取,跨进程稳定。
+    _front_proxy = _ruyi_pkg.front_proxy_raw(getattr(opts, "front_proxy", None))
+
+    if _front_proxy and not selected_browser_proxy:
+
+        log("前置代理已配但本账号无上游代理,忽略前置", "WARN")
+
     if selected_browser_proxy:
 
-        tb.set_proxy(selected_browser_proxy)
+        tb.set_proxy(_ruyi_pkg.front_relay_url(selected_browser_proxy, front=_front_proxy, tag=tag))
 
         # log(f"挂载浏览器代理: {mask_ruoyi_proxy(selected_browser_proxy)}")
 
@@ -7633,7 +7649,7 @@ def register_outlook(opts, proxy_pool, idx):
 
         )
 
-        _log_current_ip_async(proxy_pool, tag)
+        _log_current_ip_async(proxy_pool, tag, front_proxy=getattr(opts, "front_proxy", "") or "")
 
         _shot(page, "start", idx)
 
@@ -8718,6 +8734,8 @@ def _resolve_graph_auth_proxy(args_or_opts, reg_proxy, tag):
     返回传给 extract_graph_token_http 的 proxy_str（已归一化为 scheme://user:pass@host:port）。
 
     未开启选项或无代理时返回 None（直连，保持原行为）。
+
+    前置代理开着时:直连上游(白名单代理)本就不通,走本地中继 socks5h://127.0.0.1:{port}。
     """
 
     if not getattr(args_or_opts, "graph_auth_use_reg_proxy", False):
@@ -8727,6 +8745,22 @@ def _resolve_graph_auth_proxy(args_or_opts, reg_proxy, tag):
     if not reg_proxy:
 
         return None
+
+    _front = _ruyi_pkg.front_proxy_raw(getattr(args_or_opts, "front_proxy", None))
+
+    if _front:
+
+        try:
+
+            _hub = _ruyi_pkg.ensure_front_relay(_front, tag=tag)
+
+            _port = _hub.port_for(_ruyi_pkg.parse_front_proxy(reg_proxy))
+
+            return f"socks5h://127.0.0.1:{_port}"
+
+        except ValueError as exc:
+
+            log(f"{tag} graph 授权前置链映射失败,回退直连上游: {exc}", "WARN")
 
     proxies = _proxy_for_ip_lookup([reg_proxy], tag)
 
@@ -9242,6 +9276,10 @@ def main():
 
                     help="HTTP GET 代理列表地址，返回 txt；每行一个代理")
 
+    ap.add_argument("--front-proxy", default=os.environ.get("LAUNCH_FRONT_PROXY", ""),
+
+                    help="前置代理(本机可达)：socks5://127.0.0.1:10808 或 http://127.0.0.1:7897。上游代理需外网 IP 才能连时用它链一跳；留空读 .env LAUNCH_FRONT_PROXY")
+
     ap.add_argument("--count", "-n", type=int, default=1, help="注册次数(默认 1)")
 
     ap.add_argument("--concurrency", "-c", type=int, default=1, help="并发注册数(默认 1)")
@@ -9385,6 +9423,19 @@ def main():
     args = ap.parse_args()
 
     set_log_level(args.log_level)
+
+    # 前置代理校验：非法直接退出(对齐 launch_ruoyi_browser 行为)
+    if str(getattr(args, "front_proxy", "") or "").strip():
+
+        try:
+
+            _ruyi_pkg.parse_front_proxy(args.front_proxy)
+
+        except ValueError as exc:
+
+            log(f"非法 --front-proxy: {exc}", "ERR")
+
+            sys.exit(1)
 
     # CLI 覆盖环境，保证 _load_ua_pool / batch stagger 读到最新值
 
