@@ -127,6 +127,7 @@ from .launch import (
     RUOYI_HEADLESS_PATCH_JS,
     _ensure_ruoyi_headless_preload,
     _apply_ruoyi_headless_page_patches,
+    _apply_ruoyi_geo_emulation,
     _ruoyi_should_block_resource_request,
     _start_ruoyi_resource_blocking,
     after_launch,
@@ -137,13 +138,8 @@ from .launch import (
     _RUOYI_RESOURCE_BLOCK_EXTS,
 )
 
-# ── warmup:H 组首屏预热 + 挑战 cookie 种子池 ──
+# ── warmup:H 组首屏预热(种子池 load_seed/save_seed 已删:动态池下命中率 0%) ──
 from .warmup import (
-    CHALLENGE_COOKIE_ALLOWLIST,
-    SEED_TTL_SEC,
-    SEED_MAX_ENTRIES,
-    load_seed,
-    save_seed,
     warmup,
 )
 
@@ -218,13 +214,13 @@ __all__ = [
     "_apply_ruoyi_headless_options", "build_browser_options",
     "_apply_ruoyi_headless_emulation", "_build_headless_patch_js",
     "RUOYI_HEADLESS_PATCH_JS", "_ensure_ruoyi_headless_preload",
-    "_apply_ruoyi_headless_page_patches", "_ruoyi_should_block_resource_request",
+    "_apply_ruoyi_headless_page_patches", "_apply_ruoyi_geo_emulation",
+    "_ruoyi_should_block_resource_request",
     "_start_ruoyi_resource_blocking", "after_launch",
     "_RUOYI_RESOURCE_BLOCK_KINDS", "_RUOYI_RESOURCE_ALLOW_HOST_HINTS",
     "_RUOYI_TELEMETRY_HOSTS", "_RUOYI_RESOURCE_BLOCK_EXTS",
     # warmup
-    "CHALLENGE_COOKIE_ALLOWLIST", "SEED_TTL_SEC", "SEED_MAX_ENTRIES",
-    "load_seed", "save_seed", "warmup",
+    "warmup",
     # chain
     "FRONT_PROXY_ENV", "ChainRelayHub", "ensure_front_relay",
     "front_proxy_raw", "front_relay_url", "parse_front_proxy",

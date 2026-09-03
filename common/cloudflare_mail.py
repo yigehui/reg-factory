@@ -54,6 +54,17 @@ def _resolve_proxy():
     return _PROXY or os.environ.get("CF_MAIL_PROXY") or None
 
 
+def _timeouts():
+    """(connect, read) 超时元组。读超时默认 3s,可用 CF_MAIL_TIMEOUT 覆盖。
+    cf worker 健康时响应都在秒级,3s 足够;抖动时快速失败,
+    由 wait_for_code 的多轮重试兜底,不白白卡住收信轮询。"""
+    try:
+        read = float(os.environ.get("CF_MAIL_TIMEOUT") or 3)
+    except ValueError:
+        read = 3.0
+    return (3, read)
+
+
 def _cf_session():
     s = requests.Session()
     s.trust_env = False
@@ -122,7 +133,7 @@ def create_or_get_address(ms_email, verbose=True):
     body = {"enablePrefix": False, "name": name, "domain": domain}
     headers = _auth_headers(admin=admin, site_pass=site_pass)
     try:
-        resp = sess.post(url, json=body, headers=headers, timeout=30)
+        resp = sess.post(url, json=body, headers=headers, timeout=_timeouts())
     except Exception as e:
         raise RuntimeError(f"建 cf 邮箱请求失败: {e}")
     if resp.status_code == 200:
@@ -157,7 +168,7 @@ def _find_address_id(address):
     while offset < 20000:  # 上限保护
         try:
             resp = sess.get(f"{base}/admin/address", headers=headers,
-                            params={"limit": 100, "offset": offset}, timeout=30)
+                            params={"limit": 100, "offset": offset}, timeout=_timeouts())
         except Exception:
             return None
         if resp.status_code != 200:
@@ -192,7 +203,7 @@ def _reset_address_password(address, verbose=True):
     headers = _auth_headers(admin=admin, site_pass=site_pass)
     try:
         resp = sess.post(f"{base}/admin/address/{address_id}/reset_password",
-                         json={"password": hashed}, headers=headers, timeout=30)
+                         json={"password": hashed}, headers=headers, timeout=_timeouts())
     except Exception as e:
         if verbose:
             print(f"  [cf] 重设密码请求失败: {e}")
@@ -216,7 +227,7 @@ def list_addresses(ms_email=None):
     url = f"{base}/admin/address"
     headers = _auth_headers(admin=admin, site_pass=site_pass)
     try:
-        resp = sess.get(url, headers=headers, timeout=30)
+        resp = sess.get(url, headers=headers, timeout=_timeouts())
         if resp.status_code != 200:
             return []
         d = resp.json()
@@ -233,7 +244,7 @@ def fetch_parsed_mails(jwt, limit=20, offset=0, site_pass=None):
     sess = _cf_session()
     url = f"{base}/api/parsed_mails"
     headers = _auth_headers(jwt=jwt, site_pass=site_pass or sp)
-    resp = sess.get(url, headers=headers, params={"limit": limit, "offset": offset}, timeout=20)
+    resp = sess.get(url, headers=headers, params={"limit": limit, "offset": offset}, timeout=_timeouts())
     if resp.status_code == 200:
         return resp.json().get("results", [])
     if resp.status_code == 404:
@@ -248,7 +259,7 @@ def _fetch_raw_as_parsed(jwt, site_pass, limit=20):
     sess = _cf_session()
     url = f"{base}/api/mails"
     headers = _auth_headers(jwt=jwt, site_pass=site_pass or sp)
-    resp = sess.get(url, headers=headers, params={"limit": limit, "offset": 0}, timeout=20)
+    resp = sess.get(url, headers=headers, params={"limit": limit, "offset": 0}, timeout=_timeouts())
     if resp.status_code != 200:
         return []
     out = []
@@ -284,7 +295,7 @@ def fetch_admin_mails(address, limit=20, offset=0):
     sess = _cf_session()
     url = f"{base}/admin/mails"
     headers = _auth_headers(admin=admin, site_pass=site_pass)
-    resp = sess.get(url, headers=headers, params={"limit": limit, "offset": offset, "address": address}, timeout=20)
+    resp = sess.get(url, headers=headers, params={"limit": limit, "offset": offset, "address": address}, timeout=_timeouts())
     if resp.status_code != 200:
         raise RuntimeError(f"fetch_admin_mails {resp.status_code}: {resp.text[:200]}")
     return resp.json().get("results", [])
@@ -330,7 +341,8 @@ def wait_for_code(addr_or_jwt, sender_contains=("account-security-noreply", "mic
         except Exception as e:
             if verbose:
                 print(f"  [cf] 取信异常: {e}")
-            time.sleep(poll)
+            # 请求本身已耗掉 connect+read 超时,抖动时不再额外睡满 poll
+            time.sleep(1)
             continue
         for m in mails:
             mid = m.get("id", 0)
@@ -371,7 +383,7 @@ def _selftest():
     print(f"邮箱就绪: {test['address']}")
     # 校验 JWT
     sess = _cf_session()
-    r = sess.get(f"{base}/api/settings", headers=_auth_headers(jwt=jwt, site_pass=sp), timeout=20)
+    r = sess.get(f"{base}/api/settings", headers=_auth_headers(jwt=jwt, site_pass=sp), timeout=_timeouts())
     print(f"JWT 校验(/api/settings): {r.status_code} {r.text[:120]}")
 
 

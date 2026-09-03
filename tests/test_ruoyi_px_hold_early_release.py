@@ -84,6 +84,9 @@ class PxHoldEarlyReleaseTests(unittest.TestCase):
             def run_js_loaded(self, _script):
                 return {"id": "hidden-label", "text": "Press and hold", "display": "none", "visibility": "visible", "opacity": "1", "hidden": True}
 
+            # run_js 别名:热路径探测已切 run_js(不等 doc_loaded)
+            run_js = run_js_loaded
+
         state = mod._px_hold_instruction_state(_Ctx())
         self.assertEqual("none", (state or {}).get("display"))
         self.assertEqual("hidden-label", (state or {}).get("id"))

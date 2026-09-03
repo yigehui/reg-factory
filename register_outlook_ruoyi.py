@@ -2030,7 +2030,7 @@ def _body_text(page):
 
         try:
 
-            return page.run_js_loaded(script) or ""
+            return page.run_js(script) or ""
 
         except Exception:
 
@@ -2054,7 +2054,7 @@ def _context_text(ctx):
 
         try:
 
-            return ctx.run_js_loaded(script) or ""
+            return ctx.run_js(script) or ""
 
         except Exception:
 
@@ -2079,6 +2079,7 @@ _build_headless_patch_js = _ruyi_pkg._build_headless_patch_js
 RUOYI_HEADLESS_PATCH_JS = _ruyi_pkg.RUOYI_HEADLESS_PATCH_JS
 _ensure_ruoyi_headless_preload = _ruyi_pkg._ensure_ruoyi_headless_preload
 _apply_ruoyi_headless_page_patches = _ruyi_pkg._apply_ruoyi_headless_page_patches
+_apply_ruoyi_geo_emulation = _ruyi_pkg._apply_ruoyi_geo_emulation
 
 
 
@@ -6078,7 +6079,8 @@ return (() => {
 })()
 """ % (json.dumps(hold_patterns, ensure_ascii=True), json.dumps(challenge_patterns, ensure_ascii=True), json.dumps(done_patterns, ensure_ascii=True)))
     try:
-        target = ctx.run_js_loaded(script)
+        # run_js 不等 doc_loaded:此探测在主循环热路径逐 context 执行。
+        target = ctx.run_js(script)
     except Exception:
         return None
     if not isinstance(target, dict):
@@ -6154,7 +6156,7 @@ return (() => {
 
     try:
 
-        box = page.run_js_loaded(script)
+        box = page.run_js(script)
 
     except Exception:
 
@@ -6202,7 +6204,7 @@ return !!document.querySelector('iframe[src*="hsprotect.net"], iframe[src*="arko
 
 """
 
-        return bool(page.run_js_loaded(script))
+        return bool(page.run_js(script))
 
     except Exception:
 
@@ -6346,7 +6348,7 @@ return (() => {
 
         try:
 
-            if bool(ctx.run_js_loaded(script)):
+            if bool(ctx.run_js(script)):
 
                 return True
 
@@ -6427,7 +6429,7 @@ return (() => {
 })()
 """ % (json.dumps(target_id), center_x, center_y, json.dumps(hold_patterns, ensure_ascii=True)))
     try:
-        state = ctx.run_js_loaded(script)
+        state = ctx.run_js(script)
     except Exception:
         return None
     return state if isinstance(state, dict) else None
@@ -6482,7 +6484,7 @@ return (() => {
 })()
 """ % (json.dumps(target_id), json.dumps(hold_patterns, ensure_ascii=True)))
     try:
-        state = ctx.run_js_loaded(script)
+        state = ctx.run_js(script)
     except Exception:
         return None
     return state if isinstance(state, dict) else None
@@ -7408,8 +7410,6 @@ def register_outlook(opts, proxy_pool, idx):
     # 免"零 cookie 新浏览器直达注册页"触发挑战拦截。OUTLOOK_RUOYI_WARMUP=0 关闭。
     _warmup_enabled = _env_bool("OUTLOOK_RUOYI_WARMUP", True)
 
-    _warmup_seed_enabled = _env_bool("OUTLOOK_RUOYI_WARMUP_SEED", True)
-
     _launch_url = SIGNUP_URL if _direct_signup else ""
 
     if _warmup_enabled:
@@ -7559,6 +7559,10 @@ def register_outlook(opts, proxy_pool, idx):
         page = browser_page
         setattr(page, "_ruoyi_px_motion_profile", _new_ruoyi_px_motion_profile())
 
+        # TZ/locale 统一固定 US(2026-09-03 A/B:locale 随 IP 对齐无收益,见 launch.py 注)。
+        # userContexts scope 应用,不依赖出口探测,探测失败也生效。
+        _apply_ruoyi_geo_emulation(page, None, tag)
+
 
 
         if proxy_pool:
@@ -7596,25 +7600,12 @@ def register_outlook(opts, proxy_pool, idx):
 
         if _warmup_enabled:
 
-            # 首屏预热:首页停留种第一方 cookie + 回灌同代理同UA种子(挑战 cookie 复用)
-            _warmup_seed_list = []
-
-            if _warmup_seed_enabled and selected_browser_proxy:
-
-                _warmup_seed_list = _ruyi_pkg.load_seed(
-                    "outlook", selected_browser_proxy, user_agent
-                )
-
-                if _warmup_seed_list:
-
-                    log(f"  {tag} 命中种子池: {len(_warmup_seed_list)} 条挑战 cookie 待回灌")
-                else:
-
-                    log(f"  {tag} 种子池未命中(新代理/UA 或已过期),本轮当探路")
-
+            # 首屏预热:首页停留种第一方挑战 cookie。
+            # 种子池(load_seed 回灌)已删除:动态代理池下出口 IP 每次都变,
+            # (proxy, ua) 键永远 miss,8/30~9/2 日志实测命中率 0%。
             _, step_timings["warmup"] = _timed_step(
                 tag, "warmup", _ruyi_pkg.warmup, page, tag,
-                home_url=WARMUP_HOME_URL, seed_cookies=_warmup_seed_list,
+                home_url=WARMUP_HOME_URL, seed_cookies=None,
             )
 
         if capture_har:
@@ -7844,10 +7835,13 @@ def register_outlook(opts, proxy_pool, idx):
 
         while time.time() < deadline:
 
+            # patch 注入不等 doc_loaded(run_js 立即执行):patch 只 define 属性,
+            # 不需等加载。主循环每轮都走到这里,submit 后页面处于导航态时
+            # run_js_loaded 会卡 doc_loaded 轮询——并发下 BiDi 往返拥堵,
+            # 实测把 captcha 出现→press 拉长 ~20s。与 unlock 首屏同语义。
             _apply_ruoyi_headless_page_patches(
-
-                page, tag, log_once=(not headless_patch_logged), user_agent=user_agent
-
+                page, tag, log_once=(not headless_patch_logged), user_agent=user_agent,
+                wait_loaded=False,
             )
 
             headless_patch_logged = True
@@ -8594,20 +8588,6 @@ def register_outlook(opts, proxy_pool, idx):
             else:
 
                 har_collector.stop()
-
-        # 注册成功才入种子池:挑战 cookie 是"放行态"的凭证,失败实例的种子多半已烧穿,
-        # 灌给下轮只会带指纹矛盾。成功 = PX 已放行,此时采集最干净。
-        if success and page is not None and _warmup_seed_enabled:
-
-            try:
-
-                _ruyi_pkg.save_seed(
-                    page, "outlook", selected_browser_proxy, user_agent, tag
-                )
-
-            except Exception as exc:
-
-                log(f"  {tag} 种子入池失败: {type(exc).__name__}: {exc}", "WARN")
 
         if page is not None and browser_page is not None and page is not browser_page:
 

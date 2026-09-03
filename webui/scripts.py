@@ -509,10 +509,6 @@ ENV_SCHEMA = [
          "choices": [{"label": "开启", "value": "1"}, {"label": "关闭", "value": "0"}],
          "default": "1",
          "help": "ruoyi 注册首屏预热：先落地 login.live.com 首页停留 2-5s 种第一方挑战 cookie，再进注册页，免零 cookie 直达被 PX 拦。0=走原直达流程"},
-        {"key": "OUTLOOK_RUOYI_WARMUP_SEED", "type": "choice",
-         "choices": [{"label": "开启", "value": "1"}, {"label": "关闭", "value": "0"}],
-         "default": "1",
-         "help": "挑战 cookie 种子池：注册成功的实例把放行态挑战 cookie 按 (代理,UA) 入池，45 分钟内同代理同 UA 的新实例启动时回灌。需预热开启才有意义"},
     ]},
     {"group": "SUB2API(Codex 导入)", "items": [
         {"key": "SUB2API_URL", "help": "SUB2API 管理接口地址(用 --codex 时必填)"},

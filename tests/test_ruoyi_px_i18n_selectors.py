@@ -12,6 +12,9 @@ class _PlaywrightCtx:
     def run_js_loaded(self, script):
         return self.page.evaluate(f"() => {{ {script} }}")
 
+    # run_js 别名:热路径探测已切 run_js(不等 doc_loaded)
+    run_js = run_js_loaded
+
 
 class PxI18nSelectorTests(unittest.TestCase):
     @classmethod

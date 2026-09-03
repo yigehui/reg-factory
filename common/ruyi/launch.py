@@ -408,6 +408,48 @@ def _apply_ruoyi_headless_page_patches(page, tag=None, log_once=False, user_agen
     return ok_count
 
 
+# ── TZ/locale 跟随出口 IP ────────────────────────────────────────
+
+# 2026-09-03 两轮 A/B 验证(20+20 号):locale 随 IP 对齐(JP=ja-JP/KR=ko-KR)
+# 相比固定 Asia/Taipei+en-US 无统计差异(22.5% vs 33%),对齐假设不成立。
+# 统一固定 US profile:TZ=America/New_York + locale=en-US,与注册表单
+# Accept-Language: en-US 及 UA 一致,不再跟随出口国家。
+_GEO_FIXED_TZ = "America/New_York"
+_GEO_FIXED_LOCALE = "en-US"
+
+
+def _apply_ruoyi_geo_emulation(page, identity=None, tag=None):
+    """统一固定 US 时区/语言(America/New_York + en-US),不再跟随出口国家。
+
+    userContexts scope 实测可用(spike 2026-09-02);identity 参数保留兼容
+    旧调用签名,内容不再参与决策。探测失败/无代理也照样应用固定 profile。
+    """
+    if page is None:
+        return False
+    try:
+        from .._bidi import emulation as _bidi_emulation
+        from .._bidi import browsing_context as _bidi_context
+    except ImportError:
+        try:
+            from ruyipage._bidi import emulation as _bidi_emulation
+            from ruyipage._bidi import browsing_context as _bidi_context
+        except ImportError:
+            return False
+    try:
+        driver = page._driver._browser_driver
+        tree = _bidi_context.get_tree(driver, max_depth=0, root=page._context_id)
+        uc = (tree.get("contexts") or [{}])[0].get("userContext")
+        if not uc:
+            return False
+        _bidi_emulation.set_timezone_override(driver, timezone_id=_GEO_FIXED_TZ, user_contexts=[uc])
+        _bidi_emulation.set_locale_override(driver, locales=[_GEO_FIXED_LOCALE], user_contexts=[uc])
+        log(f"  {tag} geo emulation: TZ={_GEO_FIXED_TZ} locale={_GEO_FIXED_LOCALE} (fixed US)")
+        return True
+    except Exception as exc:
+        log(f"  {tag} geo emulation skipped: {type(exc).__name__}: {str(exc)[:120]}", "DEBUG")
+        return False
+
+
 # ── 资源拦截 ─────────────────────────────────────────────────────
 
 _RUOYI_RESOURCE_BLOCK_KINDS = ("image", "font", "media")
