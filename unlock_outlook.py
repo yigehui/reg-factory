@@ -155,12 +155,12 @@ def inject_px_solution(page, sol):
         for key in ['_pxCaptcha', '_px3', '_px2', '_pxhd', '_pxvid', '_pxde']:
             val = sol.get(key)
             if val:
-                page.run_js_loaded(
+                page.run_js(
                     f'document.cookie="{key}={val};domain=.live.com;path=/";'
                 )
         tok = sol.get("token") or sol.get("uuid")
         if tok:
-            page.run_js_loaded(
+            page.run_js(
                 'var h=document.querySelector(\'input[name="_pxCaptcha"]\');'
                 f'if(h){{h.value="{tok}";}}'
             )
@@ -206,13 +206,17 @@ def classify(page):
         except Exception:
             pass
         try:
-            heading_parts.append(ctx.run_js_loaded(
+            heading_parts.append(ctx.run_js(
                 "return Array.from(document.querySelectorAll('h1,h2')).map(e=>e.innerText||'').join('\\n');") or "")
         except Exception:
             pass
     t = ("\n".join(text_parts) + "\n" + "\n".join(heading_parts)).lower()
     u = (url or "").lower()
-    # PX 人工挑战优先:Abuse?id=389 等页可能内嵌 PX,要先按压而非点继续/跳过
+    # Something went wrong 优先:PX 文案常与其同页存在(错误页内嵌 PX/残留 iframe),
+    # 若判 px_challenge 则顶部 Try-again 扫描对其跳过、永不点重试(Try again 不是
+    # submit 按钮,PX 分支不会点它),只能死等 -> 先判 error_page 走 Try-again 流程。
+    if "something went wrong" in t: return "error_page"
+    # PX 人工挑战:Abuse?id=389 等页可能内嵌 PX,要先按压而非点继续/跳过
     if "let's prove you're human" in t or "press and hold" in t: return "px_challenge"
     # 解锁成功文案优先于 URL 判定(无论哪个页面/iframe 出现都算成功)
     if "account has been unblocked" in t:                  return "logged_in"
@@ -256,7 +260,7 @@ def snap(page, tag, name, idx):
 def clear_live_cookies(page):
     """账号间隔离:清 live.com 域 cookie,避免上个账号 session 残留。"""
     try:
-        page.run_js_loaded(
+        page.run_js(
             "document.cookie.split(';').forEach(function(c){"
             "var k=(c.split('=')[0]||'').trim(); if(!k) return;"
             "['','.live.com','login.live.com','account.live.com'].forEach(function(d){"
@@ -291,8 +295,7 @@ function(v) {
 """
     for ctx in _all_contexts(page):
         try:
-            fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
-            if fn(js, email):
+            if ctx.run_js(js, email):
                 return True
         except Exception:
             pass
@@ -329,7 +332,7 @@ def _page_go_back(page):
             except Exception:
                 pass
     try:
-        page.run_js_loaded("history.back();")
+        page.run_js("history.back();")
     except Exception:
         pass
 
@@ -343,19 +346,38 @@ def _try_again_button_scan(ctx):
     try:
         fn = getattr(ctx, "run_js", None) or ctx.run_js_loaded
         return bool(fn(
-            "var btns=Array.from(document.querySelectorAll('button,a,input[type=submit],input[type=button]'));"
             "var pats=['try again','try once more','retry','again','try','重试','再试一次','再试','重试一次'];"
+            "var patched=[];"
+            "// 1) 标准/类按钮元素直接扫 textContent"
+            "var btns=Array.from(document.querySelectorAll('button,a,input[type=submit],input[type=button],input[type=image],[role=button]'));"
             "for(var i=0;i<btns.length;i++){"
             "var tx=(btns[i].textContent||btns[i].innerText||btns[i].value||btns[i].getAttribute('aria-label')||'').trim().toLowerCase();"
             "if(!tx)continue;"
             "for(var j=0;j<pats.length;j++){if(tx.indexOf(pats[j])>=0){btns[i].click();return true;}}}"
+            "// 2) 兜底:扫任意叶节点文本含 'try again/重试' 的最小元素,向上找可点祖先点击"
+            "var all=Array.from(document.querySelectorAll('body *'));"
+            "for(var i=0;i<all.length;i++){"
+            "var e=all[i];if(e.offsetWidth<=0||e.offsetHeight<=0)continue;"
+            "var tx=(e.textContent||'').trim().toLowerCase();"
+            "if(!tx||tx.length>120)continue;"
+            "var hit=false;for(var j=0;j<pats.length;j++){if(tx===pats[j]||tx.indexOf(pats[j])>=0){hit=true;break;}}"
+            "if(!hit)continue;"
+            "// 向上找可点击祖先(button/a/[role=button]/带 onclick),找不到就地 click"
+            "var n=e,clickable=null,best=null;"
+            "while(n&&n!==document.body){"
+            "var t2=(n.tagName||'').toLowerCase();"
+            "var r2=(n.getAttribute('role')||'').toLowerCase();"
+            "if(t2==='button'||t2==='a'||r2==='button'||n.getAttribute('onclick')){clickable=n;break;}"
+            "if(t2==='div'||t2==='span'||t2==='li')best=n;"
+            "n=n.parentNode;}"
+            "(clickable||best||e).click();return true;}"
             "return false;"
         ))
     except Exception:
         return False
 
 
-def _click_try_again_if_present(page, wait_rounds=1, sleep=0.6):
+def _click_try_again_if_present(page, wait_rounds=1, sleep=0.6, tag=""):
     """跨所有 context(main+iframe)扫 'Try again' 等重试按钮并点击。找到返回 True。
 
     错误页的 Try again 按钮**晚于**"Something went wrong" 文案渲染(几百 ms~数秒),
@@ -364,11 +386,24 @@ def _click_try_again_if_present(page, wait_rounds=1, sleep=0.6):
     something went wrong 页常不触发 loaded,等会卡。
 
     顶部兜底(每轮主循环都跑)用默认 wait_rounds=1 单轮快扫(<50ms,无等待);
-    error_page 分支(确定有错误页)传 wait_rounds=3 轮等渲染(最坏 ~1.8s,只此一处值得)。"""
+    error_page 分支(确定有错误页)传 wait_rounds=3 轮等渲染(最坏 ~1.8s,只此一处值得)。
+
+    多线程并发下 BiDi 往返拥堵,SWW 页渲染/按钮出现更慢 -> 单轮/短轮询易 miss。
+    tag 传入时把每轮扫描命中/未命中打印出来,便于定位"Something went wrong 傻等"。"""
+    if tag and wait_rounds > 1:
+        print(f"    [{tag}] try-again scan start wait_rounds={wait_rounds}")
     for _ in range(max(1, wait_rounds)):
         for ctx in _all_contexts(page):
-            if _try_again_button_scan(ctx):
+            try:
+                hit = _try_again_button_scan(ctx)
+            except Exception:
+                hit = False
+            if hit:
+                if tag:
+                    print(f"    [{tag}] try-again HIT (ctx round {_})")
                 return True
+        if tag and wait_rounds > 1:
+            print(f"    [{tag}] try-again miss (round {_}) ctxs={len(_all_contexts(page))}")
         if wait_rounds > 1:
             time.sleep(sleep)
     return False
@@ -556,8 +591,10 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
     for i in range(20):
         if time.time() > deadline: return "timeout"
         state = snap(page, tag, f"L{i:02d}", idx)
-        # 任意页 something went wrong:先扫 Try again 按钮并点(px_challenge/loading 跳过)
-        if state not in ("px_challenge", "loading"):
+        # 任意页 something went wrong:先扫 Try again 按钮并点(loading 跳过;
+        # px_challenge 不跳过)——PX 文案残留/误判时 SWW 的 Try again 按钮仍要立即点,
+        # "Try again 不是 submit 按钮",scan 已覆盖 [role=button] 等宽 selector。
+        if state not in ("loading",):
             if _click_try_again_if_present(page):
                 print(f"    [{tag}] Try-again clicked (state={state})")
                 time.sleep(3); continue
@@ -580,7 +617,7 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
         if state == "error_page":
             # Something went wrong:跨 context 扫 Try again 按钮(按钮可能在 iframe,
             # 且晚于错误文案渲染,故带轮询)。扫到即点;扫不到才后退回退。
-            tried = _click_try_again_if_present(page, wait_rounds=3)
+            tried = _click_try_again_if_present(page, wait_rounds=8, tag=tag)
             if not tried:
                 _page_go_back(page)
             time.sleep(5 if tried else 3)
@@ -627,8 +664,10 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
         if state != "loading" and loading_wait_started is not None:
             loading_wait_started = None
 
-        # 任意页 something went wrong:先扫 Try again 按钮并点(px_challenge/loading 跳过)
-        if state not in ("px_challenge", "loading"):
+        # 任意页 something went wrong:先扫 Try again 按钮并点(loading 跳过;
+        # px_challenge 不跳过)——PX 文案残留/误判时 SWW 的 Try again 按钮仍要立即点,
+        # "Try again 不是 submit 按钮",scan 已覆盖 [role=button] 等宽 selector。
+        if state not in ("loading",):
             if _click_try_again_if_present(page):
                 print(f"    [{tag}] Try-again clicked (state={state})")
                 time.sleep(3); continue
@@ -660,7 +699,7 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
         if state == "error_page":
             # Something went wrong:跨 context 扫 Try again 按钮(按钮可能在 iframe,
             # 且晚于错误文案渲染,故带轮询)。扫到即点;扫不到才后退回退。
-            tried = _click_try_again_if_present(page, wait_rounds=3)
+            tried = _click_try_again_if_present(page, wait_rounds=8, tag=tag)
             if not tried:
                 _page_go_back(page)
             time.sleep(5 if tried else 3)
@@ -684,27 +723,33 @@ def unlock_account(page, email, password, tag, idx, max_press=DEFAULT_MAX_PRESS,
 
         if state == "px_challenge":
             if press_count < max_press:
-                # 等待找到真正按压按钮(#px-captcha 等)再按,不用 iframe-box fallback 急按
+                # 快速轮询找按压目标:短间隔重扫(0.5s),目标一就绪立即按。
+                # 不等固定 3s —— PX iframe 挂载慢时固定 3s 会让"点击等很久"。
                 ctx = None; target = None
-                for c in _all_contexts(page):
-                    try:
-                        t = _find_hold_target(c)
-                    except Exception:
-                        t = None
-                    if t and _target_quality(t) <= 5:
-                        ctx, target = c, t
+                for _scan in range(6):
+                    for c in _all_contexts(page):
+                        try:
+                            t = _find_hold_target(c)
+                        except Exception:
+                            t = None
+                        if t and _target_quality(t) <= 5:
+                            ctx, target = c, t
+                            break
+                    if target and ctx:
                         break
+                    time.sleep(0.5)
                 if target and ctx:
                     press_count += 1
                     held = _perform_hold_with_px_screenshots(
                         page, ctx, target, idx, press_count, tag, enabled=SAVE_DEBUG)
                     print(f"    held {held} (#{press_count})")
-                    _wait_before_next_captcha_press(tag, reason="unlock press")
                     no_btn_rounds = 0
+                    # 按压后走短实测重试间隙(PX 连续按压不可过密,保留)
+                    _wait_before_next_captcha_press(tag, reason="unlock press")
                 else:
                     no_btn_rounds += 1
                     print(f"    no hold target (round {no_btn_rounds})")
-                    time.sleep(3)
+                    time.sleep(1)
             elif not px_api_tried:
                 px_api_tried = True
                 print("    fallback: EZCaptcha PX API...")
@@ -789,10 +834,11 @@ async def _attempt_account(pool, worker_id, args, concurrency, tag, email, passw
         return "proxy_dead"
 
     try:
-        await asyncio.to_thread(clear_live_cookies, page)
+        # clear_live_cookies 走 run_js 秒回,直接同步调,不进默认线程池(省一次排队)
         outcome = await asyncio.to_thread(
-            unlock_account, page, email, password, tag, worker_id,
-            args.max_press, args.timeout)
+            lambda: (clear_live_cookies(page), unlock_account(
+                page, email, password, tag, worker_id,
+                args.max_press, args.timeout))[1])
     except Exception as e:
         outcome = f"error: {str(e)[:80]}"
     finally:
