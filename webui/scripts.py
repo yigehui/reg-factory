@@ -280,9 +280,8 @@ SCRIPTS = [
         "file": "register_github_ruoyi.py",
         "category": "单平台注册",
         "title": "GitHub 注册(ruoyi)",
-        "desc": "ruyipage Firefox BiDi 版 GitHub 注册；从 _outlook_pool 取号、SOCKS5 代理池、Arkose 打码(需配打码 key)。",
+        "desc": "ruyipage Firefox BiDi 版 GitHub 注册；从 _outlook_pool 取号、SOCKS5 代理池、自动接码、Arkose 打码(需配打码 key)。",
         "args": [
-            {"flag": "--auto", "type": "bool", "default": False, "help": "走完整流程(含取 launch code)"},
             {"flag": "--email", "type": "str", "default": "", "help": "指定邮箱(默认从 _outlook_pool 取)"},
             {"flag": "--password", "type": "str", "default": "", "help": "邮箱密码"},
             {"flag": "--count", "type": "int", "default": 1, "help": "注册数量"},

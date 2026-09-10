@@ -21,8 +21,7 @@ GitHub 专属(公共组件不覆盖,保留自 register_github.py):
   - cookie 落盘(适配 ruyipage get_cookies)
 
 用法:
-    python register_github_ruoyi.py                # 默认:填到验证步停下
-    python register_github_ruoyi.py --auto          # 试走完整流程
+    python register_github_ruoyi.py                # 完整流程(填表->接码->存号)
     python register_github_ruoyi.py --headless      # 无头
     python register_github_ruoyi.py --proxy-file proxies_github.txt
     python register_github_ruoyi.py --email a@b.com --password xxx   # 指定邮箱
@@ -1426,8 +1425,6 @@ def register_github(opts, proxy_pool, idx, runtime=None):
         timeout = float(REGISTER_TIMEOUT)
 
     is_headless = bool(getattr(opts, "headless", False))
-    auto = bool(getattr(opts, "auto", False))
-    keep = bool(getattr(opts, "keep", True))
     capture_har = False
 
     # UA 池
@@ -1730,19 +1727,14 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                     elif _submit_state == "captcha":
                         print("  ===== STEP-D: Arkose/octocaptcha 验证出现,打码 =====")
                         _shot(page, "06_CAPTCHA", idx)
-                        if auto:
-                            solved = solve_arkose(page, max_wait=200)
-                            print(f"  [5] 验证结果: {'通过(注入token)' if solved else '打码失败'}")
-                            if solved:
-                                time.sleep(6)
-                                _shot(page, "06b_after_solve", idx)
-                                continue
-                            _shot(page, "06b_solve_failed", idx)
+                        solved = solve_arkose(page, max_wait=200)
+                        print(f"  [5] 验证结果: {'通过(注入token)' if solved else '打码失败'}")
+                        if solved:
+                            time.sleep(6)
+                            _shot(page, "06b_after_solve", idx)
                             continue
-                        else:
-                            print("  [explore] 停在验证步,窗口保留。")
-                            failure_reason = "captcha_reached"
-                            break
+                        _shot(page, "06b_solve_failed", idx)
+                        continue
 
                     elif _submit_state == "spinner":
                         # octocaptcha spinner 在转 = 验证流程真在跑,等它出结果
@@ -1821,75 +1813,72 @@ def register_github(opts, proxy_pool, idx, runtime=None):
 
                 if _round >= 99:
                     return (email, gh_password, False, failure_reason)
-                if not _otp_reached and auto:
-                    # 兜底:没明确到接码页,按旧逻辑探一次验证码
+                if not _otp_reached:
+                    # 兜底:没明确到接码页,探一次验证码
                     has_captcha = _detect_captcha(page)
                     if not has_captcha:
                         print("  [5] no captcha detected at this point")
                         _shot(page, "06_no_captcha", idx)
 
-                if auto:
-                    # ===== STEP-D: 输入验证码 =====
-                    print("  ===== STEP-D: 取验证码并填入 =====")
+                # ===== STEP-D: 输入验证码 =====
+                print("  ===== STEP-D: 取验证码并填入 =====")
+                time.sleep(4)
+                pool_entry = {}
+                try:
+                    with open(next(f for f in sorted(glob.glob(os.path.join(POOL_DIR, "*.json")), reverse=True) if email in open(f, encoding='utf-8').read()), encoding="utf-8") as _f:
+                        pool_entry = json.load(_f)
+                except Exception:
+                    pass
+                code = _get_gh_code(page, email, password, pool_entry, max_wait=180,
+                                    received_after=_signup_started_at)
+                if code:
+                    print(f"  [STEP-D] got launch code: {code}")
+                    _fill(page, "css:input[autocomplete='one-time-code']", code, "otp")
+                    print("  [STEP-D] 验证码已填入,等待创建完成...")
                     time.sleep(4)
-                    pool_entry = {}
-                    try:
-                        with open(next(f for f in sorted(glob.glob(os.path.join(POOL_DIR, "*.json")), reverse=True) if email in open(f, encoding='utf-8').read()), encoding="utf-8") as _f:
-                            pool_entry = json.load(_f)
-                    except Exception:
-                        pass
-                    code = _get_gh_code(page, email, password, pool_entry, max_wait=180,
-                                        received_after=_signup_started_at)
-                    if code:
-                        print(f"  [STEP-D] got launch code: {code}")
-                        _fill(page, "css:input[autocomplete='one-time-code']", code, "otp")
-                        print("  [STEP-D] 验证码已填入,等待创建完成...")
-                        time.sleep(4)
-                        _shot(page, "09_after_code", idx)
-                    else:
-                        print("  [STEP-D] FAIL: 没收到验证码")
-
-                    # ===== STEP-E: 确认创建成功,保存账号 =====
-                    print("  ===== STEP-E: 确认创建成功,保存账号信息 =====")
-
-                    # 跳主页确认落域。判定要防假阳性:没到接码页 + 没拿到 code 时,
-                    # _gh_sess 只是匿名会话 cookie(实测 2026-09:整个 submit 循环卡
-                    # DataDome interstitial,照样能存 cookie,但账号根本没建)。
-                    try:
-                        page.get("https://github.com/")
-                        time.sleep(4)
-                    except Exception:
-                        pass
-                    _shot(page, "10_final", idx)
-                    # 登录态硬判定: logged_in cookie(GitHub 登录成功才种)
-                    _has_login_cookie = False
-                    try:
-                        _lc = page.run_js("return document.cookie.indexOf('logged_in=') >= 0;")
-                        _has_login_cookie = bool(_lc)
-                    except Exception:
-                        pass
-                    if not _otp_reached and not code and not _has_login_cookie:
-                        _final_body = _body_text(page).lower()
-                        _logged_in = any(k in _final_body for k in ["create repository", "new repository", "your repositories", "start a project"]) or _has_login_cookie
-                        if _logged_in:
-                            print("  [STEP-E] 主页已登录态(免接码路径)")
-                        else:
-                            print("  [STEP-E] FAIL: 没到接码页也没拿到 code,主页非登录态 —— 判失败")
-                            _save_github_cookies(page, email, gh_password)
-                            failure_reason = failure_reason or "no_otp_no_login"
-                            return (email, gh_password, False, failure_reason)
-
-                    # 保存 cookie
-                    key_val = _save_github_cookies(page, email, gh_password)
-                    if key_val:
-                        print("  ===== [STEP-E] OK: 账号创建成功,账号信息已保存 =====")
-                        success = True
-                        failure_reason = ""
-                        return (email, gh_password, success, "success")
-                    print("  [STEP-E] FAIL: 没拿到 session cookie")
-                    failure_reason = "no_session_cookie"
+                    _shot(page, "09_after_code", idx)
                 else:
-                    failure_reason = "form_done"
+                    print("  [STEP-D] FAIL: 没收到验证码")
+
+                # ===== STEP-E: 确认创建成功,保存账号 =====
+                print("  ===== STEP-E: 确认创建成功,保存账号信息 =====")
+
+                # 跳主页确认落域。判定要防假阳性:没到接码页 + 没拿到 code 时,
+                # _gh_sess 只是匿名会话 cookie(实测 2026-09:整个 submit 循环卡
+                # DataDome interstitial,照样能存 cookie,但账号根本没建)。
+                try:
+                    page.get("https://github.com/")
+                    time.sleep(4)
+                except Exception:
+                    pass
+                _shot(page, "10_final", idx)
+                # 登录态硬判定: logged_in cookie(GitHub 登录成功才种)
+                _has_login_cookie = False
+                try:
+                    _lc = page.run_js("return document.cookie.indexOf('logged_in=') >= 0;")
+                    _has_login_cookie = bool(_lc)
+                except Exception:
+                    pass
+                if not _otp_reached and not code and not _has_login_cookie:
+                    _final_body = _body_text(page).lower()
+                    _logged_in = any(k in _final_body for k in ["create repository", "new repository", "your repositories", "start a project"]) or _has_login_cookie
+                    if _logged_in:
+                        print("  [STEP-E] 主页已登录态(免接码路径)")
+                    else:
+                        print("  [STEP-E] FAIL: 没到接码页也没拿到 code,主页非登录态 —— 判失败")
+                        _save_github_cookies(page, email, gh_password)
+                        failure_reason = failure_reason or "no_otp_no_login"
+                        return (email, gh_password, False, failure_reason)
+
+                # 保存 cookie
+                key_val = _save_github_cookies(page, email, gh_password)
+                if key_val:
+                    print("  ===== [STEP-E] OK: 账号创建成功,账号信息已保存 =====")
+                    success = True
+                    failure_reason = ""
+                    return (email, gh_password, success, "success")
+                print("  [STEP-E] FAIL: 没拿到 session cookie")
+                failure_reason = "no_session_cookie"
 
     except Exception as e:
         import traceback
@@ -1994,8 +1983,6 @@ def main():
     parser = argparse.ArgumentParser(description="GitHub Auto Register (ruoyi)")
     parser.add_argument("--email", default=None)
     parser.add_argument("--password", default=None)
-    parser.add_argument("--auto", action="store_true")
-    parser.add_argument("--no-keep", action="store_true")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--count", "-n", type=int, default=1)
     parser.add_argument("--timeout", "-t", type=int, default=600)
@@ -2030,8 +2017,7 @@ def main():
         print(f"  proxy pool take -> {_ruyi_pkg.mask_ruoyi_proxy(proxy_pool[0]) if proxy_pool else 'none'} remaining={pool.remaining()}")
 
     print("=" * 56)
-    print(f"  GitHub Auto Register (ruoyi) auto={args.auto} headless={args.headless} "
-          f"keep={not args.no_keep} count={args.count}")
+    print(f"  GitHub Auto Register (ruoyi) headless={args.headless} count={args.count}")
     print("=" * 56)
 
     results = []
