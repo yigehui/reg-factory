@@ -1131,6 +1131,21 @@ def _sww_present(page):
     return bool(_js(page, _SWW_JS, loaded=False))
 
 
+def _username_taken_error(page):
+    """提交后立即查用户名被占报错。命中返回被占的名字,否则 None。
+    实测(probe901): submit 后 ~1s 报错即出现在 body ——
+    'Username github is not available'。"""
+    body = _body_text(page)
+    m = re.search(r"[Uu]sername\s+(\S+)\s+is not available", body)
+    if m:
+        return m.group(1)
+    low = body.lower()
+    if "username is already taken" in low or "username already exists" in low:
+        # 变体文案抠不出名字就返回空串(调用方仍换名)
+        return ""
+    return None
+
+
 def _click_try_again(page):
     """点页面上的 Try again/重试(unlock 侧同款病灶)。返回点到的文本或 ''。
     顶层 miss 后同样落到 DataDome iframe 里点(interstitial RETRY 在 iframe 内)。"""
@@ -1636,6 +1651,7 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                     # 提交后观察落点(最长 25s)
                     _submit_deadline = time.time() + 25
                     _submit_state = "unknown"
+                    _taken_name = None   # 提交后实时抓到的被占用户名
                     while time.time() < _submit_deadline:
                         time.sleep(2)
                         _u = _page_url(page)
@@ -1645,6 +1661,12 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                             except Exception:
                                 pass
                             _submit_state = "navigated"
+                            break
+                        # 实时抓用户名被占报错: probe901 实测 submit 后 ~1s 出现,
+                        # 提前跳出观察窗,不用等满 25s 再走 form_again 慢路径
+                        _taken_name = _username_taken_error(page)
+                        if _taken_name is not None:
+                            _submit_state = "username_taken"
                             break
                         try:
                             _em2 = page.ele("css:input#email", timeout=1)
@@ -1665,6 +1687,17 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                             break
                     print(f"  [4.{_round}] --- 落点判定: state={_submit_state} ---")
                     _shot(page, f"05_round{_round}", idx)
+
+                    if _submit_state == "username_taken":
+                        # 用户名被占:只换名 + 只重填 username 字段(email/password/
+                        # country 都还留着),立刻进下一轮 submit —— 不走全表单重填慢路径
+                        _old = _taken_name or username
+                        username = rand_username()
+                        print(f"  [4.{_round}] 用户名 '{_old}' 被占(提交后实时抓到) -> 换 '{username}',只重填 username")
+                        _fill(page, "css:input#login", username, "username")
+                        time.sleep(2.5)
+                        _shot(page, f"05r{_round}_username_swapped", idx)
+                        continue
 
                     if _submit_state == "form_again":
                         # 页面没跳转,回在表单页 —— 用户流程: 重填信息,继续下一轮 submit×3
