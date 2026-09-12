@@ -1165,6 +1165,39 @@ def _spinner_visible(page):
     return bool(_js(page, _SPINNER_JS, loaded=False))
 
 
+def _email_input_ready(page):
+    """表单 email 字段可见/可交互(填表就绪)。"""
+    try:
+        el = page.ele("css:input#email", timeout=1)
+        return bool(el and not isinstance(el, NoneElement))
+    except Exception:
+        return False
+
+
+def _wait_email_form(page, max_wait=10, poll=0.5):
+    """条件等待注册表单出现(替代固定 sleep)。表单在 or 超时,返回 bool。"""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if _email_input_ready(page):
+            return True
+        time.sleep(poll)
+    return False
+
+
+def _wait_arkose_ready(page, max_wait=10, poll=0.5):
+    """等 Arkose/octocaptcha enforcement 初始化(替代填表后的固定 sleep(10))。
+    命中即返回;超时也放行不阻塞(重填轮次 iframe 常驻,首轮也就几秒)。"""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            if _arkose_frames(page):
+                return True
+        except Exception:
+            pass
+        time.sleep(poll)
+    return False
+
+
 def _trigger_verify(page, url_before=None, max_clicks=3):
     """用户流程: 点 submit -> 页面没跳转就再点,循环 3 次。
     跳转(url 变化)或滑块出现 = 本阶段结束,交给外层状态机。
@@ -1257,40 +1290,93 @@ def _get_code_api(email, refresh_token, client_id, max_wait=120, received_after=
     return code
 
 
+def _tab_click_any(tab, selectors, timeout=2):
+    """container tab 里按选择器列表逐个找可点元素并点击。返回命中的选择器或 None。
+    选择器支持 'text:xxx' 与 'css:xxx'/'xpath:...' 前缀(ruyipage 原生语法)。"""
+    for sel in selectors:
+        el = None
+        try:
+            el = tab.ele(sel, timeout=timeout)
+        except Exception:
+            el = None
+        if el is None or isinstance(el, NoneElement):
+            continue
+        try:
+            el.click()
+            return sel
+        except Exception:
+            try:
+                el.run_js("function(){ this.click(); return true; }")
+                return sel
+            except Exception:
+                continue
+    return None
+
+
+# "Verify your email" 页(账号绑了辅助邮箱,微软默认往辅助邮箱发码)的
+# "改用密码登录"选择器 —— 对齐 unlock_outlook.py _USE_PASSWORD_SELECTORS。
+_USE_PASSWORD_SELECTORS = [
+    "text:Use your password", "text:Sign in with password",
+    "text:Use password instead", "text:使用密码登录", "text:用密码登录",
+    "css:a#proofDecline",
+]
+
+
 def _outlook_fetch_code_tab(page, email, password, max_wait=180):
     """在独立 container tab 登录 Outlook 取 GitHub launch code。
     设计:新建 container tab(独立 userContext),避免污染 GitHub 主会话的
-    登录态/cookie。复用 common/mailbox 的 Playwright 逻辑太重,这里精简适配。"""
+    登录态/cookie。登录流程对齐 unlock_outlook.py:
+      邮箱表单 → (可选)Verify your email 页点 "Use your password" → 密码表单
+      → 隐私/passkey/Stay signed in 中间页 → 收件箱扫码。
+    之前版本缺 "Use your password" 处理:绑了辅助邮箱的号卡在 proof 页,
+    永远到不了密码表单,取码必失败。"""
+    tab = None
     try:
         tab = page.new_container_tab(url="https://login.live.com/")
         time.sleep(4)
-        # email
-        ei = tab.ele("input[type='email'], input[name='loginfmt']")
+        # ── 邮箱表单 ──
+        ei = tab.ele("css:input[type='email'], input[name='loginfmt']")
         if ei and not isinstance(ei, NoneElement):
-            _fill(tab, "input[type='email'], input[name='loginfmt']", email, "outlook-email", settle=0.6)
-            # ruyipage 无 press():点 Next/#iNext 提交
+            _fill(tab, "css:input[type='email'], input[name='loginfmt']", email, "outlook-email", settle=0.6)
             nxt = _click_label_button(tab, "Next") or tab.ele("css:#iNext") or tab.ele("css:input[type='submit']")
             if nxt and not isinstance(nxt, NoneElement):
                 nxt.click()
             time.sleep(4)
-        # password
-        pi = tab.ele("input[type='password'], input[name='passwd']")
-        if pi and not isinstance(pi, NoneElement):
-            _fill(tab, "input[type='password'], input[name='passwd']", password, "outlook-pass", settle=0.6)
-            nxt = _click_label_button(tab, "Sign in") or tab.ele("css:#idSIButton9") or tab.ele("css:input[type='submit']")
-            if nxt and not isinstance(nxt, NoneElement):
-                nxt.click()
-            time.sleep(6)
-        # 过隐私/passkey 中间页
-        from ruyipage import NoneElement as _NE
-        for _ in range(6):
+        # ── 中间页状态机(邮箱提交后到进邮箱前):轮询处理 ──
+        # 可能依次出现:
+        #   1) Verify your email(绑辅助邮箱) → 点 "Use your password" 进密码表单
+        #   2) 密码表单 → 填密码提交
+        #   3) 隐私协议 / passkey / Stay signed in → 点同意/跳过/Yes
+        password_done = False
+        for _ in range(15):
             time.sleep(2)
-            cur_url = str(getattr(tab, "url", "") or "")
-            body = _body_text(tab).lower()[:400]
+            cur_url = str(getattr(tab, "url", "") or "").lower()
+            if "outlook.live.com/mail" in cur_url or "mail.live" in cur_url:
+                break  # 已进邮箱
+            body = _body_text(tab).lower()[:600]
+            # 1) Verify your email → 改用密码登录
+            if "verify your email" in body or "验证你的电子邮件" in body or "验证邮箱" in body:
+                hit = _tab_click_any(tab, _USE_PASSWORD_SELECTORS, timeout=2)
+                print(f"  [mail-tab] 辅助邮箱验证页, Use your password={hit or 'miss'}")
+                time.sleep(3)
+                continue
+            # 2) 密码表单(还没填过)
+            if not password_done:
+                pi = tab.ele("css:input[type='password'], input[name='passwd']")
+                if pi and not isinstance(pi, NoneElement):
+                    _fill(tab, "css:input[type='password'], input[name='passwd']", password, "outlook-pass", settle=0.6)
+                    nxt = _click_label_button(tab, "Sign in") or tab.ele("css:#idSIButton9") or tab.ele("css:input[type='submit']")
+                    if nxt and not isinstance(nxt, NoneElement):
+                        nxt.click()
+                    password_done = True
+                    print("  [mail-tab] 密码已提交")
+                    time.sleep(6)
+                    continue
+            # 3) 隐私/协议/passkey/保持登录 中间页
             clicked = False
             for label in ["Accept and continue", "Accept", "Agree and continue", "I agree", "Agree",
                           "接受并继续", "接受", "同意并继续", "同意", "Continue", "继续", "繼續", "Next", "OK",
-                          "Yes", "是", "确认", "確認"]:
+                          "Yes", "是", "确认", "確認", "Got it", "知道了"]:
                 b = _click_label_button(tab, label)
                 if b:
                     try:
@@ -1298,15 +1384,13 @@ def _outlook_fetch_code_tab(page, email, password, max_wait=180):
                     except Exception:
                         pass
             if not clicked:
-                for label in ["Skip", "跳过", "跳過", "Not now", "稍后", "稍後", "Maybe later", "暂时跳过"]:
+                for label in ["Skip", "跳过", "跳過", "Not now", "稍后", "稍後", "Maybe later", "暂时跳过", "No"]:
                     b = _click_label_button(tab, label)
                     if b:
                         try:
                             b.click(); clicked = True; break
                         except Exception:
                             pass
-            if "outlook" in cur_url or "mail.live" in cur_url:
-                break
         # 进收件箱
         tab.get("https://outlook.live.com/mail/0/")
         time.sleep(6)
@@ -1333,10 +1417,13 @@ def _outlook_fetch_code_tab(page, email, password, max_wait=180):
         print(f"  [mail-tab] error: {str(e)[:80]}")
         return None
     finally:
-        try:
-            tab.close()
-        except Exception:
-            pass
+        # 注意:tab 断连(PageDisconnectedError/WebSocket)时 close() 会再抛,
+        # finally 里不接住会替换掉正常 return,把异常炸回主循环废掉整个 run
+        if tab is not None:
+            try:
+                tab.close()
+            except Exception:
+                pass
 
 
 def _get_gh_code(page, email, password, pool_entry, max_wait=180, received_after=None):
@@ -1386,7 +1473,11 @@ def _save_github_cookies(page, email, gh_password):
     from datetime import datetime
     pdir = os.path.join("cookies", PLATFORM)
     os.makedirs(pdir, exist_ok=True)
-    cookies = page.get_cookies(True) or []
+    try:
+        cookies = page.get_cookies(True) or []
+    except Exception as e:
+        print(f"  save-cookies: get_cookies 失败({type(e).__name__}),跳过")
+        return None
     key_val = None
     found_names = []
     serializable = []
@@ -1632,9 +1723,11 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                 _uncheck_marketing(page)
                 _shot(page, "04_before_submit", idx)
 
-                # 等 Arkose enforcement 初始化
-                print("  [3.5] settling for Arkose enforcement to init...")
-                time.sleep(10)
+                # 等 Arkose enforcement 初始化(条件等待:iframe 就位即走,不再固定睡 10s)
+                print("  [3.5] waiting for Arkose enforcement...")
+                _t_ark = time.time()
+                _ark_ok = _wait_arkose_ready(page, max_wait=10)
+                print(f"  [3.5] arkose ready={_ark_ok} ({time.time()-_t_ark:.1f}s)")
 
                 # ===== 用户流程状态机 =====
                 # STEP A: 填表(上面已完成) -> 点 submit×3(没跳转就重点)
@@ -1749,9 +1842,10 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                         print("  ===== STEP B: 进入滑块页,找滑块位置,长按拖 240px =====")
                         if _solve_datadome_slider(page, max_wait=60, interstitial=True):
                             _shot(page, f"05r{_round}_slider_passed", idx)
-                            # 滑块过了后表单被清空要求重填(实测)——回到表单分支
-                            print(f"  [4.{_round}] 滑块通过,等待跳回填表页...")
-                            time.sleep(3)
+                            # 滑块过了后表单被清空要求重填(实测)——条件等表单出现再进重填
+                            _t_sf = time.time()
+                            _form_back = _wait_email_form(page, max_wait=10)
+                            print(f"  [4.{_round}] 滑块通过,表单回来={_form_back} ({time.time()-_t_sf:.1f}s)")
                             continue
                         else:
                             _shot(page, f"05r{_round}_slider_failed", idx)
@@ -1862,8 +1956,13 @@ def register_github(opts, proxy_pool, idx, runtime=None):
                         pool_entry = json.load(_f)
                 except Exception:
                     pass
-                code = _get_gh_code(page, email, password, pool_entry, max_wait=180,
-                                    received_after=_signup_started_at)
+                code = None
+                try:
+                    code = _get_gh_code(page, email, password, pool_entry, max_wait=180,
+                                        received_after=_signup_started_at)
+                except Exception as _e:
+                    # mail-tab 挂掉(PageDisconnectedError/WebSocket)只废取码,不废整个 run
+                    print(f"  [STEP-D] 取码异常(隔离): {type(_e).__name__}: {str(_e)[:80]}")
                 if code:
                     print(f"  [STEP-D] got launch code: {code}")
                     _fill(page, "css:input[autocomplete='one-time-code']", code, "otp")
