@@ -235,7 +235,7 @@ function renderForm(s, saved={}){
   btn.className='btn-run'; btn.textContent='▶ 运行';
   btn.onclick = runScript;
   actions.appendChild(btn);
-  if(['register_outlook_ruoyi', 'unlock_outlook'].includes(s.id)){
+  if(['register_outlook_ruoyi', 'register_github_ruoyi', 'unlock_outlook'].includes(s.id)){
     const saveBtn = document.createElement('button');
     saveBtn.className = 'btn-run';
     saveBtn.textContent = '保存当前配置';
